@@ -151,6 +151,25 @@ pub fn open_existing_domains(
         .collect()
 }
 
+/// Opens each existing file of `domains`, skipping one that fails to open (corrupt, locked, no
+/// permission) with a note on stderr: for an agent (the hook, the MCP server), one bad file must
+/// not silence the good ones.
+pub fn open_readable_domains(lessons_home: &Path, domains: &[Domain]) -> Vec<(Domain, Connection)> {
+    domains
+        .iter()
+        .filter(|domain| domain.file_path(lessons_home).exists())
+        .filter_map(
+            |&domain| match open(&domain.file_path(lessons_home), OpenMode::Existing) {
+                Ok(conn) => Some((domain, conn)),
+                Err(open_error) => {
+                    eprintln!("lessons: skipping {}: {open_error:#}", domain.as_str());
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
 /// Pause between attempts to switch a contended file into WAL mode.
 const WAL_RETRY_PAUSE: Duration = Duration::from_millis(10);
 

@@ -14,6 +14,7 @@ pub struct Config {
     /// Domains `lessons search` uses when `--in` is omitted.
     pub default_search: Vec<Domain>,
     pub hook: HookConfig,
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -29,19 +30,43 @@ impl Default for Config {
         Config {
             default_search: Domain::ALL.to_vec(),
             hook: HookConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
 
-/// Enough lessons to be useful, few enough to stay a short read before each prompt.
-const DEFAULT_HOOK_MAX_RESULTS: usize = 5;
+/// Enough lessons to be useful, few enough to stay a short read inside an agent session.
+const DEFAULT_AGENT_MAX_RESULTS: usize = 5;
+
+/// The domains an agent (the hook, the MCP server) may touch by default. Personal is left out on
+/// purpose: agents run inside work sessions too.
+fn default_agent_domains() -> Vec<Domain> {
+    vec![Domain::Work, Domain::Shared]
+}
 
 impl Default for HookConfig {
     fn default() -> Self {
         HookConfig {
-            // Personal is left out on purpose: the hook runs inside work sessions too.
-            domains: vec![Domain::Work, Domain::Shared],
-            max_results: DEFAULT_HOOK_MAX_RESULTS,
+            domains: default_agent_domains(),
+            max_results: DEFAULT_AGENT_MAX_RESULTS,
+        }
+    }
+}
+
+/// The MCP server: the only domains its tools may search or record into.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct McpConfig {
+    pub domains: Vec<Domain>,
+    /// Search results when a tool call gives no limit.
+    pub max_results: usize,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig {
+            domains: default_agent_domains(),
+            max_results: DEFAULT_AGENT_MAX_RESULTS,
         }
     }
 }
@@ -83,6 +108,7 @@ mod tests {
         let config: Config = load(temp_dir.path()).unwrap();
         assert_eq!(config, Config::default());
         assert!(!config.hook.domains.contains(&Domain::Personal));
+        assert!(!config.mcp.domains.contains(&Domain::Personal));
     }
 
     #[test]

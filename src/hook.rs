@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use rusqlite::Connection;
-
-use crate::db::Domain;
 use crate::store::SearchHit;
 use crate::{config, db, journal, query, store};
 
@@ -50,7 +47,7 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
     );
     let hits: Vec<SearchHit> = match &fts_query {
         Some(fts_query) => {
-            let opened = open_readable_domains(lessons_home, &hook_config.domains);
+            let opened = db::open_readable_domains(lessons_home, &hook_config.domains);
             let candidate_hits: Vec<SearchHit> = store::search_all(
                 &opened,
                 fts_query,
@@ -66,24 +63,6 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
     };
     journal!("hook: {} hit(s) printed", hits.len());
     Ok(render(&hits))
-}
-
-/// Opens each existing file of `domains`, skipping one that fails to open (corrupt, locked, no
-/// permission) with a note on stderr: in the hook, one bad file must not silence the good ones.
-fn open_readable_domains(lessons_home: &Path, domains: &[Domain]) -> Vec<(Domain, Connection)> {
-    domains
-        .iter()
-        .filter(|domain| domain.file_path(lessons_home).exists())
-        .filter_map(|&domain| {
-            match db::open(&domain.file_path(lessons_home), db::OpenMode::Existing) {
-                Ok(conn) => Some((domain, conn)),
-                Err(open_error) => {
-                    eprintln!("lessons hook: skipping {}: {open_error:#}", domain.as_str());
-                    None
-                }
-            }
-        })
-        .collect()
 }
 
 /// Moves hits whose `context` names the current directory to the front, keeping score order

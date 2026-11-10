@@ -760,6 +760,40 @@ fn each_command_shows_its_own_help_line() {
     );
 }
 
+#[test]
+fn mcp_server_speaks_json_rpc_lines_over_stdio_and_exits_when_stdin_closes() {
+    let (temp_dir, shared_id, _work_id) = work_laptop_home();
+    let client_messages: String = [
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":"list","method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"search_lessons","arguments":{"query":"not_found_or_no_access"}}}"#,
+    ]
+    .join("\n");
+    let output: Output = run_lessons_with_stdin(temp_dir.path(), &["mcp"], &client_messages);
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    // stdout must hold only MCP messages: one JSON object per line, one per request (not per notification).
+    let replies: Vec<serde_json::Value> = stdout_of(&output)
+        .lines()
+        .map(|reply_line| {
+            serde_json::from_str(reply_line).expect("stdout line is not a JSON message")
+        })
+        .collect();
+    let reply_ids: Vec<&str> = replies
+        .iter()
+        .filter_map(|reply| reply["id"].as_str())
+        .collect();
+    assert_eq!(reply_ids, vec!["init", "list", "search"]);
+    let search_reply: &serde_json::Value = replies
+        .iter()
+        .find(|reply| reply["id"] == "search")
+        .expect("a reply to the search request");
+    let search_text: &str = search_reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(search_text.contains(&shared_id), "{search_text}");
+}
+
 #[cfg(unix)]
 mod editor {
     use super::*;

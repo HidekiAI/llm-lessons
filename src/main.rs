@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod hook;
 mod journal;
+mod mcp;
 mod query;
 mod store;
 
@@ -100,6 +101,8 @@ enum Command {
         #[arg(long)]
         by: String,
     },
+    /// Serve search_lessons and record_lesson to an MCP client over stdio
+    Mcp,
     /// Entry points for Claude Code hooks; they never block a prompt
     Hook {
         #[command(subcommand)]
@@ -273,6 +276,11 @@ fn main() -> Result<()> {
         } => run_search(&fn_lessons_home()?, &text, in_domains, limit, raw, format),
         Command::Retire { id, by } => run_retire(&fn_lessons_home()?, &id, &by),
         Command::Move { id, to } => run_move(&fn_lessons_home()?, &id, to),
+        Command::Mcp => mcp::serve(
+            &fn_lessons_home()?,
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+        ),
         Command::Hook { event } => {
             run_hook(event, fn_lessons_home);
             Ok(())
