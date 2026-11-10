@@ -23,7 +23,16 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# lessons DB files are data, not code: never commit them (WAL and shared-memory sidecars included)
+# lessons DB files are private data, never code: they must never reach any remote, because a
+# pushed file stays retrievable from history and archives even after it is deleted.
+# Every form SQLite writes: the file, its WAL and shared-memory sidecars, the rollback journal.
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+# A LESSONS_HOME pointed inside the repo, which also holds config.toml.
+.lessons/
