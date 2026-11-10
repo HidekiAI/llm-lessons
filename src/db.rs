@@ -398,8 +398,8 @@ mod tests {
         const NO_WAIT_LIMIT: Duration = Duration::from_secs(1);
         let (_temp_dir, db_path) = temp_db_path();
         drop(open(&db_path, OpenMode::Create).expect("create"));
-        let mut writer_conn: Connection = Connection::open(&db_path).unwrap();
-        let writer_transaction = writer_conn
+        let mut mut_writer_conn: Connection = Connection::open(&db_path).unwrap();
+        let writer_transaction = mut_writer_conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap(); // holds the write lock for the rest of the test
         let open_started = std::time::Instant::now();
