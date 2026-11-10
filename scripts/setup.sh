@@ -18,12 +18,14 @@ readonly KNOWN_DOMAINS="work personal shared"
 readonly KNOWN_AGENTS="opencode claude"
 readonly MCP_SERVER_NAME="lessons"
 readonly EXIT_USAGE=2
-temp_root="${TMPDIR:-/tmp}"
-readonly LOG_FILE="${temp_root%/}/lessons-setup.log" # TMPDIR on macOS ends in a slash
+# A per-user log directory: a fixed name in a shared /tmp could be pre-planted as a symlink.
+readonly LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lessons"
+readonly LOG_FILE="$LOG_DIR/setup.log"
 
 dry_run=false
 
 log_step() {
+    mkdir -p "$LOG_DIR"
     printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" | tee -a "$LOG_FILE" >&2
 }
 
@@ -106,9 +108,17 @@ run_setup() {
     fi
 
     log_step "setup: repo $REPO_ROOT, domains ${domain_names[*]}, agents ${agent_names[*]:-none}, log $LOG_FILE"
-    command -v cargo >/dev/null 2>&1 || { log_step "ERROR: cargo not found; install Rust from https://rustup.rs"; exit 1; }
+    if ! command -v cargo >/dev/null 2>&1; then
+        # A dry run only shows the steps, so it goes on without cargo.
+        if [[ "$dry_run" != true ]]; then
+            log_step "ERROR: cargo not found; install Rust from https://rustup.rs"
+            exit 1
+        fi
+        log_step "note: cargo not found; a real run needs it (https://rustup.rs)"
+    fi
     run_step cargo install --locked --path "$REPO_ROOT"
-    local lessons_binary="${CARGO_HOME:-$HOME/.cargo}/bin/lessons"
+    # Where `cargo install` puts the binary: CARGO_INSTALL_ROOT, else CARGO_HOME, else ~/.cargo.
+    local lessons_binary="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/lessons"
     for domain_name in "${domain_names[@]}"; do
         run_step "$lessons_binary" init --domain "$domain_name"
     done
@@ -121,7 +131,7 @@ run_setup() {
 # --test: checks the pure parts (argument validation, the registration commands). Runs nothing.
 run_self_test() {
     local failures=0
-    check() {
+    check_equal() {
         local check_name="$1" expected_text="$2" actual_text="$3"
         if [[ "$expected_text" == "$actual_text" ]]; then
             printf 'PASS %s\n' "$check_name"
@@ -130,13 +140,13 @@ run_self_test() {
             failures=$((failures + 1))
         fi
     }
-    check "domains split in order" "work shared" "$(validated_list domain work,shared "$KNOWN_DOMAINS" | tr '\n' ' ' | sed 's/ $//')"
-    check "unknown domain refused" "refused" "$(validated_list domain work,home "$KNOWN_DOMAINS" >/dev/null 2>&1 && echo accepted || echo refused)"
-    check "unknown agent refused" "refused" "$(validated_list agent cursor "$KNOWN_AGENTS" >/dev/null 2>&1 && echo accepted || echo refused)"
-    check "empty agent list is allowed" "" "$(validated_list agent "" "$KNOWN_AGENTS")"
-    check "opencode registers globally" "opencode mcp add --global lessons -- /bin/lessons mcp" \
+    check_equal "domains split in order" "work shared" "$(validated_list domain work,shared "$KNOWN_DOMAINS" | tr '\n' ' ' | sed 's/ $//')"
+    check_equal "unknown domain refused" "refused" "$(validated_list domain work,home "$KNOWN_DOMAINS" >/dev/null 2>&1 && echo accepted || echo refused)"
+    check_equal "unknown agent refused" "refused" "$(validated_list agent cursor "$KNOWN_AGENTS" >/dev/null 2>&1 && echo accepted || echo refused)"
+    check_equal "empty agent list is allowed" "" "$(validated_list agent "" "$KNOWN_AGENTS")"
+    check_equal "opencode registers globally" "opencode mcp add --global lessons -- /bin/lessons mcp" \
         "$(agent_register_command opencode /bin/lessons | tr '\n' ' ' | sed 's/ $//')"
-    check "claude registers for the user" "claude mcp add --scope user lessons -- /bin/lessons mcp" \
+    check_equal "claude registers for the user" "claude mcp add --scope user lessons -- /bin/lessons mcp" \
         "$(agent_register_command claude /bin/lessons | tr '\n' ' ' | sed 's/ $//')"
     if [[ "$failures" -eq 0 ]]; then
         printf 'setup self-test: all checks passed\n'

@@ -91,8 +91,10 @@ pub fn open(path: &Path, mode: OpenMode) -> Result<Connection> {
 
     // WAL mode is stored in the file, so only a file not yet in it is switched: the switch needs
     // an exclusive lock, and readers (search, the hook) must not queue behind a writer for it.
-    let current_journal_mode: String =
-        mut_conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    // SQLite opens lazily: this first read is where a corrupt or non-SQLite file fails, so it names the file.
+    let current_journal_mode: String = mut_conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .with_context(|| format!("cannot read {}", path.display()))?;
     // journal_mode answers with the mode it actually got. A filesystem that cannot do WAL (some
     // network mounts) keeps the old mode; the file still works, readers just block on writers.
     let journal_mode: String = if current_journal_mode.eq_ignore_ascii_case("wal") {
@@ -148,25 +150,6 @@ pub fn open_existing_domains(
                 None
             }
         })
-        .collect()
-}
-
-/// Opens each existing file of `domains`, skipping one that fails to open (corrupt, locked, no
-/// permission) with a note on stderr: for an agent (the hook, the MCP server), one bad file must
-/// not silence the good ones.
-pub fn open_readable_domains(lessons_home: &Path, domains: &[Domain]) -> Vec<(Domain, Connection)> {
-    domains
-        .iter()
-        .filter(|domain| domain.file_path(lessons_home).exists())
-        .filter_map(
-            |&domain| match open(&domain.file_path(lessons_home), OpenMode::Existing) {
-                Ok(conn) => Some((domain, conn)),
-                Err(open_error) => {
-                    eprintln!("lessons: skipping {}: {open_error:#}", domain.as_str());
-                    None
-                }
-            },
-        )
         .collect()
 }
 

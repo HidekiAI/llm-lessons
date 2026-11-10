@@ -39,12 +39,25 @@ pub fn serve(
     mut mut_client_output: impl Write,
 ) -> Result<()> {
     journal!("mcp: serving {}", lessons_home.display());
-    for input_line in client_input.lines() {
-        let input_line: String = input_line.context("cannot read from the MCP client")?;
-        if input_line.trim().is_empty() {
-            continue;
-        }
-        if let Some(reply) = reply_to(lessons_home, &input_line) {
+    let mut mut_client_input = client_input;
+    loop {
+        let reply: Option<Value> = match read_message_line(&mut mut_client_input)? {
+            InputLine::EndOfInput => break,
+            InputLine::Text(input_line) if input_line.trim().is_empty() => None,
+            InputLine::Text(input_line) => reply_to(lessons_home, &input_line),
+            // One bad line must not end the session: answer it and read the next one.
+            InputLine::NotUtf8 => Some(error_reply(
+                Value::Null,
+                PARSE_ERROR,
+                "message is not valid UTF-8",
+            )),
+            InputLine::TooLong => Some(error_reply(
+                Value::Null,
+                PARSE_ERROR,
+                &format!("message longer than {MAX_MESSAGE_BYTES} bytes"),
+            )),
+        };
+        if let Some(reply) = reply {
             // serde_json escapes newlines inside strings, so one reply is always one line.
             writeln!(mut_client_output, "{reply}").context("cannot write to the MCP client")?;
             mut_client_output.flush()?;
@@ -52,6 +65,36 @@ pub fn serve(
     }
     journal!("mcp: client closed stdin, exiting");
     Ok(())
+}
+
+/// The longest message accepted. Lesson text is small; the cap stops a runaway or hostile client
+/// from making the server buffer an endless line.
+const MAX_MESSAGE_BYTES: usize = 1 << 20; // 1 MiB
+
+enum InputLine {
+    Text(String),
+    NotUtf8,
+    TooLong,
+    EndOfInput,
+}
+
+/// Reads one newline-terminated message, reading at most MAX_MESSAGE_BYTES of it into memory.
+fn read_message_line(client_input: &mut impl BufRead) -> Result<InputLine> {
+    let mut mut_line_bytes: Vec<u8> = Vec::new();
+    let bytes_read: usize = std::io::Read::take(&mut *client_input, MAX_MESSAGE_BYTES as u64 + 1) // one byte past the cap shows the line is too long
+        .read_until(b'\n', &mut mut_line_bytes)
+        .context("cannot read from the MCP client")?;
+    let is_too_long: bool = mut_line_bytes.len() > MAX_MESSAGE_BYTES;
+    match (bytes_read, is_too_long) {
+        (0, _) => Ok(InputLine::EndOfInput),
+        (_, true) => client_input
+            .skip_until(b'\n') // drop the rest of the oversized line
+            .map(|_skipped_bytes| InputLine::TooLong)
+            .context("cannot read from the MCP client"),
+        (_, false) => {
+            Ok(String::from_utf8(mut_line_bytes).map_or(InputLine::NotUtf8, InputLine::Text))
+        }
+    }
 }
 
 /// The reply to one input line, or None when none is due (a notification, or a response to a
@@ -74,7 +117,17 @@ fn reply_to(lessons_home: &Path, input_line: &str) -> Option<Value> {
             INVALID_REQUEST,
             "expected one JSON-RPC object per line; batches are not supported",
         )),
-        (true, None, _) => None,
+        // A response (it carries result or error) to a request this server never sends: nothing to do.
+        (true, None, _) if message.get("result").is_some() || message.get("error").is_some() => {
+            None
+        }
+        // An id with no method is a malformed request; the client is waiting for an answer.
+        (true, None, Some(request_id)) => Some(error_reply(
+            request_id,
+            INVALID_REQUEST,
+            "request has no method",
+        )),
+        (true, None, None) => None,
         (true, Some(method), None) => {
             journal!("mcp: notification {method}");
             None
@@ -103,7 +156,7 @@ fn handle_request(
     params: Option<&Value>,
 ) -> Result<Value, RequestError> {
     match method {
-        "initialize" => Ok(initialize_result(params)),
+        "initialize" => initialize_result(params),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => call_tool(lessons_home, params),
@@ -114,22 +167,26 @@ fn handle_request(
     }
 }
 
-fn initialize_result(params: Option<&Value>) -> Value {
-    let requested_version: Option<&str> = params
+fn initialize_result(params: Option<&Value>) -> Result<Value, RequestError> {
+    let requested_version: &str = params
         .and_then(|params| params.get("protocolVersion"))
-        .and_then(Value::as_str);
-    let negotiated_version: &str = requested_version
-        .filter(|requested| SUPPORTED_PROTOCOL_VERSIONS.contains(requested))
-        .or_else(|| SUPPORTED_PROTOCOL_VERSIONS.first().copied())
+        .and_then(Value::as_str)
+        .ok_or_else(|| RequestError {
+            code: INVALID_PARAMS,
+            message: "initialize needs a string params.protocolVersion".to_string(),
+        })?;
+    let negotiated_version: &str = SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .find(|supported| **supported == requested_version)
+        .or_else(|| SUPPORTED_PROTOCOL_VERSIONS.first())
+        .copied()
         .unwrap_or_default(); // the list is a non-empty constant
-    journal!(
-        "mcp: client asked for protocol {requested_version:?}, answering {negotiated_version}"
-    );
-    json!({
+    journal!("mcp: client asked for protocol {requested_version}, answering {negotiated_version}");
+    Ok(json!({
         "protocolVersion": negotiated_version,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "lessons", "version": env!("CARGO_PKG_VERSION") },
-    })
+    }))
 }
 
 /// The two tools. Descriptions stay short: they are read into every agent session.
@@ -223,6 +280,12 @@ fn call_tool(lessons_home: &Path, params: Option<&Value>) -> Result<Value, Reque
             .map_err(|parse_error| {
                 fn_invalid_params(format!("invalid search_lessons arguments: {parse_error}"))
             })
+            .and_then(|arguments: SearchArguments| match arguments.limit {
+                Some(0) => Err(fn_invalid_params(
+                    "search_lessons limit must be at least 1".to_string(),
+                )),
+                Some(_) | None => Ok(arguments),
+            })
             .map(|arguments| search_lessons(lessons_home, arguments))?,
         "record_lesson" => serde_json::from_value(tool_call.arguments)
             .map_err(|parse_error| {
@@ -271,7 +334,9 @@ fn search_lessons(lessons_home: &Path, arguments: SearchArguments) -> Result<Str
     };
     let hits: Vec<SearchHit> = match &fts_query {
         Some(fts_query) => store::search_all(
-            &db::open_readable_domains(lessons_home, &domains),
+            // Strict open: a file that exists but cannot be read is an error naming it, not an empty
+            // result the agent would take for "no lessons exist".
+            &db::open_existing_domains(lessons_home, &domains)?,
             fts_query,
             arguments.limit.unwrap_or(mcp_config.max_results),
         )?,
@@ -498,6 +563,107 @@ mod tests {
                 INVALID_PARAMS
             ]
         );
+    }
+
+    /// Sends raw bytes (which need not be JSON or even UTF-8) and returns every reply in order.
+    fn exchange_bytes(lessons_home: &Path, client_input: &[u8]) -> Vec<Value> {
+        let mut mut_server_output: Vec<u8> = Vec::new();
+        serve(lessons_home, client_input, &mut mut_server_output).expect("serve");
+        String::from_utf8(mut_server_output)
+            .expect("UTF-8 output")
+            .lines()
+            .map(|reply_line| serde_json::from_str(reply_line).expect("JSON reply"))
+            .collect()
+    }
+
+    #[test]
+    fn an_id_without_a_method_is_answered_but_a_response_is_not() {
+        let lessons_home = work_laptop_home();
+        let replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[
+                json!({ "jsonrpc": "2.0", "id": "orphan" }),
+                json!({ "jsonrpc": "2.0", "id": "answer", "result": {} }),
+            ],
+        );
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0]["id"], "orphan");
+        assert_eq!(replies[0]["error"]["code"], INVALID_REQUEST);
+    }
+
+    #[test]
+    fn a_bad_line_is_answered_and_the_session_goes_on() {
+        let lessons_home = work_laptop_home();
+        let ping_line: String = format!(
+            "{}\n",
+            json!({ "jsonrpc": "2.0", "id": "after", "method": "ping" })
+        );
+        let oversized_line: Vec<u8> = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        let client_input: Vec<u8> = [
+            b"\xff\xfe not utf-8\n".as_slice(),
+            ping_line.as_bytes(),
+            &oversized_line,
+            b"\n",
+            ping_line.as_bytes(),
+        ]
+        .concat();
+        let replies: Vec<Value> = exchange_bytes(lessons_home.path(), &client_input);
+        let reply_summary: Vec<(Value, Value)> = replies
+            .iter()
+            .map(|reply| (reply["id"].clone(), reply["error"]["code"].clone()))
+            .collect();
+        assert_eq!(
+            reply_summary,
+            vec![
+                (Value::Null, json!(PARSE_ERROR)),
+                (json!("after"), Value::Null),
+                (Value::Null, json!(PARSE_ERROR)),
+                (json!("after"), Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_not_taken_for_an_empty_result() {
+        let lessons_home = work_laptop_home();
+        std::fs::write(
+            Domain::Shared.file_path(lessons_home.path()),
+            "this is not a SQLite file at all",
+        )
+        .unwrap();
+        let replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[tool_call(
+                "search",
+                "search_lessons",
+                json!({ "query": "registry" }),
+            )],
+        );
+        assert_eq!(replies[0]["result"]["isError"], true, "{}", replies[0]);
+        assert!(
+            tool_text(&replies[0]).contains("shared.db"),
+            "{}",
+            replies[0]
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_and_an_initialize_without_a_version_are_invalid_params() {
+        let lessons_home = work_laptop_home();
+        let replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[
+                tool_call(
+                    "zero",
+                    "search_lessons",
+                    json!({ "query": "registry", "limit": 0 }),
+                ),
+                json!({ "jsonrpc": "2.0", "id": "versionless", "method": "initialize", "params": {} }),
+            ],
+        );
+        replies
+            .iter()
+            .for_each(|reply| assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{reply}"));
     }
 
     #[test]
