@@ -612,6 +612,129 @@ fn move_refuses_the_same_file_a_missing_target_and_an_unknown_id() {
     );
 }
 
+/// Every hook run must exit 0, whatever happens: exit 2 would block the user's prompt.
+fn expect_hook_exit_zero(output: &Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "hook exited non-zero; stderr: {}",
+        stderr_of(output)
+    );
+}
+
+#[test]
+fn hook_prints_lessons_for_a_matching_prompt() {
+    let (temp_dir, shared_id, _work_id) = work_laptop_home();
+    let hook_json: &str = r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/src/x","prompt":"pull fails: not_found_or_no_access"}"#;
+    let output: Output =
+        run_lessons_with_stdin(temp_dir.path(), &["hook", "user-prompt-submit"], hook_json);
+    expect_hook_exit_zero(&output);
+    let hook_text: String = stdout_of(&output);
+    assert!(
+        hook_text.starts_with("Relevant past lessons (from lessons db):\n"),
+        "{hook_text}"
+    );
+    assert!(
+        hook_text.contains(&format!("(id {shared_id})")),
+        "{hook_text}"
+    );
+}
+
+#[test]
+fn hook_prints_nothing_and_exits_zero_without_a_match_or_without_any_db() {
+    let (temp_dir, _shared_id, _work_id) = work_laptop_home();
+    let no_match: Output = run_lessons_with_stdin(
+        temp_dir.path(),
+        &["hook", "user-prompt-submit"],
+        r#"{"prompt":"bake a cake"}"#,
+    );
+    expect_hook_exit_zero(&no_match);
+    assert_eq!(stdout_of(&no_match), "");
+
+    let empty_home = tempfile::tempdir().unwrap();
+    let no_db: Output = run_lessons_with_stdin(
+        empty_home.path(),
+        &["hook", "user-prompt-submit"],
+        r#"{"prompt":"registry"}"#,
+    );
+    expect_hook_exit_zero(&no_db);
+    assert_eq!(stdout_of(&no_db), "");
+}
+
+#[test]
+fn hook_exits_zero_on_bad_stdin_and_says_why_on_stderr() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output: Output =
+        run_lessons_with_stdin(temp_dir.path(), &["hook", "user-prompt-submit"], "not json");
+    expect_hook_exit_zero(&output);
+    assert_eq!(stdout_of(&output), "");
+    assert!(
+        stderr_of(&output).contains("cannot parse the hook JSON"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn a_mistyped_hook_command_still_exits_zero() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output: Output =
+        run_lessons_with_stdin(temp_dir.path(), &["hook", "user-prompt-sumbit"], "{}");
+    expect_hook_exit_zero(&output);
+    assert!(
+        stderr_of(&output).contains("lessons hook:"),
+        "{}",
+        stderr_of(&output)
+    );
+    // Outside `hook`, a usage error still fails loudly.
+    assert!(
+        !run_lessons(temp_dir.path(), &["serach", "x"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn hook_never_reads_personal_even_when_the_file_exists() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    add_lesson(
+        temp_dir.path(),
+        "personal",
+        "private registry note",
+        "registry",
+    );
+    let output: Output = run_lessons_with_stdin(
+        temp_dir.path(),
+        &["hook", "user-prompt-submit"],
+        r#"{"prompt":"registry"}"#,
+    );
+    expect_hook_exit_zero(&output);
+    assert_eq!(stdout_of(&output), "");
+}
+
+#[test]
+fn each_command_shows_its_own_help_line() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let help_text: String = expect_success(run_lessons(temp_dir.path(), &["--help"]));
+    // clap aligns the columns, so compare each line with its spacing collapsed.
+    let fn_help_line_of = |command_name: &str| -> String {
+        help_text
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
+            .find(|line| line.starts_with(&format!("{command_name} ")))
+            .unwrap_or_default()
+    };
+    assert!(
+        fn_help_line_of("move").starts_with("move Move a lesson to another DB file"),
+        "{help_text}"
+    );
+    assert!(
+        fn_help_line_of("retire").starts_with("retire Hide a lesson from search"),
+        "{help_text}"
+    );
+}
+
 #[cfg(unix)]
 mod editor {
     use super::*;

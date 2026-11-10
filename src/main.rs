@@ -2,6 +2,7 @@
 
 mod config;
 mod db;
+mod hook;
 mod journal;
 mod query;
 mod store;
@@ -82,19 +83,30 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Hide a lesson from search because a newer one replaces it
     /// Move a lesson to another DB file, keeping its id
     Move {
         id: String,
         #[arg(long, value_enum)]
         to: Domain,
     },
+    /// Hide a lesson from search because a newer one replaces it
     Retire {
         id: String,
         /// The id of the lesson that replaces it
         #[arg(long)]
         by: String,
     },
+    /// Entry points for Claude Code hooks; they never block a prompt
+    Hook {
+        #[command(subcommand)]
+        event: HookEvent,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookEvent {
+    /// Print lessons relevant to the submitted prompt (reads the hook JSON on stdin)
+    UserPromptSubmit,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -204,32 +216,70 @@ impl FieldArgs {
 }
 
 fn main() -> Result<()> {
-    let cli: Cli = Cli::parse();
+    let cli: Cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // clap exits 2 on a usage error, and Claude Code reads exit 2 from a hook as "block the
+        // prompt": a mistyped hook command in settings.json would block every prompt. Report it
+        // and let the prompt through instead.
+        Err(parse_error) if std::env::args().nth(1).as_deref() == Some("hook") => {
+            eprintln!("lessons hook: {parse_error}");
+            return Ok(());
+        }
+        Err(parse_error) => parse_error.exit(),
+    };
     journal::init(cli.verbose);
-    let lessons_home: PathBuf = db::lessons_home()?;
-    journal!("start: LESSONS_HOME is {}", lessons_home.display());
+    // Resolved per command, so the hook can turn a missing home directory into a stderr line.
+    let fn_lessons_home = || -> Result<PathBuf> {
+        let lessons_home: PathBuf = db::lessons_home()?;
+        journal!("start: LESSONS_HOME is {}", lessons_home.display());
+        Ok(lessons_home)
+    };
 
     match cli.command {
-        Command::Init { domain } => run_init(&lessons_home, domain),
-        Command::Add(add_args) => run_add(&lessons_home, add_args),
-        Command::Show { id, format } => run_show(&lessons_home, &id, format),
+        Command::Init { domain } => run_init(&fn_lessons_home()?, domain),
+        Command::Add(add_args) => run_add(&fn_lessons_home()?, add_args),
+        Command::Show { id, format } => run_show(&fn_lessons_home()?, &id, format),
         Command::List {
             in_domains,
             limit,
             tag,
             format,
-        } => run_list(&lessons_home, &in_domains.0, limit, tag.as_deref(), format),
-        Command::Update { id, fields } => run_update(&lessons_home, &id, fields.into_patch()),
-        Command::Hit { id } => run_hit(&lessons_home, &id),
+        } => run_list(
+            &fn_lessons_home()?,
+            &in_domains.0,
+            limit,
+            tag.as_deref(),
+            format,
+        ),
+        Command::Update { id, fields } => run_update(&fn_lessons_home()?, &id, fields.into_patch()),
+        Command::Hit { id } => run_hit(&fn_lessons_home()?, &id),
         Command::Search {
             text,
             in_domains,
             limit,
             raw,
             format,
-        } => run_search(&lessons_home, &text, in_domains, limit, raw, format),
-        Command::Retire { id, by } => run_retire(&lessons_home, &id, &by),
-        Command::Move { id, to } => run_move(&lessons_home, &id, to),
+        } => run_search(&fn_lessons_home()?, &text, in_domains, limit, raw, format),
+        Command::Retire { id, by } => run_retire(&fn_lessons_home()?, &id, &by),
+        Command::Move { id, to } => run_move(&fn_lessons_home()?, &id, to),
+        Command::Hook { event } => {
+            run_hook(event, fn_lessons_home);
+            Ok(())
+        }
+    }
+}
+
+/// Runs a Claude Code hook. It never fails: every error goes to stderr and the exit code stays 0,
+/// because exit code 2 would block the user's prompt.
+fn run_hook(hook_event: HookEvent, fn_lessons_home: impl Fn() -> Result<PathBuf>) {
+    let hook_result: Result<String> = match hook_event {
+        HookEvent::UserPromptSubmit => fn_lessons_home().and_then(|lessons_home| {
+            hook::user_prompt_submit(&lessons_home, std::io::stdin().lock())
+        }),
+    };
+    match hook_result {
+        Ok(hook_text) => print!("{hook_text}"),
+        Err(hook_error) => eprintln!("lessons hook: {hook_error:#}"),
     }
 }
 

@@ -29,7 +29,17 @@ fn every_private_data_file_is_ignored_by_git() {
         .expect("run git check-ignore");
     let report: String = String::from_utf8_lossy(&check_output.stdout).into_owned();
     // With --non-matching, a path no rule covers is printed with an empty source: "::\t<path>".
-    let unignored: Vec<&str> = report.lines().filter(|report_line| report_line.starts_with("::")).collect();
-    assert!(unignored.is_empty(), "not ignored by .gitignore: {unignored:?}");
-    assert_eq!(report.lines().count(), private_paths.len(), "git check-ignore output: {report}");
+    let unignored: Vec<&str> = report
+        .lines()
+        .filter(|report_line| report_line.starts_with("::"))
+        .collect();
+    assert!(
+        unignored.is_empty(),
+        "not ignored by .gitignore: {unignored:?}"
+    );
+    assert_eq!(
+        report.lines().count(),
+        private_paths.len(),
+        "git check-ignore output: {report}"
+    );
 }
