@@ -62,7 +62,7 @@ max_results = 5
 
 ## Using it from a coding agent
 
-Any agent that can run a shell command can use it (opencode, Claude Code, others). Add a line like this to the agent's instruction file (`AGENTS.md`, `CLAUDE.md`, ...):
+It works with any coding agent and any model provider: opencode with OpenRouter, Claude Code, or anything that can run a shell command or speak MCP. Nothing in `lessons` depends on the model. Add a line like this to the agent's instruction file (`AGENTS.md` for opencode, `CLAUDE.md` for Claude Code):
 
 ```
 On an unfamiliar error, run `lessons search '<error text>' --format json` before debugging; after solving something non-trivial, propose a `lessons add --json -` entry for me to approve.
@@ -79,9 +79,14 @@ opencode mcp add --global lessons -- lessons mcp
 claude mcp add --scope user lessons -- lessons mcp
 ```
 
-### Optional: Claude Code prompt hook
+### Optional, Claude Code only: prompt hook
 
-Claude Code can also run the search on every prompt. Add to `~/.claude/settings.json`; use the absolute path to `lessons` if it is not on the PATH the hook sees.
+opencode gets the same lessons through the MCP server or the `AGENTS.md` line above. Claude Code can additionally search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which Claude Code adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt.
+
+<details>
+<summary>Hook setup for <code>~/.claude/settings.json</code></summary>
+
+Use the absolute path to `lessons` if it is not on the PATH the hook sees.
 
 ```json
 {
@@ -93,7 +98,7 @@ Claude Code can also run the search on every prompt. Add to `~/.claude/settings.
 }
 ```
 
-On each prompt the hook prints matching lessons, which Claude Code adds as context, and prints nothing when none match. It always exits 0, so it never blocks a prompt.
+</details>
 
 ## FAQ
 
