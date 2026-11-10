@@ -18,6 +18,7 @@ readonly KNOWN_DOMAINS="work personal shared"
 readonly KNOWN_AGENTS="opencode claude"
 readonly MCP_SERVER_NAME="lessons"
 readonly EXIT_USAGE=2
+readonly EXIT_FAILURE=1
 # A per-user log directory: a fixed name in a shared /tmp could be pre-planted as a symlink.
 readonly LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lessons"
 readonly LOG_FILE="$LOG_DIR/setup.log"
@@ -112,7 +113,7 @@ run_setup() {
         # A dry run only shows the steps, so it goes on without cargo.
         if [[ "$dry_run" != true ]]; then
             log_step "ERROR: cargo not found; install Rust from https://rustup.rs"
-            exit 1
+            exit "$EXIT_FAILURE"
         fi
         log_step "note: cargo not found; a real run needs it (https://rustup.rs)"
     fi
@@ -152,7 +153,7 @@ run_self_test() {
         printf 'setup self-test: all checks passed\n'
     else
         printf 'setup self-test: %s check(s) failed\n' "$failures"
-        exit 1
+        exit "$EXIT_FAILURE"
     fi
 }
 

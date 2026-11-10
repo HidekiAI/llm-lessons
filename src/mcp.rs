@@ -85,13 +85,16 @@ fn read_message_line(client_input: &mut impl BufRead) -> Result<InputLine> {
         .read_until(b'\n', &mut mut_line_bytes)
         .context("cannot read from the MCP client")?;
     let is_too_long: bool = mut_line_bytes.len() > MAX_MESSAGE_BYTES;
-    match (bytes_read, is_too_long) {
-        (0, _) => Ok(InputLine::EndOfInput),
-        (_, true) => client_input
+    // A line of exactly the cap plus its newline is read whole: skipping again would eat the next message.
+    let newline_already_read: bool = mut_line_bytes.last() == Some(&b'\n');
+    match (bytes_read, is_too_long, newline_already_read) {
+        (0, _, _) => Ok(InputLine::EndOfInput),
+        (_, true, true) => Ok(InputLine::TooLong),
+        (_, true, false) => client_input
             .skip_until(b'\n') // drop the rest of the oversized line
             .map(|_skipped_bytes| InputLine::TooLong)
             .context("cannot read from the MCP client"),
-        (_, false) => {
+        (_, false, _) => {
             Ok(String::from_utf8(mut_line_bytes).map_or(InputLine::NotUtf8, InputLine::Text))
         }
     }
@@ -599,10 +602,15 @@ mod tests {
             json!({ "jsonrpc": "2.0", "id": "after", "method": "ping" })
         );
         let oversized_line: Vec<u8> = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        // Exactly the cap plus its newline: read whole, so nothing after it may be skipped.
+        let exactly_capped_line: Vec<u8> = vec![b'y'; MAX_MESSAGE_BYTES];
         let client_input: Vec<u8> = [
             b"\xff\xfe not utf-8\n".as_slice(),
             ping_line.as_bytes(),
             &oversized_line,
+            b"\n",
+            ping_line.as_bytes(),
+            &exactly_capped_line,
             b"\n",
             ping_line.as_bytes(),
         ]
@@ -615,6 +623,8 @@ mod tests {
         assert_eq!(
             reply_summary,
             vec![
+                (Value::Null, json!(PARSE_ERROR)),
+                (json!("after"), Value::Null),
                 (Value::Null, json!(PARSE_ERROR)),
                 (json!("after"), Value::Null),
                 (Value::Null, json!(PARSE_ERROR)),
