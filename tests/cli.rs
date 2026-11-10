@@ -555,6 +555,63 @@ fn search_raw_passes_fts5_syntax_and_reports_a_bad_expression() {
     );
 }
 
+#[test]
+fn move_carries_a_lesson_to_another_file_and_search_follows_it() {
+    let (temp_dir, _shared_id, work_id) = work_laptop_home();
+    let move_output: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &["move", &work_id, "--to", "shared"],
+    ));
+    assert_eq!(
+        move_output.trim(),
+        format!("moved {work_id} [work] -> [shared]")
+    );
+    let shown_text: String = expect_success(run_lessons(temp_dir.path(), &["show", &work_id]));
+    assert!(
+        shown_text.contains("[shared] ssh agent refuses deploy key"),
+        "{shown_text}"
+    );
+    assert!(
+        search_ids(
+            temp_dir.path(),
+            &["search", "agent", "--in", "work", "--format", "json"]
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        search_ids(
+            temp_dir.path(),
+            &["search", "agent", "--in", "shared", "--format", "json"]
+        ),
+        vec![work_id]
+    );
+}
+
+#[test]
+fn move_refuses_the_same_file_a_missing_target_and_an_unknown_id() {
+    let (temp_dir, shared_id, _work_id) = work_laptop_home();
+    let same_file: Output = run_lessons(temp_dir.path(), &["move", &shared_id, "--to", "shared"]);
+    assert!(
+        stderr_of(&same_file).contains("is already in shared"),
+        "{}",
+        stderr_of(&same_file)
+    );
+    let missing_target: Output =
+        run_lessons(temp_dir.path(), &["move", &shared_id, "--to", "personal"]);
+    assert!(
+        stderr_of(&missing_target).contains("lessons init --domain personal"),
+        "{}",
+        stderr_of(&missing_target)
+    );
+    assert!(!temp_dir.path().join("personal.db").exists());
+    let unknown_id: Output = run_lessons(temp_dir.path(), &["move", "01NOSUCHID", "--to", "work"]);
+    assert!(
+        stderr_of(&unknown_id).contains("no lesson with id 01NOSUCHID"),
+        "{}",
+        stderr_of(&unknown_id)
+    );
+}
+
 #[cfg(unix)]
 mod editor {
     use super::*;

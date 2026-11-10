@@ -83,6 +83,12 @@ enum Command {
         format: OutputFormat,
     },
     /// Hide a lesson from search because a newer one replaces it
+    /// Move a lesson to another DB file, keeping its id
+    Move {
+        id: String,
+        #[arg(long, value_enum)]
+        to: Domain,
+    },
     Retire {
         id: String,
         /// The id of the lesson that replaces it
@@ -223,6 +229,7 @@ fn main() -> Result<()> {
             format,
         } => run_search(&lessons_home, &text, in_domains, limit, raw, format),
         Command::Retire { id, by } => run_retire(&lessons_home, &id, &by),
+        Command::Move { id, to } => run_move(&lessons_home, &id, to),
     }
 }
 
@@ -590,4 +597,36 @@ fn search_hit_as_text(hit: &SearchHit) -> String {
         "problem",
         fn_first_line(&hit.lesson.problem)
     )
+}
+
+fn run_move(lessons_home: &Path, lesson_id: &str, target_domain: Domain) -> Result<()> {
+    let target_conn = db::open_target(lessons_home, target_domain)?;
+    // The source is looked for in the OTHER files only: after a crash mid-move the lesson is in
+    // both, and finding the target copy first would wrongly report the move as already done.
+    let other_domains: Vec<Domain> = Domain::ALL
+        .into_iter()
+        .filter(|domain| *domain != target_domain)
+        .collect();
+    let other_files = db::open_existing_domains(lessons_home, &other_domains)?;
+    let source_domain: Domain = match store::owner_of(&other_files, lesson_id)? {
+        Some((domain, _conn)) => *domain,
+        None if store::find_by_id(&target_conn, lesson_id)?.is_some() => {
+            bail!("{lesson_id} is already in {}", target_domain.as_str())
+        }
+        None => bail!("no lesson with id {lesson_id} in any DB file"),
+    };
+    drop(other_files); // only one connection to the source from here on, and that one writes
+    let mut mut_source_conn = db::open(&source_domain.file_path(lessons_home), OpenMode::Existing)?;
+    if !store::move_lesson(&mut mut_source_conn, &target_conn, lesson_id)? {
+        bail!(
+            "{lesson_id} disappeared from {} before it could be moved",
+            source_domain.as_str()
+        );
+    }
+    println!(
+        "moved {lesson_id} [{}] -> [{}]",
+        source_domain.as_str(),
+        target_domain.as_str()
+    );
+    Ok(())
 }

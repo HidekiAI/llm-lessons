@@ -260,6 +260,88 @@ pub fn retire(conn: &Connection, lesson_id: &str, superseded_by_id: &str) -> Res
     Ok(changed_rows == 1)
 }
 
+/// Writes `lesson` into `target` with its id, timestamps and counters, creating or refreshing it.
+/// An upsert rather than INSERT OR IGNORE, so a re-run after a crash copies the source's current
+/// state instead of keeping a stale copy; ON CONFLICT DO UPDATE fires the update trigger, so the
+/// index stays in step (REPLACE would skip the delete trigger and desync it).
+fn copy_into(target: &Connection, lesson: &Lesson) -> Result<()> {
+    target.execute(
+        "INSERT INTO lesson (id, created_at, updated_at, title, context, problem, root_cause, resolution, \
+                             failed_tries, tags, env_versions, superseded_by, hits) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         ON CONFLICT(id) DO UPDATE SET \
+             created_at = excluded.created_at, updated_at = excluded.updated_at, title = excluded.title, \
+             context = excluded.context, problem = excluded.problem, root_cause = excluded.root_cause, \
+             resolution = excluded.resolution, failed_tries = excluded.failed_tries, tags = excluded.tags, \
+             env_versions = excluded.env_versions, superseded_by = excluded.superseded_by, hits = excluded.hits",
+        rusqlite::params![
+            lesson.id,
+            lesson.created_at,
+            lesson.updated_at,
+            lesson.title,
+            lesson.context,
+            lesson.problem,
+            lesson.root_cause,
+            lesson.resolution,
+            lesson.failed_tries,
+            lesson.tags,
+            lesson.env_versions,
+            lesson.superseded_by,
+            lesson.hits,
+        ],
+    )?;
+    Ok(())
+}
+
+/// How often `move_lesson` re-copies a lesson that keeps changing while it is being moved.
+const MOVE_ATTEMPTS: u32 = 3;
+
+/// Moves `lesson_id` from `source` to `target`. Returns false when `source` does not hold it.
+///
+/// Two commits, one per file: a transaction cannot span two SQLite files atomically in WAL mode.
+/// The copy commits first, so a crash in between leaves a copy in both files, never in neither;
+/// re-running the move then refreshes the copy and finishes the delete.
+pub fn move_lesson(source: &mut Connection, target: &Connection, lesson_id: &str) -> Result<bool> {
+    for attempt in 1..=MOVE_ATTEMPTS {
+        let copied: Lesson = match find_by_id(source, lesson_id)? {
+            Some(lesson) => lesson,
+            None => return Ok(false),
+        };
+        copy_into(target, &copied)?;
+        if find_by_id(target, lesson_id)?.as_ref() != Some(&copied) {
+            bail!(
+                "the copy of {lesson_id} did not land in the target; the source is left untouched"
+            );
+        }
+        // IMMEDIATE blocks other writers on the source, so the row cannot change between this
+        // comparison and the delete; a change made since the copy means the copy is stale.
+        let transaction =
+            source.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        match find_by_id(&transaction, lesson_id)? {
+            Some(current) if current == copied => {
+                transaction.execute("DELETE FROM lesson WHERE id = ?1", [lesson_id])?;
+                transaction.commit()?;
+                journal!("move {lesson_id}: copied and deleted from source (attempt {attempt})");
+                return Ok(true);
+            }
+            Some(_changed) => {
+                journal!(
+                    "move {lesson_id}: source changed during the move, copying again (attempt {attempt})"
+                );
+            }
+            None => {
+                journal!(
+                    "move {lesson_id}: source row already gone (a concurrent move finished it)"
+                );
+                return Ok(true);
+            }
+        }
+    }
+    bail!(
+        "{lesson_id} kept changing during the move ({MOVE_ATTEMPTS} attempts); both files hold a copy, run move again"
+    )
+}
+
 /// A search result: the lesson, its file, and its bm25 score (lower ranks higher).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
@@ -673,6 +755,89 @@ mod tests {
             "sorted best first"
         );
         assert_eq!(search_all(&opened, "\"linker\"", 2).unwrap().len(), 2);
+    }
+
+    fn work_and_shared() -> (tempfile::TempDir, Connection, Connection) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let work_conn: Connection =
+            open(&temp_dir.path().join("work.db"), OpenMode::Create).unwrap();
+        let shared_conn: Connection =
+            open(&temp_dir.path().join("shared.db"), OpenMode::Create).unwrap();
+        (temp_dir, work_conn, shared_conn)
+    }
+
+    #[test]
+    fn move_lesson_keeps_every_field_and_reindexes_in_the_target() {
+        let (_temp_dir, mut work_conn, shared_conn) = work_and_shared();
+        let lesson_id: String = insert(&work_conn, &minimal_lesson()).unwrap();
+        bump_hits(&work_conn, &lesson_id).unwrap();
+        let before_move: Lesson = find_by_id(&work_conn, &lesson_id).unwrap().unwrap();
+
+        assert!(move_lesson(&mut work_conn, &shared_conn, &lesson_id).unwrap());
+        assert_eq!(
+            find_by_id(&shared_conn, &lesson_id).unwrap(),
+            Some(before_move)
+        );
+        assert_eq!(find_by_id(&work_conn, &lesson_id).unwrap(), None);
+        assert_eq!(
+            search(&shared_conn, Domain::Shared, "\"linker\"", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            search(&work_conn, Domain::Work, "\"linker\"", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn move_lesson_finishes_after_a_crash_between_copy_and_delete() {
+        let (_temp_dir, mut work_conn, shared_conn) = work_and_shared();
+        let lesson_id: String = insert(&work_conn, &minimal_lesson()).unwrap();
+        // The crash: the copy committed, the delete never ran. Then the source was edited.
+        copy_into(
+            &shared_conn,
+            &find_by_id(&work_conn, &lesson_id).unwrap().unwrap(),
+        )
+        .unwrap();
+        let patch = LessonPatch {
+            title: Some("edited after the crash".into()),
+            ..LessonPatch::default()
+        };
+        update(&work_conn, &lesson_id, &patch).unwrap();
+
+        assert!(move_lesson(&mut work_conn, &shared_conn, &lesson_id).unwrap());
+        let moved: Lesson = find_by_id(&shared_conn, &lesson_id).unwrap().unwrap();
+        assert_eq!(
+            moved.title, "edited after the crash",
+            "the retry copies the source's current state"
+        );
+        assert_eq!(find_by_id(&work_conn, &lesson_id).unwrap(), None);
+        let target_rows: i64 = shared_conn
+            .query_row("SELECT count(*) FROM lesson", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(target_rows, 1, "no duplicate in the target");
+        assert_eq!(
+            search(&shared_conn, Domain::Shared, "\"crash\"", 10)
+                .unwrap()
+                .len(),
+            1,
+            "the index followed the refresh"
+        );
+        assert!(
+            search(&shared_conn, Domain::Shared, "\"linker\"", 10)
+                .unwrap()
+                .is_empty(),
+            "and dropped the old title"
+        );
+    }
+
+    #[test]
+    fn move_lesson_reports_an_id_the_source_does_not_hold() {
+        let (_temp_dir, mut work_conn, shared_conn) = work_and_shared();
+        assert!(!move_lesson(&mut work_conn, &shared_conn, "01NOSUCHID").unwrap());
     }
 
     #[test]
