@@ -1,0 +1,347 @@
+//! End-to-end tests: run the real `lessons` binary against a throwaway LESSONS_HOME.
+
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+
+/// A `lessons` command isolated from the developer's own data, log setting and editor.
+fn lessons_command(lessons_home: &Path) -> Command {
+    let mut mut_command = Command::new(env!("CARGO_BIN_EXE_lessons"));
+    mut_command
+        .env("LESSONS_HOME", lessons_home)
+        .env_remove("LESSONS_LOG")
+        .env_remove("VISUAL")
+        .env_remove("EDITOR");
+    mut_command
+}
+
+fn run_lessons(lessons_home: &Path, args: &[&str]) -> Output {
+    lessons_command(lessons_home)
+        .args(args)
+        .output()
+        .expect("run lessons")
+}
+
+fn run_lessons_with_stdin(lessons_home: &Path, args: &[&str], stdin_text: &str) -> Output {
+    let mut mut_child = lessons_command(lessons_home)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lessons");
+    mut_child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin_text.as_bytes())
+        .expect("write stdin");
+    mut_child.wait_with_output().expect("wait for lessons")
+}
+
+fn stdout_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Runs a command that must succeed and returns its stdout.
+fn expect_success(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        stderr_of(&output)
+    );
+    stdout_of(&output)
+}
+
+fn init_all(lessons_home: &Path) {
+    expect_success(run_lessons(lessons_home, &["init"]));
+}
+
+/// A made-up lesson, used as the round-trip fixture.
+const FIRST_LESSON_ARGS: [&str; 16] = [
+    "add",
+    "--to",
+    "shared",
+    "--title",
+    "CI build cannot pull from the private registry",
+    "--problem",
+    "pull_image: not_found_or_no_access for example-org/widget-api",
+    "--root-cause",
+    "The CI runner's registry token had expired; a local docker login does not apply to CI runners",
+    "--resolution",
+    "Rotated the registry token and stored it as a CI secret",
+    "--failed",
+    "Retrying the pull; re-running docker login locally; clearing the build cache",
+    "--tags",
+    "docker registry ssh",
+    "--verbose",
+];
+
+#[test]
+fn init_creates_all_three_files_and_is_safe_to_repeat() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let first_run: String = expect_success(run_lessons(temp_dir.path(), &["init"]));
+    assert_eq!(first_run.matches("created").count(), 3, "{first_run}");
+    ["work.db", "personal.db", "shared.db"]
+        .iter()
+        .for_each(|file_name| {
+            assert!(
+                temp_dir.path().join(file_name).exists(),
+                "{file_name} missing"
+            )
+        });
+    let second_run: String = expect_success(run_lessons(temp_dir.path(), &["init"]));
+    assert_eq!(second_run.matches("ready").count(), 3, "{second_run}");
+}
+
+#[test]
+fn init_with_one_domain_creates_only_that_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    expect_success(run_lessons(temp_dir.path(), &["init", "--domain", "work"]));
+    assert!(temp_dir.path().join("work.db").exists());
+    assert!(!temp_dir.path().join("personal.db").exists());
+    assert!(!temp_dir.path().join("shared.db").exists());
+}
+
+#[test]
+fn add_without_to_is_refused() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let output: Output = run_lessons(temp_dir.path(), &["add", "--title", "t", "--problem", "p"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("--to"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn add_to_a_missing_file_points_at_init_and_creates_nothing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let output: Output = run_lessons(
+        temp_dir.path(),
+        &["add", "--to", "work", "--title", "t", "--problem", "p"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("lessons init --domain work"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!temp_dir.path().join("work.db").exists());
+}
+
+#[test]
+fn add_without_title_or_problem_is_refused() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let output: Output = run_lessons(
+        temp_dir.path(),
+        &["add", "--to", "shared", "--title", "only a title"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("--problem"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn add_with_flags_then_show_as_text_and_json() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let add_output: Output = run_lessons(temp_dir.path(), &FIRST_LESSON_ARGS);
+    assert!(
+        stderr_of(&add_output).contains("insert "),
+        "--verbose should journal the insert"
+    );
+    let lesson_id: String = expect_success(add_output).trim().to_string();
+    assert_eq!(
+        lesson_id.len(),
+        26,
+        "a ULID is 26 characters, got {lesson_id:?}"
+    );
+
+    let shown_text: String = expect_success(run_lessons(temp_dir.path(), &["show", &lesson_id]));
+    assert!(
+        shown_text.starts_with(&format!("{lesson_id} [shared] CI build cannot")),
+        "{shown_text}"
+    );
+    assert!(
+        shown_text.contains("not_found_or_no_access"),
+        "{shown_text}"
+    );
+
+    let shown_json: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &["show", &lesson_id, "--format", "json"],
+    ));
+    let lesson_json: serde_json::Value = serde_json::from_str(&shown_json).expect("valid JSON");
+    assert_eq!(lesson_json["domain"], "shared");
+    assert_eq!(lesson_json["id"], lesson_id.as_str());
+    assert_eq!(lesson_json["tags"], "docker registry ssh");
+    assert_eq!(
+        lesson_json["failed_tries"],
+        "Retrying the pull; re-running docker login locally; clearing the build cache"
+    );
+    assert_eq!(lesson_json["context"], serde_json::Value::Null);
+    assert_eq!(lesson_json["hits"], 0);
+}
+
+#[test]
+fn add_json_from_stdin_then_show() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_json: &str =
+        r#"{"title":"from an LLM","problem":"ld: library not found","tags":"linker"}"#;
+    let lesson_id: String = expect_success(run_lessons_with_stdin(
+        temp_dir.path(),
+        &["add", "--to", "work", "--json", "-"],
+        lesson_json,
+    ))
+    .trim()
+    .to_string();
+    let shown_text: String = expect_success(run_lessons(temp_dir.path(), &["show", &lesson_id]));
+    assert!(shown_text.contains("[work] from an LLM"), "{shown_text}");
+}
+
+#[test]
+fn add_json_with_an_unknown_key_is_refused() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let output: Output = run_lessons_with_stdin(
+        temp_dir.path(),
+        &["add", "--to", "work", "--json", "-"],
+        r#"{"title":"t","problem":"p","rootcause":"typo"}"#,
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("rootcause"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn add_json_cannot_be_combined_with_field_flags() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let output: Output = run_lessons_with_stdin(
+        temp_dir.path(),
+        &["add", "--to", "work", "--json", "-", "--title", "t"],
+        "{}",
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("cannot be used with"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn show_of_an_unknown_id_fails_and_names_the_files_searched() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    expect_success(run_lessons(
+        temp_dir.path(),
+        &["init", "--domain", "shared"],
+    ));
+    let output: Output = run_lessons(temp_dir.path(), &["show", "01NOSUCHID"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("no lesson with id 01NOSUCHID in shared"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[cfg(unix)]
+mod editor {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Writes a fake editor: a shell script that overwrites the file it is given with `edited_toml`.
+    fn fake_editor(script_dir: &Path, edited_toml: &str) -> std::path::PathBuf {
+        let script_path = script_dir.join("fake-editor.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat > \"$1\" <<'EOF'\n{edited_toml}\nEOF\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_path
+    }
+
+    fn leftover_templates(temp_root: &Path) -> usize {
+        std::fs::read_dir(temp_root)
+            .unwrap()
+            .filter(|dir_entry| {
+                dir_entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("lessons-")
+            })
+            .count()
+    }
+
+    fn run_add_edit(lessons_home: &Path, temp_root: &Path, editor_path: &Path) -> Output {
+        lessons_command(lessons_home)
+            .env("EDITOR", editor_path)
+            .env("TMPDIR", temp_root) // std::env::temp_dir() reads TMPDIR, so templates land where the test can see them
+            .args(["add", "--to", "shared", "--edit"])
+            .output()
+            .expect("run lessons")
+    }
+
+    #[test]
+    fn add_edit_stores_what_the_editor_wrote_and_removes_the_template() {
+        let lessons_home = tempfile::tempdir().unwrap();
+        let temp_root = tempfile::tempdir().unwrap();
+        init_all(lessons_home.path());
+        let editor_path = fake_editor(
+            temp_root.path(),
+            "title = \"from the editor\"\nproblem = \"typed in vi\"",
+        );
+        let lesson_id: String = expect_success(run_add_edit(
+            lessons_home.path(),
+            temp_root.path(),
+            &editor_path,
+        ))
+        .trim()
+        .to_string();
+        let shown_text: String =
+            expect_success(run_lessons(lessons_home.path(), &["show", &lesson_id]));
+        assert!(
+            shown_text.contains("[shared] from the editor"),
+            "{shown_text}"
+        );
+        assert_eq!(leftover_templates(temp_root.path()), 0);
+    }
+
+    #[test]
+    fn add_edit_keeps_the_template_when_the_lesson_is_refused() {
+        let lessons_home = tempfile::tempdir().unwrap();
+        let temp_root = tempfile::tempdir().unwrap();
+        init_all(lessons_home.path());
+        let editor_path = fake_editor(
+            temp_root.path(),
+            "title = \"no problem filled in\"\nproblem = \"\"",
+        );
+        let output: Output = run_add_edit(lessons_home.path(), temp_root.path(), &editor_path);
+        assert!(!output.status.success());
+        assert!(
+            stderr_of(&output).contains("kept at"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(leftover_templates(temp_root.path()), 1);
+    }
+}

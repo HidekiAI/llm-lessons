@@ -20,7 +20,7 @@ use crate::journal;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The three domains, one DB file each.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Domain {
     Work,
     Personal,
@@ -28,6 +28,8 @@ pub enum Domain {
 }
 
 impl Domain {
+    pub const ALL: [Domain; 3] = [Domain::Work, Domain::Personal, Domain::Shared];
+
     /// The name used for the file stem, for the ATTACH schema name, and in config.toml.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -100,6 +102,44 @@ pub fn open(path: &Path, mode: OpenMode) -> Result<Connection> {
 
     migrate(&mut mut_conn, path)?;
     Ok(mut_conn)
+}
+
+/// Opens the file a write targets (`add --to`). A missing file is an error that names the fix,
+/// because the user chose this domain explicitly; it is never created as a side effect.
+pub fn open_target(lessons_home: &Path, domain: Domain) -> Result<Connection> {
+    let db_path: PathBuf = domain.file_path(lessons_home);
+    if !db_path.exists() {
+        bail!(
+            "{} does not exist; run `lessons init --domain {}` first",
+            db_path.display(),
+            domain.as_str()
+        );
+    }
+    open(&db_path, OpenMode::Existing)
+}
+
+/// Opens each requested domain whose file exists and skips the rest: a machine may hold only some
+/// of the three files on purpose (no personal.db on a work laptop).
+pub fn open_existing_domains(
+    lessons_home: &Path,
+    domains: &[Domain],
+) -> Result<Vec<(Domain, Connection)>> {
+    domains
+        .iter()
+        .filter_map(|&domain| {
+            let db_path: PathBuf = domain.file_path(lessons_home);
+            if db_path.exists() {
+                Some(open(&db_path, OpenMode::Existing).map(|conn| (domain, conn)))
+            } else {
+                journal!(
+                    "skip {}: {} does not exist",
+                    domain.as_str(),
+                    db_path.display()
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Pause between attempts to switch a contended file into WAL mode.
@@ -329,6 +369,33 @@ mod tests {
                 open_result.as_ref().unwrap_err()
             )
         });
+    }
+
+    #[test]
+    fn open_existing_domains_skips_missing_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        open(&Domain::Shared.file_path(temp_dir.path()), OpenMode::Create).expect("create shared");
+        let opened: Vec<Domain> =
+            open_existing_domains(temp_dir.path(), &[Domain::Work, Domain::Shared])
+                .expect("open")
+                .into_iter()
+                .map(|(domain, _conn)| domain)
+                .collect();
+        assert_eq!(opened, vec![Domain::Shared]);
+        assert!(!Domain::Work.file_path(temp_dir.path()).exists());
+    }
+
+    #[test]
+    fn open_target_names_init_when_the_file_is_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let open_error: String = format!(
+            "{:#}",
+            open_target(temp_dir.path(), Domain::Work).unwrap_err()
+        );
+        assert!(
+            open_error.contains("lessons init --domain work"),
+            "unexpected error: {open_error}"
+        );
     }
 
     #[test]
