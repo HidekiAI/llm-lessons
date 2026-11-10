@@ -104,22 +104,37 @@ Use the absolute path to `lessons` if it is not on the PATH the hook sees.
 
 ### How do I share my sqlite db lessons so that lessons learned at work can be applied to home and vice-versa?
 
-Sync them through a **private git repo** (GitHub, GitLab, any host) with `lessons sync`. The `.db` files never leave your machines: each sync writes their lessons as text, one JSON line per lesson (`work.jsonl`, `personal.jsonl`, `shared.jsonl`), merges those with the repo's copy, and updates the local `.db` from the result.
+Sync them through a git repo (GitHub, GitLab, any host) with `lessons sync`. The `.db` files never leave your machines: each sync writes their lessons as text, one JSON line per lesson (`work.jsonl`, `personal.jsonl`, `shared.jsonl`), merges those with the repo's copy, and updates the local `.db` from the result.
 
-1. Create one private repo for the lessons, e.g. `<you>/<private-repo>`. If your work and personal GitHub accounts are separate, add the other account as a collaborator, so both can push. A gist does not work for this: only its owner can push, it cannot have collaborators, and a secret gist is readable by anyone who has its URL.
-2. Copy [`docs/config.sample.toml`](docs/config.sample.toml) to `~/.lessons/config.toml` (your private copy; never commit it) and fill in one `[sync.<domain>]` section per database this machine should sync: the repo's `remote`, the `ssh_key` for it, and `update = "live"` (sync after each change) or `"on-demand"` (sync when reading, at most every `pull_every_minutes`). All three may name the same repo.
-3. Run `lessons sync`, or let `update` trigger it in the background. `lessons` makes and manages its own clone under `~/.lessons/sync/`.
+> [!CAUTION]
+> Keep any repo that holds **work** lessons **private**: your employer's rules on its data apply, and anything pushed stays in the history, and in forks and archives, even after you delete it. `shared` and `personal` are your call: if you have nothing to hide, a public repo lets others learn from your lessons. A repo's visibility is set in its Settings, under Danger Zone. While a synced repo is public, every `lessons` command prints a warning.
+
+**Before you start**, create 1, 2 or 3 repos dedicated to the lessons DBs (private unless you chose otherwise above). A gist does not work for this: only its owner can push, it cannot have collaborators, and a secret gist is readable by anyone who has its URL.
+
+**Scenario A: separate work and personal accounts.** Create the repo(s) with your personal account and add your work account as a collaborator (Settings > Collaborators), so both can push. Either one repo for all three DBs, or a work-only repo plus one for `personal` and `shared`; with a work-only repo, sync also checks that no other key on the machine can read it. Then, on each machine:
+
+```sh
+scripts/setup.sh --domains work,shared        # the work laptop: no personal.db there
+scripts/setup.sh --domains personal,shared    # a home machine
+```
+
+**Scenario B: one account for work and personal.** One private repo is enough. On each machine:
+
+```sh
+scripts/setup.sh --domains work,personal,shared
+```
+
+In a terminal, `setup.sh` then asks, per domain, for the repo URL (Enter skips syncing that domain; the previous answer is offered again, so one repo can serve all three), the SSH key for it (from the keys in `~/.ssh`; domains sharing a repo share its key), `live` (sync after each change) or `on-demand` (sync when reading), and `pull_every_minutes` (default 10). Sync commits use your global git name and email. It writes the answers to `~/.lessons/config.toml`, your private copy (never commit it), creating it if needed and otherwise only adding the missing `[sync.<domain>]` sections. To write the file by hand instead, start from [`docs/config.sample.toml`](docs/config.sample.toml).
+
+After that, `lessons sync` runs by itself in the background as `update` says, or by hand. `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
 How the merge works:
 
 - Each lesson is merged field by field against the last synced version, so edits to different fields on two machines are both kept.
-- When both machines changed the same field differently, sync keeps one value and queues the other; nothing is dropped. `lessons resolve` then asks you per field: keep one, keep the other, combine both (tagged `needs-reword`, for you to reword later), or edit, or skip it to keep it queued.
+- When both machines changed the same field differently, sync keeps one value and queues the other; nothing is dropped. `lessons resolve` then asks you per field: keep one, keep the other, combine both (tagged `needs-reword`, for you to reword later), edit, or skip to keep it queued.
 - A sync never prompts: it runs in the background, so a passphrase or an unknown-host question makes it fail, not wait.
 
-Guards:
-
-- A public remote is refused for every database.
-- When `work` has a repo of its own, sync refuses it if any other configured key can read that repo. With all three in one repo, it warns once per sync that work data is readable by everyone with access to that repo; check your employer's rules on its data before syncing `work` into a personal account's repo.
+When `work` shares a repo with `personal` or `shared`, sync notes once per sync that work data is readable by everyone with access to that repo.
 
 Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dropbox). A sync client can copy a `.db` mid-write, or apart from its `-wal` file, which can corrupt it, and on a conflict it silently keeps one copy.
 
