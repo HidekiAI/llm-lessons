@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use rusqlite::Connection;
+
+use crate::db::Domain;
 use crate::store::SearchHit;
 use crate::{config, db, journal, query, store};
 
@@ -47,7 +50,7 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
     );
     let hits: Vec<SearchHit> = match &fts_query {
         Some(fts_query) => {
-            let opened = db::open_existing_domains(lessons_home, &hook_config.domains)?;
+            let opened = open_readable_domains(lessons_home, &hook_config.domains);
             let candidate_hits: Vec<SearchHit> = store::search_all(
                 &opened,
                 fts_query,
@@ -63,6 +66,24 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
     };
     journal!("hook: {} hit(s) printed", hits.len());
     Ok(render(&hits))
+}
+
+/// Opens each existing file of `domains`, skipping one that fails to open (corrupt, locked, no
+/// permission) with a note on stderr: in the hook, one bad file must not silence the good ones.
+fn open_readable_domains(lessons_home: &Path, domains: &[Domain]) -> Vec<(Domain, Connection)> {
+    domains
+        .iter()
+        .filter(|domain| domain.file_path(lessons_home).exists())
+        .filter_map(|&domain| {
+            match db::open(&domain.file_path(lessons_home), db::OpenMode::Existing) {
+                Ok(conn) => Some((domain, conn)),
+                Err(open_error) => {
+                    eprintln!("lessons hook: skipping {}: {open_error:#}", domain.as_str());
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Moves hits whose `context` names the current directory to the front, keeping score order
@@ -113,7 +134,7 @@ fn render(hits: &[SearchHit]) -> String {
             format!(
                 "- [{}] {} (id {})\n  problem: {}\n{}{}{}",
                 hit.domain,
-                hit.lesson.title,
+                fn_first_line(&hit.lesson.title),
                 hit.lesson.id,
                 fn_first_line(&hit.lesson.problem),
                 fn_optional_line("root cause", &hit.lesson.root_cause),
@@ -122,14 +143,19 @@ fn render(hits: &[SearchHit]) -> String {
             )
         })
         .collect();
-    // Keep whole blocks while they fit; the best-scored come first, so the cut drops the weakest.
-    let kept_blocks: String = lesson_blocks
-        .iter()
-        .scan(HEADER.len() + 1, |chars_used, lesson_block| {
-            *chars_used += lesson_block.chars().count();
-            (*chars_used <= MAX_OUTPUT_CHARS).then_some(lesson_block.as_str())
-        })
-        .collect();
+    // Keep whole blocks while they fit, best-scored first. A block that does not fit is skipped,
+    // not a stop: one oversized lesson must not hide the smaller ones ranked after it.
+    let (_chars_used, kept_blocks): (usize, String) = lesson_blocks.iter().fold(
+        (HEADER.len() + 1, String::new()),
+        |(chars_used, kept_blocks), lesson_block| {
+            let block_chars: usize = lesson_block.chars().count();
+            if chars_used + block_chars <= MAX_OUTPUT_CHARS {
+                (chars_used + block_chars, kept_blocks + lesson_block)
+            } else {
+                (chars_used, kept_blocks)
+            }
+        },
+    );
     if kept_blocks.is_empty() {
         String::new()
     } else {
@@ -140,6 +166,19 @@ fn render(hits: &[SearchHit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title longer than MAX_LINE_CHARS, so the per-line cut must apply.
+    const OVERSIZED_TITLE_CHARS: usize = MAX_LINE_CHARS + 100;
+    /// Enough pasted-log lines to exceed MAX_OUTPUT_CHARS many times over.
+    const PASTED_LOG_LINES: usize = 20_000;
+    /// How many lessons past the result cap a test inserts, so the cap has something to cut.
+    const EXTRA_LESSONS_PAST_THE_CAP: usize = 3;
+    /// A field far longer than MAX_LINE_CHARS.
+    const HUGE_FIELD_CHARS: usize = MAX_LINE_CHARS * 16;
+    /// Enough maximal lessons that their blocks together overflow MAX_OUTPUT_CHARS.
+    const MANY_LESSONS: usize = 40;
+    /// `search_hit` fills problem, root cause, fix and failed with the same text: four long lines.
+    const LONG_FIELDS_PER_LARGE_BLOCK: usize = 4;
     use crate::db::{Domain, OpenMode, open};
     use crate::store::{NewLesson, insert};
 
@@ -242,7 +281,8 @@ mod tests {
     #[test]
     fn max_results_caps_the_output() {
         let temp_dir = tempfile::tempdir().unwrap();
-        (0..8).for_each(|lesson_index| {
+        let default_max_results: usize = config::HookConfig::default().max_results;
+        (0..default_max_results + EXTRA_LESSONS_PAST_THE_CAP).for_each(|lesson_index| {
             add_lesson(
                 temp_dir.path(),
                 Domain::Shared,
@@ -253,7 +293,7 @@ mod tests {
         let hook_text: String = hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap();
         assert_eq!(
             hook_text.matches("\n- [").count() + usize::from(hook_text.starts_with("- [")),
-            5
+            default_max_results
         );
     }
 
@@ -261,12 +301,15 @@ mod tests {
     fn output_stays_under_the_claude_code_limit_and_long_lines_are_cut() {
         let temp_dir = tempfile::tempdir().unwrap();
         let conn = open(&Domain::Shared.file_path(temp_dir.path()), OpenMode::Create).unwrap();
-        let huge_line: String = format!("registry {}", "x".repeat(5_000));
-        (0..40).for_each(|lesson_index| {
+        let huge_line: String = format!("registry {}", "x".repeat(HUGE_FIELD_CHARS));
+        (0..MANY_LESSONS).for_each(|lesson_index| {
             insert(
                 &conn,
                 &NewLesson {
-                    title: format!("registry {lesson_index} {}", "t".repeat(400)),
+                    title: format!(
+                        "registry {lesson_index} {}",
+                        "t".repeat(OVERSIZED_TITLE_CHARS)
+                    ),
                     problem: huge_line.clone(),
                     resolution: Some(huge_line.clone()),
                     failed_tries: Some(huge_line.clone()),
@@ -277,7 +320,7 @@ mod tests {
         });
         std::fs::write(
             temp_dir.path().join("config.toml"),
-            "[hook]\nmax_results = 40\n",
+            format!("[hook]\nmax_results = {MANY_LESSONS}\n"),
         )
         .unwrap();
         let hook_text: String = hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap();
@@ -293,6 +336,106 @@ mod tests {
                 .all(|line| !line.contains(&"x".repeat(MAX_LINE_CHARS + 1)))
         );
         assert!(hook_text.ends_with('\n'), "no lesson block is cut in half");
+    }
+
+    #[test]
+    fn one_oversized_lesson_does_not_hide_the_others() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let conn = open(&Domain::Shared.file_path(temp_dir.path()), OpenMode::Create).unwrap();
+        // A huge multi-line title, matching the prompt in its strongest column, so it ranks first.
+        let huge_title: String = format!(
+            "registry token\n{}",
+            "line of pasted log\n".repeat(PASTED_LOG_LINES)
+        );
+        insert(
+            &conn,
+            &NewLesson {
+                title: huge_title,
+                problem: "registry token".into(),
+                ..NewLesson::default()
+            },
+        )
+        .unwrap();
+        add_lesson(
+            temp_dir.path(),
+            Domain::Shared,
+            "small registry lesson",
+            None,
+        );
+        let hook_text: String =
+            hook_output(temp_dir.path(), r#"{"prompt":"registry token"}"#).unwrap();
+        assert!(hook_text.contains("small registry lesson"), "{hook_text}");
+        assert!(hook_text.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(
+            !hook_text.contains("line of pasted log"),
+            "only the first line of a title is printed"
+        );
+    }
+
+    fn search_hit(title: &str, field_text: &str) -> SearchHit {
+        SearchHit {
+            domain: "shared",
+            score: -1.0,
+            lesson: crate::store::Lesson {
+                id: "01TESTID".into(),
+                created_at: "2000-01-01T00:00:00Z".into(),
+                updated_at: "2000-01-01T00:00:00Z".into(),
+                title: title.into(),
+                context: None,
+                problem: field_text.into(),
+                root_cause: Some(field_text.into()),
+                resolution: Some(field_text.into()),
+                failed_tries: Some(field_text.into()),
+                tags: None,
+                env_versions: None,
+                superseded_by: None,
+                hits: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn render_skips_a_block_that_no_longer_fits_but_keeps_smaller_ones_after_it() {
+        // Each large block is about 1,300 chars after the per-line caps, so a run of them overflows
+        // MAX_OUTPUT_CHARS; the small block ranked last must still be printed.
+        let long_field: String = "y".repeat(MAX_LINE_CHARS);
+        let large_hit_count: usize =
+            MAX_OUTPUT_CHARS / (LONG_FIELDS_PER_LARGE_BLOCK * MAX_LINE_CHARS) + 1;
+        let ranked_hits: Vec<SearchHit> = (0..large_hit_count)
+            .map(|_| search_hit("large", &long_field))
+            .chain(std::iter::once(search_hit("small last hit", "short")))
+            .collect();
+        let rendered: String = render(&ranked_hits);
+        assert!(rendered.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(
+            rendered.matches("] large (").count() < large_hit_count,
+            "the run must overflow"
+        );
+        assert!(rendered.contains("small last hit"), "{rendered}");
+    }
+
+    #[test]
+    fn render_prints_only_the_first_line_of_a_title() {
+        let rendered: String =
+            render(&[search_hit("first title line\nsecond title line", "short")]);
+        assert!(rendered.contains("first title line"), "{rendered}");
+        assert!(!rendered.contains("second title line"), "{rendered}");
+    }
+
+    #[test]
+    fn a_corrupt_file_is_skipped_and_the_others_still_answer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        add_lesson(temp_dir.path(), Domain::Shared, "registry token", None);
+        std::fs::write(
+            Domain::Work.file_path(temp_dir.path()),
+            "this is not a SQLite file at all",
+        )
+        .unwrap();
+        let hook_text: String = hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap();
+        assert!(
+            hook_text.contains("- [shared] registry token"),
+            "{hook_text}"
+        );
     }
 
     #[test]

@@ -89,10 +89,18 @@ pub fn open(path: &Path, mode: OpenMode) -> Result<Connection> {
     // The timeout goes first: switching to WAL and migrating both take locks.
     mut_conn.busy_timeout(BUSY_TIMEOUT)?;
 
+    // WAL mode is stored in the file, so only a file not yet in it is switched: the switch needs
+    // an exclusive lock, and readers (search, the hook) must not queue behind a writer for it.
+    let current_journal_mode: String =
+        mut_conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     // journal_mode answers with the mode it actually got. A filesystem that cannot do WAL (some
     // network mounts) keeps the old mode; the file still works, readers just block on writers.
-    let journal_mode: String = switch_to_wal(&mut_conn)
-        .with_context(|| format!("cannot set WAL mode on {}", path.display()))?;
+    let journal_mode: String = if current_journal_mode.eq_ignore_ascii_case("wal") {
+        current_journal_mode
+    } else {
+        switch_to_wal(&mut_conn)
+            .with_context(|| format!("cannot set WAL mode on {}", path.display()))?
+    };
     if !journal_mode.eq_ignore_ascii_case("wal") {
         eprintln!(
             "lessons: WARNING: {} is in journal mode {journal_mode}, not WAL; readers will wait on writers",
@@ -175,6 +183,16 @@ fn switch_to_wal(conn: &Connection) -> rusqlite::Result<String> {
 const MIGRATIONS: &[&str] = &[SCHEMA_V1];
 
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
+    // Fast path without any lock: a file already at the latest version needs nothing, and taking
+    // the write lock here would make every read-only command (search, the hook) wait on writers.
+    let unlocked_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if unlocked_version == MIGRATIONS.len() as i64 {
+        journal!(
+            "open {}: schema at version {unlocked_version}, nothing to migrate",
+            path.display()
+        );
+        return Ok(());
+    }
     // IMMEDIATE takes the write lock BEFORE the version is read, so two processes opening a fresh
     // file at the same moment cannot both read 0 and both run CREATE TABLE; the second waits, then
     // reads the version the first one committed.
@@ -351,11 +369,13 @@ mod tests {
 
     #[test]
     fn concurrent_first_opens_of_one_fresh_file_all_succeed() {
+        // Enough simultaneous first opens to make the WAL-switch race show up within a few runs.
+        const CONCURRENT_OPENERS: usize = 8;
         // Each thread has its own connection, as separate processes would.
         let (_temp_dir, db_path) = temp_db_path();
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let open_results: Vec<Result<Connection>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
+            let handles: Vec<_> = (0..CONCURRENT_OPENERS)
                 .map(|_| scope.spawn(|| open(&db_path, OpenMode::Create)))
                 .collect();
             handles
@@ -370,6 +390,31 @@ mod tests {
                 open_result.as_ref().unwrap_err()
             )
         });
+    }
+
+    #[test]
+    fn opening_a_current_file_does_not_wait_for_a_writer() {
+        // Far below BUSY_TIMEOUT, far above a lock-free open (milliseconds).
+        const NO_WAIT_LIMIT: Duration = Duration::from_secs(1);
+        let (_temp_dir, db_path) = temp_db_path();
+        drop(open(&db_path, OpenMode::Create).expect("create"));
+        let mut writer_conn: Connection = Connection::open(&db_path).unwrap();
+        let writer_transaction = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap(); // holds the write lock for the rest of the test
+        let open_started = std::time::Instant::now();
+        let reader_conn: Connection =
+            open(&db_path, OpenMode::Existing).expect("open while a writer holds the lock");
+        assert!(
+            open_started.elapsed() < NO_WAIT_LIMIT,
+            "open waited {:?} on the writer; BUSY_TIMEOUT is {BUSY_TIMEOUT:?}",
+            open_started.elapsed()
+        );
+        let lesson_count: i64 = reader_conn
+            .query_row("SELECT count(*) FROM lesson", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(lesson_count, 0);
+        drop(writer_transaction);
     }
 
     #[test]
@@ -410,7 +455,8 @@ mod tests {
     fn a_schema_newer_than_this_binary_is_refused() {
         let (_temp_dir, db_path) = temp_db_path();
         let conn: Connection = open(&db_path, OpenMode::Create).expect("open");
-        conn.pragma_update(None, "user_version", 99).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap(); // one version past what this binary knows
         drop(conn);
         let open_error: String = format!("{:#}", open(&db_path, OpenMode::Existing).unwrap_err());
         assert!(

@@ -16,6 +16,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::db::{Domain, OpenMode};
 use crate::store::{FoundLesson, LessonPatch, NewLesson, SearchHit};
 
+/// Default `--limit` of `list` and of `search`.
+const LIST_DEFAULT_LIMIT: usize = 20;
+const SEARCH_DEFAULT_LIMIT: usize = 10;
+
 #[derive(Parser)]
 #[command(
     name = "lessons",
@@ -51,7 +55,7 @@ enum Command {
         /// Comma-separated domains (work,personal,shared) or `all`
         #[arg(long = "in", value_name = "DOMAINS", default_value = "all", value_parser = parse_domain_list)]
         in_domains: DomainList,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = LIST_DEFAULT_LIMIT)]
         limit: usize,
         /// Only lessons carrying this whole tag
         #[arg(long)]
@@ -75,7 +79,7 @@ enum Command {
         /// Comma-separated domains (work,personal,shared) or `all`; default from config.toml
         #[arg(long = "in", value_name = "DOMAINS", value_parser = parse_domain_list)]
         in_domains: Option<DomainList>,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = SEARCH_DEFAULT_LIMIT)]
         limit: usize,
         /// Pass TEXT to FTS5 unchanged, as a query expression
         #[arg(long)]
@@ -221,7 +225,14 @@ fn main() -> Result<()> {
         // clap exits 2 on a usage error, and Claude Code reads exit 2 from a hook as "block the
         // prompt": a mistyped hook command in settings.json would block every prompt. Report it
         // and let the prompt through instead.
-        Err(parse_error) if std::env::args().nth(1).as_deref() == Some("hook") => {
+        // The subcommand is the first argument that is not a flag (`lessons --verbose hook ...`).
+        Err(parse_error)
+            if std::env::args()
+                .skip(1)
+                .find(|arg| !arg.starts_with('-'))
+                .as_deref()
+                == Some("hook") =>
+        {
             eprintln!("lessons hook: {parse_error}");
             return Ok(());
         }
@@ -352,12 +363,28 @@ tags = ""
 env_versions = ""
 "#;
 
+#[cfg(unix)]
+const OWNER_ONLY_FILE_MODE: u32 = 0o600; // read and write for the owner, nothing for group or others
+
+/// Creates a new file readable by its owner only: the template may hold work lesson text, and the
+/// temp dir is shared by every user of the machine. `create_new` also refuses a pre-planted file.
+fn write_private_file(file_path: &Path, file_text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut mut_open_options = std::fs::OpenOptions::new();
+    mut_open_options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut mut_open_options, OWNER_ONLY_FILE_MODE);
+    mut_open_options
+        .open(file_path)?
+        .write_all(file_text.as_bytes())
+}
+
 /// Opens the template in the user's editor and parses the result. Returns the template's path,
 /// which the caller deletes only once the lesson is stored.
 fn new_lesson_from_editor() -> Result<(NewLesson, PathBuf)> {
     let template_path: PathBuf =
         std::env::temp_dir().join(format!("lessons-{}.toml", ulid::Ulid::generate()));
-    std::fs::write(&template_path, EDIT_TEMPLATE)
+    write_private_file(&template_path, EDIT_TEMPLATE)
         .with_context(|| format!("cannot write the template {}", template_path.display()))?;
 
     let fn_non_empty_env = |variable_name: &str| {
@@ -552,7 +579,9 @@ fn run_update(lessons_home: &Path, lesson_id: &str, patch: LessonPatch) -> Resul
     let opened = db::open_existing_domains(lessons_home, &Domain::ALL)?;
     let (domain, conn) = store::owner_of(&opened, lesson_id)?
         .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
-    store::update(conn, lesson_id, &patch)?;
+    if !store::update(conn, lesson_id, &patch)? {
+        bail!(lesson_not_found(lessons_home, &opened, lesson_id)); // gone between the lookup and the update
+    }
     println!("updated {lesson_id} [{}]", domain.as_str());
     Ok(())
 }
@@ -582,7 +611,9 @@ fn run_retire(lessons_home: &Path, lesson_id: &str, superseded_by_id: &str) -> R
     })?;
     let (domain, conn) = store::owner_of(&opened, lesson_id)?
         .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
-    store::retire(conn, lesson_id, superseded_by_id)?;
+    if !store::retire(conn, lesson_id, superseded_by_id)? {
+        bail!(lesson_not_found(lessons_home, &opened, lesson_id)); // gone between the lookup and the update
+    }
     println!(
         "retired {lesson_id} [{}], superseded by {superseded_by_id}",
         domain.as_str()

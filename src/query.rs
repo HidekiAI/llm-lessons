@@ -128,7 +128,9 @@ mod tests {
 
     #[test]
     fn caps_the_number_of_terms() {
-        let many_words: String = (0..MAX_TERMS + 4)
+        // A few words past the cap, so the cap has something to drop.
+        const EXTRA_WORDS_PAST_THE_CAP: usize = 4;
+        let many_words: String = (0..MAX_TERMS + EXTRA_WORDS_PAST_THE_CAP)
             .map(|word_index| format!("word{word_index} "))
             .collect();
         let fts_query: String = fts_query_from_text(&many_words).expect("query");
@@ -158,7 +160,7 @@ mod tests {
         insert_problem(&conn, "01ID", "linker failed on bar");
 
         // Proof these inputs really are hostile: passed raw, each one makes MATCH fail.
-        let raw_breaking_inputs: [&str; 3] = [r#"say "hi"#, "foo AND (bar", "nosuchcolumn:foo"];
+        let raw_breaking_inputs: &[&str] = &[r#"say "hi"#, "foo AND (bar", "nosuchcolumn:foo"];
         raw_breaking_inputs.iter().for_each(|raw_input| {
             assert!(
                 match_count(&conn, raw_input).is_err(),
@@ -167,7 +169,8 @@ mod tests {
         });
 
         let hostile_inputs: Vec<&str> = raw_breaking_inputs
-            .into_iter()
+            .iter()
+            .copied()
             .chain([
                 "NOT linker",
                 "-flag",

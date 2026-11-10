@@ -187,7 +187,7 @@ pub struct LessonPatch {
 pub fn update(conn: &Connection, lesson_id: &str, patch: &LessonPatch) -> Result<bool> {
     let fn_is_blank =
         |field: &Option<String>| field.as_deref().is_some_and(|text| text.trim().is_empty());
-    let fields_named: [&Option<String>; 8] = [
+    let fields_named: &[&Option<String>] = &[
         &patch.title,
         &patch.problem,
         &patch.context,
@@ -296,11 +296,40 @@ fn copy_into(target: &Connection, lesson: &Lesson) -> Result<()> {
 /// How often `move_lesson` re-copies a lesson that keeps changing while it is being moved.
 const MOVE_ATTEMPTS: u32 = 3;
 
+/// What `delete_if_unchanged` found in the source once it held the write lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceDelete {
+    Deleted,
+    /// The row was edited after it was copied, so the copy is stale and was not trusted.
+    Changed,
+    /// Nothing to delete: a concurrent move already finished it.
+    AlreadyGone,
+}
+
+/// Deletes the source row only if it still equals `copied`. IMMEDIATE blocks other writers on
+/// the source, so the row cannot change between this comparison and the delete.
+fn delete_if_unchanged(source: &mut Connection, copied: &Lesson) -> Result<SourceDelete> {
+    let transaction = source.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    match find_by_id(&transaction, &copied.id)? {
+        Some(current) if current == *copied => {
+            transaction.execute("DELETE FROM lesson WHERE id = ?1", [&copied.id])?;
+            transaction.commit()?;
+            Ok(SourceDelete::Deleted)
+        }
+        Some(_changed) => Ok(SourceDelete::Changed), // dropping the transaction rolls back; nothing was written
+        None => Ok(SourceDelete::AlreadyGone),
+    }
+}
+
 /// Moves `lesson_id` from `source` to `target`. Returns false when `source` does not hold it.
 ///
 /// Two commits, one per file: a transaction cannot span two SQLite files atomically in WAL mode.
 /// The copy commits first, so a crash in between leaves a copy in both files, never in neither;
 /// re-running the move then refreshes the copy and finishes the delete.
+///
+/// Known limit: two moves of the same lesson to DIFFERENT targets at the same moment can both copy
+/// before either deletes, leaving a copy in each target. Running `move <id> --to <one of them>`
+/// afterwards merges them back into one, because it takes the other copy as its source.
 pub fn move_lesson(source: &mut Connection, target: &Connection, lesson_id: &str) -> Result<bool> {
     for attempt in 1..=MOVE_ATTEMPTS {
         let copied: Lesson = match find_by_id(source, lesson_id)? {
@@ -313,23 +342,17 @@ pub fn move_lesson(source: &mut Connection, target: &Connection, lesson_id: &str
                 "the copy of {lesson_id} did not land in the target; the source is left untouched"
             );
         }
-        // IMMEDIATE blocks other writers on the source, so the row cannot change between this
-        // comparison and the delete; a change made since the copy means the copy is stale.
-        let transaction =
-            source.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        match find_by_id(&transaction, lesson_id)? {
-            Some(current) if current == copied => {
-                transaction.execute("DELETE FROM lesson WHERE id = ?1", [lesson_id])?;
-                transaction.commit()?;
+        match delete_if_unchanged(source, &copied)? {
+            SourceDelete::Deleted => {
                 journal!("move {lesson_id}: copied and deleted from source (attempt {attempt})");
                 return Ok(true);
             }
-            Some(_changed) => {
+            SourceDelete::Changed => {
                 journal!(
                     "move {lesson_id}: source changed during the move, copying again (attempt {attempt})"
                 );
             }
-            None => {
+            SourceDelete::AlreadyGone => {
                 journal!(
                     "move {lesson_id}: source row already gone (a concurrent move finished it)"
                 );
@@ -434,6 +457,11 @@ pub fn list(conn: &Connection, limit: usize, tag: Option<&str>) -> Result<Vec<Le
 mod tests {
     use super::*;
     use crate::db::{OpenMode, open};
+
+    /// A search or list limit above any row count a test inserts, so nothing is cut.
+    const LIMIT_ABOVE_ROW_COUNT: usize = 10;
+    /// A limit below the row count a test inserts, so the cut is visible.
+    const LIMIT_BELOW_ROW_COUNT: usize = 2;
 
     fn temp_conn() -> (tempfile::TempDir, Connection) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -584,11 +612,14 @@ mod tests {
 
     #[test]
     fn bump_hits_counts_up_and_leaves_updated_at_alone() {
+        const BUMP_COUNT: i64 = 2; // more than one, so a counter stuck at 1 fails
         let (_temp_dir, conn) = temp_conn();
         let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
         backdate(&conn, &lesson_id);
-        assert_eq!(bump_hits(&conn, &lesson_id).unwrap(), Some(1));
-        assert_eq!(bump_hits(&conn, &lesson_id).unwrap(), Some(2));
+        // Each bump must report the running total.
+        (1..=BUMP_COUNT).for_each(|expected_hits| {
+            assert_eq!(bump_hits(&conn, &lesson_id).unwrap(), Some(expected_hits));
+        });
         let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
         assert_eq!(stored.updated_at, "2000-01-01T00:00:00Z");
     }
@@ -619,9 +650,10 @@ mod tests {
         };
         let ssh_id: String = fn_insert_tagged("widget-app SSH");
         let underscore_id: String = fn_insert_tagged("git_hub");
-        fn_insert_tagged("gitXhub sshd");
+        let decoy_id: String = fn_insert_tagged("gitXhub sshd");
+        let inserted_count: usize = [&ssh_id, &underscore_id, &decoy_id].len();
         let fn_listed_ids = |tag: Option<&str>| -> Vec<String> {
-            list(&conn, 10, tag)
+            list(&conn, LIMIT_ABOVE_ROW_COUNT, tag)
                 .unwrap()
                 .into_iter()
                 .map(|lesson| lesson.id)
@@ -637,8 +669,11 @@ mod tests {
             vec![underscore_id],
             "`_` must not match `X`"
         );
-        assert_eq!(fn_listed_ids(None).len(), 3);
-        assert_eq!(list(&conn, 2, None).unwrap().len(), 2);
+        assert_eq!(fn_listed_ids(None).len(), inserted_count);
+        assert_eq!(
+            list(&conn, LIMIT_BELOW_ROW_COUNT, None).unwrap().len(),
+            LIMIT_BELOW_ROW_COUNT
+        );
     }
 
     #[test]
@@ -661,7 +696,7 @@ mod tests {
     }
 
     fn search_ids(conn: &Connection, fts_query: &str) -> Vec<String> {
-        search(conn, Domain::Shared, fts_query, 10)
+        search(conn, Domain::Shared, fts_query, LIMIT_ABOVE_ROW_COUNT)
             .unwrap()
             .into_iter()
             .map(|hit| hit.lesson.id)
@@ -738,23 +773,33 @@ mod tests {
             )
             .unwrap()
         };
-        fn_insert(&work_conn, "linker error", "build broke", None);
+        let matching_ids: Vec<String> = vec![
+            fn_insert(&work_conn, "linker error", "build broke", None),
+            fn_insert(&shared_conn, "other", "it broke", Some("linker")),
+            fn_insert(&shared_conn, "another", "linker broke once", None),
+        ];
         fn_insert(&work_conn, "unrelated", "printer jam", None);
-        fn_insert(&shared_conn, "other", "it broke", Some("linker"));
-        fn_insert(&shared_conn, "another", "linker broke once", None);
         fn_insert(&shared_conn, "unrelated", "printer jam", None);
+        let matching_lesson_count: usize = matching_ids.len();
         let opened: Vec<(Domain, Connection)> =
             vec![(Domain::Work, work_conn), (Domain::Shared, shared_conn)];
-        let all_hits: Vec<SearchHit> = search_all(&opened, "\"linker\"", 10).unwrap();
-        assert_eq!(all_hits.len(), 3);
+        let all_hits: Vec<SearchHit> =
+            search_all(&opened, "\"linker\"", LIMIT_ABOVE_ROW_COUNT).unwrap();
+        assert_eq!(all_hits.len(), matching_lesson_count);
         assert_eq!(all_hits[0].domain, "work", "the title match ranks first");
         assert!(
             all_hits
-                .windows(2)
-                .all(|pair| pair[0].score <= pair[1].score),
+                .iter()
+                .zip(all_hits.iter().skip(1))
+                .all(|(better_hit, next_hit)| better_hit.score <= next_hit.score),
             "sorted best first"
         );
-        assert_eq!(search_all(&opened, "\"linker\"", 2).unwrap().len(), 2);
+        assert_eq!(
+            search_all(&opened, "\"linker\"", LIMIT_BELOW_ROW_COUNT)
+                .unwrap()
+                .len(),
+            LIMIT_BELOW_ROW_COUNT
+        );
     }
 
     fn work_and_shared() -> (tempfile::TempDir, Connection, Connection) {
@@ -780,15 +825,25 @@ mod tests {
         );
         assert_eq!(find_by_id(&work_conn, &lesson_id).unwrap(), None);
         assert_eq!(
-            search(&shared_conn, Domain::Shared, "\"linker\"", 10)
-                .unwrap()
-                .len(),
+            search(
+                &shared_conn,
+                Domain::Shared,
+                "\"linker\"",
+                LIMIT_ABOVE_ROW_COUNT
+            )
+            .unwrap()
+            .len(),
             1
         );
         assert!(
-            search(&work_conn, Domain::Work, "\"linker\"", 10)
-                .unwrap()
-                .is_empty()
+            search(
+                &work_conn,
+                Domain::Work,
+                "\"linker\"",
+                LIMIT_ABOVE_ROW_COUNT
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -820,16 +875,26 @@ mod tests {
             .unwrap();
         assert_eq!(target_rows, 1, "no duplicate in the target");
         assert_eq!(
-            search(&shared_conn, Domain::Shared, "\"crash\"", 10)
-                .unwrap()
-                .len(),
+            search(
+                &shared_conn,
+                Domain::Shared,
+                "\"crash\"",
+                LIMIT_ABOVE_ROW_COUNT
+            )
+            .unwrap()
+            .len(),
             1,
             "the index followed the refresh"
         );
         assert!(
-            search(&shared_conn, Domain::Shared, "\"linker\"", 10)
-                .unwrap()
-                .is_empty(),
+            search(
+                &shared_conn,
+                Domain::Shared,
+                "\"linker\"",
+                LIMIT_ABOVE_ROW_COUNT
+            )
+            .unwrap()
+            .is_empty(),
             "and dropped the old title"
         );
     }
@@ -838,6 +903,35 @@ mod tests {
     fn move_lesson_reports_an_id_the_source_does_not_hold() {
         let (_temp_dir, mut work_conn, shared_conn) = work_and_shared();
         assert!(!move_lesson(&mut work_conn, &shared_conn, "01NOSUCHID").unwrap());
+    }
+
+    #[test]
+    fn delete_if_unchanged_deletes_only_the_row_that_was_copied() {
+        let (_temp_dir, mut work_conn, _shared_conn) = work_and_shared();
+        let lesson_id: String = insert(&work_conn, &minimal_lesson()).unwrap();
+        let copied: Lesson = find_by_id(&work_conn, &lesson_id).unwrap().unwrap();
+
+        // Edited after the copy: the stale copy must not cost the source its newer text.
+        bump_hits(&work_conn, &lesson_id).unwrap();
+        assert_eq!(
+            delete_if_unchanged(&mut work_conn, &copied).unwrap(),
+            SourceDelete::Changed
+        );
+        assert!(
+            find_by_id(&work_conn, &lesson_id).unwrap().is_some(),
+            "the changed row is kept"
+        );
+
+        let fresh_copy: Lesson = find_by_id(&work_conn, &lesson_id).unwrap().unwrap();
+        assert_eq!(
+            delete_if_unchanged(&mut work_conn, &fresh_copy).unwrap(),
+            SourceDelete::Deleted
+        );
+        assert_eq!(find_by_id(&work_conn, &lesson_id).unwrap(), None);
+        assert_eq!(
+            delete_if_unchanged(&mut work_conn, &fresh_copy).unwrap(),
+            SourceDelete::AlreadyGone
+        );
     }
 
     #[test]

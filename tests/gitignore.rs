@@ -6,7 +6,7 @@ use std::process::Command;
 
 #[test]
 fn every_private_data_file_is_ignored_by_git() {
-    let private_paths: [&str; 12] = [
+    let private_paths: &[&str] = &[
         "work.db",
         "personal.db",
         "shared.db",

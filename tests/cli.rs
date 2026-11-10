@@ -61,6 +61,12 @@ fn init_all(lessons_home: &Path) {
     expect_success(run_lessons(lessons_home, &["init"]));
 }
 
+/// One DB file per domain; `lessons init` with no flag creates all of them.
+const DOMAIN_FILE_NAMES: &[&str] = &["work.db", "personal.db", "shared.db"];
+
+/// A ULID is 26 Crockford base32 characters.
+const ULID_TEXT_CHARS: usize = 26;
+
 /// A made-up lesson, used as the round-trip fixture.
 const FIRST_LESSON_ARGS: [&str; 16] = [
     "add",
@@ -85,17 +91,23 @@ const FIRST_LESSON_ARGS: [&str; 16] = [
 fn init_creates_all_three_files_and_is_safe_to_repeat() {
     let temp_dir = tempfile::tempdir().unwrap();
     let first_run: String = expect_success(run_lessons(temp_dir.path(), &["init"]));
-    assert_eq!(first_run.matches("created").count(), 3, "{first_run}");
-    ["work.db", "personal.db", "shared.db"]
-        .iter()
-        .for_each(|file_name| {
-            assert!(
-                temp_dir.path().join(file_name).exists(),
-                "{file_name} missing"
-            )
-        });
+    assert_eq!(
+        first_run.matches("created").count(),
+        DOMAIN_FILE_NAMES.len(),
+        "{first_run}"
+    );
+    DOMAIN_FILE_NAMES.iter().for_each(|file_name| {
+        assert!(
+            temp_dir.path().join(file_name).exists(),
+            "{file_name} missing"
+        )
+    });
     let second_run: String = expect_success(run_lessons(temp_dir.path(), &["init"]));
-    assert_eq!(second_run.matches("ready").count(), 3, "{second_run}");
+    assert_eq!(
+        second_run.matches("ready").count(),
+        DOMAIN_FILE_NAMES.len(),
+        "{second_run}"
+    );
 }
 
 #[test]
@@ -164,8 +176,8 @@ fn add_with_flags_then_show_as_text_and_json() {
     let lesson_id: String = expect_success(add_output).trim().to_string();
     assert_eq!(
         lesson_id.len(),
-        26,
-        "a ULID is 26 characters, got {lesson_id:?}"
+        ULID_TEXT_CHARS,
+        "not a ULID: {lesson_id:?}"
     );
 
     let shown_text: String = expect_success(run_lessons(temp_dir.path(), &["show", &lesson_id]));
@@ -454,8 +466,14 @@ fn search_finds_the_first_lesson_by_its_exact_error_code() {
 fn search_spans_files_skips_the_missing_one_and_honours_in() {
     let (temp_dir, shared_id, work_id) = work_laptop_home();
     let both_ids: Vec<String> = search_ids(temp_dir.path(), &["search", "ssh", "--format", "json"]);
-    assert_eq!(both_ids.len(), 2, "{both_ids:?}");
-    assert!(both_ids.contains(&shared_id) && both_ids.contains(&work_id));
+    let mut mut_found_ids: Vec<String> = both_ids;
+    mut_found_ids.sort();
+    let mut mut_expected_ids: Vec<String> = vec![shared_id, work_id.clone()];
+    mut_expected_ids.sort();
+    assert_eq!(
+        mut_found_ids, mut_expected_ids,
+        "one hit from each file, nothing else"
+    );
     assert_eq!(
         search_ids(
             temp_dir.path(),
@@ -686,6 +704,13 @@ fn a_mistyped_hook_command_still_exits_zero() {
         "{}",
         stderr_of(&output)
     );
+    // A global flag before the subcommand must not hide that this is a hook call.
+    let flag_first: Output = run_lessons_with_stdin(
+        temp_dir.path(),
+        &["--verbose", "hook", "user-prompt-sumbit"],
+        "{}",
+    );
+    expect_hook_exit_zero(&flag_first);
     // Outside `hook`, a usage error still fails loudly.
     assert!(
         !run_lessons(temp_dir.path(), &["serach", "x"])
@@ -740,6 +765,11 @@ mod editor {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // The binary's own constants are out of reach of an integration test, so they are named here.
+    const EXECUTABLE_SCRIPT_MODE: u32 = 0o755; // rwx for the owner, r-x for group and others
+    const OWNER_ONLY_FILE_MODE: u32 = 0o600; // rw for the owner, nothing for group or others
+    const PERMISSION_BITS: u32 = 0o777; // mode() also carries the file type; keep only these
+
     /// Writes a fake editor: a shell script that overwrites the file it is given with `edited_toml`.
     fn fake_editor(script_dir: &Path, edited_toml: &str) -> std::path::PathBuf {
         let script_path = script_dir.join("fake-editor.sh");
@@ -748,7 +778,11 @@ mod editor {
             format!("#!/bin/sh\ncat > \"$1\" <<'EOF'\n{edited_toml}\nEOF\n"),
         )
         .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            &script_path,
+            std::fs::Permissions::from_mode(EXECUTABLE_SCRIPT_MODE),
+        )
+        .unwrap();
         script_path
     }
 
@@ -817,5 +851,20 @@ mod editor {
             stderr_of(&output)
         );
         assert_eq!(leftover_templates(temp_root.path()), 1);
+        let template_mode: u32 = std::fs::read_dir(temp_root.path())
+            .unwrap()
+            .map(|dir_entry| dir_entry.unwrap())
+            .find(|dir_entry| {
+                dir_entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("lessons-")
+            })
+            .map(|dir_entry| dir_entry.metadata().unwrap().permissions().mode() & PERMISSION_BITS)
+            .expect("kept template");
+        assert_eq!(
+            template_mode, OWNER_ONLY_FILE_MODE,
+            "the template may hold private text: owner only"
+        );
     }
 }

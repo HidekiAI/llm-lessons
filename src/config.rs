@@ -33,12 +33,15 @@ impl Default for Config {
     }
 }
 
+/// Enough lessons to be useful, few enough to stay a short read before each prompt.
+const DEFAULT_HOOK_MAX_RESULTS: usize = 5;
+
 impl Default for HookConfig {
     fn default() -> Self {
         HookConfig {
             // Personal is left out on purpose: the hook runs inside work sessions too.
             domains: vec![Domain::Work, Domain::Shared],
-            max_results: 5,
+            max_results: DEFAULT_HOOK_MAX_RESULTS,
         }
     }
 }
