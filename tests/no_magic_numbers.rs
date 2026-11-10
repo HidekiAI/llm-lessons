@@ -49,8 +49,11 @@ fn normalized_literal(literal: &str) -> String {
         .chars()
         .filter(|&literal_char| literal_char != '_')
         .collect();
+    // In a hex literal `f32` and `f64` are digits (0x1f32), never a float suffix.
+    let is_hex: bool = without_separators.starts_with("0x");
     let number_part: &str = NUMBER_SUFFIXES
         .iter()
+        .filter(|suffix| !(is_hex && suffix.starts_with('f')))
         .find_map(|suffix| without_separators.strip_suffix(suffix))
         .filter(|number_part| !number_part.is_empty())
         .unwrap_or(&without_separators);
@@ -238,15 +241,16 @@ fn blank_out_const_values(code_text: &str) -> String {
                 (search_from..code_chars.len())
                     .find(|&scan_index| !code_chars[scan_index].is_whitespace())
             };
-            // `static mut NAME: ...` keeps its name after the `mut`.
             let name_start: Option<usize> =
                 fn_next_non_space(name_search_start).and_then(|word_start| {
-                    let mut_keyword: Vec<char> = "mut ".chars().collect();
-                    if code_chars[word_start..].starts_with(&mut_keyword) {
-                        fn_next_non_space(word_start + mut_keyword.len())
-                    } else {
-                        Some(word_start)
-                    }
+                    // `static mut NAME` and lazy_static's `static ref NAME` keep their name after the modifier.
+                    ["mut ", "ref "]
+                        .iter()
+                        .map(|modifier| modifier.chars().collect::<Vec<char>>())
+                        .find(|modifier_chars| code_chars[word_start..].starts_with(modifier_chars))
+                        .map_or(Some(word_start), |modifier_chars| {
+                            fn_next_non_space(word_start + modifier_chars.len())
+                        })
                 });
             name_start.is_some_and(|name_start| {
                 let name_end: usize = (name_start..code_chars.len())
@@ -334,8 +338,10 @@ fn number_literals_in(code_line: &str) -> Vec<String> {
                     // The sign of an exponent (2E-3) belongs to a decimal literal, not to the next token.
                     let is_exponent_sign: bool = (scanned_char == '-' || scanned_char == '+')
                         && !literal_is_radix
-                        && scan_index > mut_char_index
+                        && scan_index >= mut_char_index + TWO_CHAR_TOKEN
                         && matches!(line_chars[scan_index - 1], 'e' | 'E')
+                        // A digit, `.` or `_` before the `e`: an exponent, not the tail of a suffix like `usize`.
+                        && matches!(line_chars[scan_index - TWO_CHAR_TOKEN], '0'..='9' | '.' | '_')
                         && line_chars
                             .get(scan_index + 1)
                             .is_some_and(char::is_ascii_digit);
@@ -417,6 +423,8 @@ fn sized<const N: usize>() -> usize { let generic_body = 77; generic_body }
 impl<T, const M: u8> Holder<T, M> { fn held(&self) { let impl_body = 99; } }
 static mut COUNTER: u32 = 5;
 const _: () = assert!(4 > 3);
+fn edges() { let below = 0usize-1; let above = 1usize+1; let hex_float_digits = 0x1f32; }
+static ref CACHE: Holder = Holder::new(5);
 fn tails() { let via_try = parse()?.2; let via_block = { pair }.2; let unit_exp = 1e0; let small_exp = 2E-3; }
 "##;
     let flagged: Vec<String> = magic_numbers_in(sample_source)
@@ -426,7 +434,7 @@ fn tails() { let via_try = parse()?.2; let via_block = { pair }.2; let unit_exp 
     assert_eq!(
         flagged,
         vec![
-            "7", "250", "8", "2.5", "1_000u32", "0o777", "77", "99", "2E-3"
+            "7", "250", "8", "2.5", "1_000u32", "0o777", "77", "99", "0x1f32", "2E-3"
         ]
     );
 }
