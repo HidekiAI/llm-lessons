@@ -48,9 +48,19 @@ domains = ["work", "shared"]   # personal is left out on purpose
 max_results = 5
 ```
 
-## Claude Code hook
+## Using it from a coding agent
 
-Add to `~/.claude/settings.json`. Use the absolute path to `lessons` if it is not on the PATH the hook sees.
+Any agent that can run a shell command can use it (opencode, Claude Code, others). Add a line like this to the agent's instruction file (`AGENTS.md`, `CLAUDE.md`, ...):
+
+```
+On an unfamiliar error, run `lessons search '<error text>' --format json` before debugging; after solving something non-trivial, propose a `lessons add --json -` entry for me to approve.
+```
+
+`--format json` output and `add --json -` input are the stable contract for agents.
+
+### Optional: Claude Code prompt hook
+
+Claude Code can also run the search on every prompt. Add to `~/.claude/settings.json`; use the absolute path to `lessons` if it is not on the PATH the hook sees.
 
 ```json
 {
@@ -62,14 +72,14 @@ Add to `~/.claude/settings.json`. Use the absolute path to `lessons` if it is no
 }
 ```
 
-On each prompt the hook prints matching lessons, which Claude Code adds as context, and prints nothing when none match. It always exits 0, so it never blocks a prompt. Suggested `CLAUDE.md` line:
+On each prompt the hook prints matching lessons, which Claude Code adds as context, and prints nothing when none match. It always exits 0, so it never blocks a prompt.
 
-```
-On an unfamiliar error, run `lessons search '<error text>' --format json` before debugging; after solving something non-trivial, propose a `lessons add` entry for me to approve.
-```
+## Contributing
+
+`cargo test` also enforces two repo rules: no DB file can be committed (`tests/gitignore.rs`), and no magic-number literal outside a named `const` (`tests/no_magic_numbers.rs`).
 
 ## Phase 2 (not built yet)
 
-- MCP server exposing `search_lessons` and `record_lesson`.
+- MCP server exposing `search_lessons` and `record_lesson`, for any MCP-capable agent.
 - Semantic search with sqlite-vec embeddings.
 - Sync between machines: `lessons export` / `import` to one JSON line per lesson, for a private data repo (never `work.db` in a personal repo).
