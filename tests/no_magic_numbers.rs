@@ -19,6 +19,9 @@ const NUMBER_SUFFIXES: &[&str] = &[
     "i8",
 ];
 
+/// Prefixes of non-decimal literals and their radix.
+const RADIX_PREFIXES: &[(&str, u32)] = &[("0x", 16), ("0o", 8), ("0b", 2)];
+
 /// Two-character tokens the scanner steps over: a comment opener or closer such as `/*`, an
 /// escape such as `\n`, a `b"` or `r"` prefix, and the opening quote plus character of `'x'`.
 const TWO_CHAR_TOKEN: usize = 2;
@@ -46,12 +49,22 @@ fn normalized_literal(literal: &str) -> String {
         .chars()
         .filter(|&literal_char| literal_char != '_')
         .collect();
-    NUMBER_SUFFIXES
+    let number_part: &str = NUMBER_SUFFIXES
         .iter()
         .find_map(|suffix| without_separators.strip_suffix(suffix))
         .filter(|number_part| !number_part.is_empty())
-        .unwrap_or(&without_separators)
-        .to_string()
+        .unwrap_or(&without_separators);
+    // Hex, octal and binary literals compare by value, so `0x0` and `0b1` count as 0 and 1.
+    let radix_literal: Option<(u32, &str)> = RADIX_PREFIXES.iter().find_map(|(prefix, radix)| {
+        number_part
+            .strip_prefix(prefix)
+            .map(|digits| (*radix, digits))
+    });
+    match radix_literal {
+        Some((radix, digits)) => u128::from_str_radix(digits, radix)
+            .map_or(number_part.to_string(), |value| value.to_string()),
+        None => number_part.to_string(),
+    }
 }
 
 fn is_identifier_char(character: char) -> bool {
@@ -213,13 +226,29 @@ fn blank_out_const_values(code_text: &str) -> String {
                 .starts_with(&keyword_chars)
                 .then_some(keyword_index + keyword_chars.len())
         });
-        let item_name_is_uppercase: bool = after_keyword.is_some_and(|name_search_start| {
-            code_chars[name_search_start..]
-                .iter()
-                .find(|name_char| !name_char.is_whitespace())
-                .is_some_and(char::is_ascii_uppercase)
+        // An item reads `const NAME: Type = ...`: an uppercase name, then a `:`.
+        let is_named_item: bool = after_keyword.is_some_and(|name_search_start| {
+            let name_start: Option<usize> = (name_search_start..code_chars.len())
+                .find(|&scan_index| !code_chars[scan_index].is_whitespace());
+            name_start.is_some_and(|name_start| {
+                let name_end: usize = (name_start..code_chars.len())
+                    .find(|&scan_index| !is_identifier_char(code_chars[scan_index]))
+                    .unwrap_or(code_chars.len());
+                code_chars[name_start].is_ascii_uppercase()
+                    && code_chars[name_end..]
+                        .iter()
+                        .find(|after_name| !after_name.is_whitespace())
+                        == Some(&':')
+            })
         });
-        !preceded_by_word_char && item_name_is_uppercase
+        // A const generic parameter (`<const N: usize>`, `, const M: u8`) has the same shape but is
+        // no item: it has no value to blank, and treating it as one would hide real code after it.
+        let is_generic_parameter: bool = code_chars[..keyword_index]
+            .iter()
+            .rev()
+            .find(|before_keyword| !before_keyword.is_whitespace())
+            .is_some_and(|before_keyword| *before_keyword == '<' || *before_keyword == ',');
+        !preceded_by_word_char && is_named_item && !is_generic_parameter
     };
     let mut mut_blanked: Vec<char> = code_chars.clone();
     let mut mut_scan_index: usize = 0;
@@ -271,8 +300,9 @@ fn number_literals_in(code_line: &str) -> Vec<String> {
         let starts_number: bool =
             current_char.is_ascii_digit() && !previous_char.is_some_and(is_identifier_char);
         let is_field_index: bool = previous_char == Some('.')
-            && before_previous
-                .is_some_and(|before_char| is_identifier_char(before_char) || before_char == ')');
+            && before_previous.is_some_and(|before_char| {
+                is_identifier_char(before_char) || before_char == ')' || before_char == ']'
+            });
         if starts_number {
             let literal_end: usize = (mut_char_index..line_chars.len())
                 .find(|&scan_index| {
@@ -349,11 +379,18 @@ fn retry<'a>(pair: (u8, u8, u8), name: &'static str) -> &'a str {
     /* 500 in a block comment /* nested 600 */ still a comment 700 */
     let ratio = 2.5;
     let big = 1_000u32;
+    let hex_zero = 0x0; let binary_one = 0b1; let mask = 0o777; // mask flagged
+    let indexed_field = rows[0].2;
 }
+fn sized<const N: usize>() -> usize { let generic_body = 77; generic_body }
+impl<T, const M: u8> Holder<T, M> { fn held(&self) { let impl_body = 99; } }
 "##;
     let flagged: Vec<String> = magic_numbers_in(sample_source)
         .into_iter()
         .map(|(_line_number, literal)| literal)
         .collect();
-    assert_eq!(flagged, vec!["7", "250", "8", "2.5", "1_000u32"]);
+    assert_eq!(
+        flagged,
+        vec!["7", "250", "8", "2.5", "1_000u32", "0o777", "77", "99"]
+    );
 }
