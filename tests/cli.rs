@@ -261,6 +261,153 @@ fn show_of_an_unknown_id_fails_and_names_the_files_searched() {
     );
 }
 
+/// Adds a minimal lesson and returns its id.
+fn add_lesson(lessons_home: &Path, domain: &str, title: &str, tags: &str) -> String {
+    expect_success(run_lessons(
+        lessons_home,
+        &[
+            "add",
+            "--to",
+            domain,
+            "--title",
+            title,
+            "--problem",
+            "p",
+            "--tags",
+            tags,
+        ],
+    ))
+    .trim()
+    .to_string()
+}
+
+#[test]
+fn update_replaces_and_clears_fields_in_whichever_file_holds_the_lesson() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_id: String = add_lesson(temp_dir.path(), "work", "old title", "rust");
+    let update_output: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &["update", &lesson_id, "--title", "new title", "--tags", ""],
+    ));
+    assert!(update_output.contains("[work]"), "{update_output}");
+    let lesson_json: serde_json::Value = serde_json::from_str(&expect_success(run_lessons(
+        temp_dir.path(),
+        &["show", &lesson_id, "--format", "json"],
+    )))
+    .unwrap();
+    assert_eq!(lesson_json["title"], "new title");
+    assert_eq!(lesson_json["tags"], serde_json::Value::Null);
+    assert_eq!(lesson_json["problem"], "p");
+}
+
+#[test]
+fn update_without_fields_or_of_an_unknown_id_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_id: String = add_lesson(temp_dir.path(), "shared", "t", "x");
+    assert!(
+        !run_lessons(temp_dir.path(), &["update", &lesson_id])
+            .status
+            .success()
+    );
+    let unknown_output: Output =
+        run_lessons(temp_dir.path(), &["update", "01NOSUCHID", "--title", "t"]);
+    assert!(
+        stderr_of(&unknown_output).contains("no lesson with id 01NOSUCHID"),
+        "{}",
+        stderr_of(&unknown_output)
+    );
+}
+
+#[test]
+fn hit_counts_up() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_id: String = add_lesson(temp_dir.path(), "personal", "t", "x");
+    expect_success(run_lessons(temp_dir.path(), &["hit", &lesson_id]));
+    let second_hit: String = expect_success(run_lessons(temp_dir.path(), &["hit", &lesson_id]));
+    assert!(second_hit.contains("[personal]: 2 hits"), "{second_hit}");
+}
+
+#[test]
+fn retire_checks_the_replacement_exists_and_is_not_itself() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let old_id: String = add_lesson(temp_dir.path(), "work", "old", "x");
+    let new_id: String = add_lesson(temp_dir.path(), "shared", "new", "x");
+
+    let typo_output: Output =
+        run_lessons(temp_dir.path(), &["retire", &old_id, "--by", "01NOSUCHID"]);
+    assert!(
+        stderr_of(&typo_output).contains("the replacement"),
+        "{}",
+        stderr_of(&typo_output)
+    );
+    let self_output: Output = run_lessons(temp_dir.path(), &["retire", &old_id, "--by", &old_id]);
+    assert!(
+        stderr_of(&self_output).contains("cannot replace itself"),
+        "{}",
+        stderr_of(&self_output)
+    );
+
+    // The replacement lives in another file: retire must still accept it.
+    expect_success(run_lessons(
+        temp_dir.path(),
+        &["retire", &old_id, "--by", &new_id],
+    ));
+    let shown_text: String = expect_success(run_lessons(temp_dir.path(), &["show", &old_id]));
+    assert!(
+        shown_text.contains(&format!("superseded by {new_id}")),
+        "{shown_text}"
+    );
+    let listed: String = expect_success(run_lessons(temp_dir.path(), &["list"]));
+    assert!(
+        listed.contains(&format!("{old_id} [work] old (retired)")),
+        "{listed}"
+    );
+}
+
+#[test]
+fn list_merges_files_newest_first_and_filters_by_domain_and_tag() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let first_id: String = add_lesson(temp_dir.path(), "work", "first", "ssh");
+    let second_id: String = add_lesson(temp_dir.path(), "shared", "second", "rust");
+    let third_id: String = add_lesson(temp_dir.path(), "personal", "third", "ssh");
+
+    let fn_listed_ids = |args: &[&str]| -> Vec<String> {
+        expect_success(run_lessons(temp_dir.path(), args))
+            .lines()
+            .map(|line| line.split(' ').next().unwrap_or("").to_string())
+            .collect()
+    };
+    // ULIDs created in the same second still sort by creation, so newest-first is deterministic.
+    assert_eq!(
+        fn_listed_ids(&["list"]),
+        vec![third_id.clone(), second_id.clone(), first_id.clone()]
+    );
+    assert_eq!(
+        fn_listed_ids(&["list", "--limit", "2"]),
+        vec![third_id.clone(), second_id.clone()]
+    );
+    assert_eq!(
+        fn_listed_ids(&["list", "--in", "work,shared"]),
+        vec![second_id, first_id.clone()]
+    );
+    assert_eq!(
+        fn_listed_ids(&["list", "--tag", "ssh"]),
+        vec![third_id, first_id]
+    );
+
+    let bad_domain: Output = run_lessons(temp_dir.path(), &["list", "--in", "work,home"]);
+    assert!(
+        stderr_of(&bad_domain).contains("unknown domain `home`"),
+        "{}",
+        stderr_of(&bad_domain)
+    );
+}
+
 #[cfg(unix)]
 mod editor {
     use super::*;

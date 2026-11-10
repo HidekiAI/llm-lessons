@@ -149,6 +149,134 @@ pub fn find_in_domains(
         })
 }
 
+/// The open file that holds `lesson_id`, for commands that change a lesson in place.
+pub fn owner_of<'opened>(
+    opened: &'opened [(Domain, Connection)],
+    lesson_id: &str,
+) -> Result<Option<&'opened (Domain, Connection)>> {
+    opened
+        .iter()
+        .try_fold(None, |first_owner, domain_and_conn| match first_owner {
+            Some(already_found) => Ok(Some(already_found)),
+            None => domain_and_conn
+                .1
+                .query_row("SELECT 1 FROM lesson WHERE id = ?1", [lesson_id], |_row| {
+                    Ok(())
+                })
+                .optional()
+                .map(|found| found.map(|()| domain_and_conn))
+                .map_err(anyhow::Error::from), // try_fold needs one error type for both arms
+        })
+}
+
+/// Changes to an existing lesson. Per field: `None` leaves it as it is, `Some("")` clears it
+/// (stores NULL), any other text replaces it. Title and problem can be replaced, never cleared.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LessonPatch {
+    pub title: Option<String>,
+    pub problem: Option<String>,
+    pub context: Option<String>,
+    pub root_cause: Option<String>,
+    pub resolution: Option<String>,
+    pub failed_tries: Option<String>,
+    pub tags: Option<String>,
+    pub env_versions: Option<String>,
+}
+
+/// Applies `patch` and bumps `updated_at`. Returns false when no lesson has `lesson_id`.
+pub fn update(conn: &Connection, lesson_id: &str, patch: &LessonPatch) -> Result<bool> {
+    let fn_is_blank =
+        |field: &Option<String>| field.as_deref().is_some_and(|text| text.trim().is_empty());
+    let fields_named: [&Option<String>; 8] = [
+        &patch.title,
+        &patch.problem,
+        &patch.context,
+        &patch.root_cause,
+        &patch.resolution,
+        &patch.failed_tries,
+        &patch.tags,
+        &patch.env_versions,
+    ];
+    if fields_named.iter().all(|field| field.is_none()) {
+        bail!("nothing to update: pass at least one field flag");
+    }
+    if fn_is_blank(&patch.title) || fn_is_blank(&patch.problem) {
+        bail!("title and problem cannot be cleared, only replaced");
+    }
+    // One static statement for every patch: a NULL parameter keeps the column (CASE), an empty
+    // one clears it (NULLIF), so no SQL is assembled from strings at run time.
+    let fn_trimmed = |field: &Option<String>| field.as_deref().map(str::trim).map(str::to_string);
+    let changed_rows: usize = conn.execute(
+        "UPDATE lesson SET \
+             title        = CASE WHEN ?2 IS NULL THEN title        ELSE ?2 END, \
+             problem      = CASE WHEN ?3 IS NULL THEN problem      ELSE ?3 END, \
+             context      = CASE WHEN ?4 IS NULL THEN context      ELSE NULLIF(?4, '') END, \
+             root_cause   = CASE WHEN ?5 IS NULL THEN root_cause   ELSE NULLIF(?5, '') END, \
+             resolution   = CASE WHEN ?6 IS NULL THEN resolution   ELSE NULLIF(?6, '') END, \
+             failed_tries = CASE WHEN ?7 IS NULL THEN failed_tries ELSE NULLIF(?7, '') END, \
+             tags         = CASE WHEN ?8 IS NULL THEN tags         ELSE NULLIF(?8, '') END, \
+             env_versions = CASE WHEN ?9 IS NULL THEN env_versions ELSE NULLIF(?9, '') END, \
+             updated_at   = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+         WHERE id = ?1",
+        (
+            lesson_id,
+            fn_trimmed(&patch.title),
+            fn_trimmed(&patch.problem),
+            fn_trimmed(&patch.context),
+            fn_trimmed(&patch.root_cause),
+            fn_trimmed(&patch.resolution),
+            fn_trimmed(&patch.failed_tries),
+            fn_trimmed(&patch.tags),
+            fn_trimmed(&patch.env_versions),
+        ),
+    )?;
+    journal!("update {lesson_id}: {changed_rows} row(s) changed");
+    Ok(changed_rows == 1)
+}
+
+/// Adds one to `hits` and returns the new count, or `None` for an unknown id. Leaves
+/// `updated_at` alone: a hit records use, not an edit.
+pub fn bump_hits(conn: &Connection, lesson_id: &str) -> Result<Option<i64>> {
+    let new_hits: Option<i64> = conn
+        .query_row(
+            "UPDATE lesson SET hits = hits + 1 WHERE id = ?1 RETURNING hits",
+            [lesson_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    journal!("hit {lesson_id}: hits now {new_hits:?}");
+    Ok(new_hits)
+}
+
+/// Marks `lesson_id` as replaced by `superseded_by_id`, which hides it from search. Returns false
+/// for an unknown id. The caller checks that the replacement exists: it may live in another file.
+pub fn retire(conn: &Connection, lesson_id: &str, superseded_by_id: &str) -> Result<bool> {
+    let changed_rows: usize = conn.execute(
+        "UPDATE lesson SET superseded_by = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+         WHERE id = ?1",
+        (lesson_id, superseded_by_id),
+    )?;
+    journal!("retire {lesson_id}: superseded by {superseded_by_id}, {changed_rows} row(s) changed");
+    Ok(changed_rows == 1)
+}
+
+/// The newest `limit` lessons of one file, optionally only those carrying `tag` as a whole tag.
+pub fn list(conn: &Connection, limit: usize, tag: Option<&str>) -> Result<Vec<Lesson>> {
+    // instr, not LIKE: `_` and `%` are wildcards in LIKE, and `_` is common in tags.
+    let mut mut_statement = conn.prepare(&format!(
+        "SELECT {LESSON_SELECT_COLUMNS} FROM lesson \
+         WHERE ?1 IS NULL OR instr(' ' || lower(ifnull(tags, '')) || ' ', ' ' || lower(?1) || ' ') > 0 \
+         ORDER BY created_at DESC, seq DESC LIMIT ?2"
+    ))?;
+    let lessons: Vec<Lesson> = mut_statement
+        .query_map(
+            (tag, i64::try_from(limit).unwrap_or(i64::MAX)),
+            lesson_from_row,
+        )? // a limit beyond i64 means "all"
+        .collect::<rusqlite::Result<Vec<Lesson>>>()?;
+    Ok(lessons)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +362,149 @@ mod tests {
     fn find_by_id_returns_none_for_an_unknown_id() {
         let (_temp_dir, conn) = temp_conn();
         assert_eq!(find_by_id(&conn, "01NOSUCHID").unwrap(), None);
+    }
+
+    /// Backdates a lesson's timestamps, since `updated_at` only has one-second resolution.
+    fn backdate(conn: &Connection, lesson_id: &str) {
+        conn.execute(
+            "UPDATE lesson SET created_at = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            [lesson_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn update_replaces_named_fields_clears_empty_ones_and_keeps_the_rest() {
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(
+            &conn,
+            &NewLesson {
+                context: Some("old context".into()),
+                tags: Some("rust".into()),
+                ..minimal_lesson()
+            },
+        )
+        .unwrap();
+        backdate(&conn, &lesson_id);
+        let patch = LessonPatch {
+            title: Some("loader error".into()),
+            context: Some("".into()),
+            ..LessonPatch::default()
+        };
+        assert!(update(&conn, &lesson_id, &patch).unwrap());
+        let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
+        assert_eq!(stored.title, "loader error");
+        assert_eq!(stored.context, None, "an empty string clears the field");
+        assert_eq!(
+            stored.tags.as_deref(),
+            Some("rust"),
+            "an unnamed field is unchanged"
+        );
+        assert_eq!(stored.problem, "cargo build failed");
+        assert_ne!(stored.updated_at, "2000-01-01T00:00:00Z");
+        assert_eq!(stored.created_at, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn update_refuses_an_empty_patch_and_clearing_title_or_problem() {
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        assert!(update(&conn, &lesson_id, &LessonPatch::default()).is_err());
+        let clear_title = LessonPatch {
+            title: Some(" ".into()),
+            ..LessonPatch::default()
+        };
+        assert!(update(&conn, &lesson_id, &clear_title).is_err());
+    }
+
+    #[test]
+    fn update_hit_and_retire_report_an_unknown_id() {
+        let (_temp_dir, conn) = temp_conn();
+        let patch = LessonPatch {
+            title: Some("t".into()),
+            ..LessonPatch::default()
+        };
+        assert!(!update(&conn, "01NOSUCHID", &patch).unwrap());
+        assert_eq!(bump_hits(&conn, "01NOSUCHID").unwrap(), None);
+        assert!(!retire(&conn, "01NOSUCHID", "01OTHER").unwrap());
+    }
+
+    #[test]
+    fn bump_hits_counts_up_and_leaves_updated_at_alone() {
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        backdate(&conn, &lesson_id);
+        assert_eq!(bump_hits(&conn, &lesson_id).unwrap(), Some(1));
+        assert_eq!(bump_hits(&conn, &lesson_id).unwrap(), Some(2));
+        let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
+        assert_eq!(stored.updated_at, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn retire_records_the_replacement_and_bumps_updated_at() {
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        backdate(&conn, &lesson_id);
+        assert!(retire(&conn, &lesson_id, "01NEWER").unwrap());
+        let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
+        assert_eq!(stored.superseded_by.as_deref(), Some("01NEWER"));
+        assert_ne!(stored.updated_at, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn list_filters_by_whole_tag_and_treats_underscore_literally() {
+        let (_temp_dir, conn) = temp_conn();
+        let fn_insert_tagged = |tags: &str| {
+            insert(
+                &conn,
+                &NewLesson {
+                    tags: Some(tags.into()),
+                    ..minimal_lesson()
+                },
+            )
+            .unwrap()
+        };
+        let ssh_id: String = fn_insert_tagged("widget-app SSH");
+        let underscore_id: String = fn_insert_tagged("git_hub");
+        fn_insert_tagged("gitXhub sshd");
+        let fn_listed_ids = |tag: Option<&str>| -> Vec<String> {
+            list(&conn, 10, tag)
+                .unwrap()
+                .into_iter()
+                .map(|lesson| lesson.id)
+                .collect()
+        };
+        assert_eq!(
+            fn_listed_ids(Some("ssh")),
+            vec![ssh_id],
+            "whole tag, any case; `sshd` is not `ssh`"
+        );
+        assert_eq!(
+            fn_listed_ids(Some("git_hub")),
+            vec![underscore_id],
+            "`_` must not match `X`"
+        );
+        assert_eq!(fn_listed_ids(None).len(), 3);
+        assert_eq!(list(&conn, 2, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn owner_of_finds_the_file_holding_the_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let work_conn: Connection =
+            open(&temp_dir.path().join("work.db"), OpenMode::Create).unwrap();
+        let shared_conn: Connection =
+            open(&temp_dir.path().join("shared.db"), OpenMode::Create).unwrap();
+        let lesson_id: String = insert(&shared_conn, &minimal_lesson()).unwrap();
+        let opened: Vec<(Domain, Connection)> =
+            vec![(Domain::Work, work_conn), (Domain::Shared, shared_conn)];
+        assert_eq!(
+            owner_of(&opened, &lesson_id)
+                .unwrap()
+                .map(|(domain, _conn)| *domain),
+            Some(Domain::Shared)
+        );
+        assert!(owner_of(&opened, "01NOSUCHID").unwrap().is_none());
     }
 
     #[test]

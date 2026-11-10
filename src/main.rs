@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::db::{Domain, OpenMode};
-use crate::store::{FoundLesson, NewLesson};
+use crate::store::{FoundLesson, LessonPatch, NewLesson};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +43,34 @@ enum Command {
         id: String,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+    },
+    /// List the newest lessons
+    List {
+        /// Comma-separated domains (work,personal,shared) or `all`
+        #[arg(long = "in", value_name = "DOMAINS", default_value = "all", value_parser = parse_domain_list)]
+        in_domains: DomainList,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Only lessons carrying this whole tag
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Change fields of a lesson; an empty value (--context "") clears that field
+    Update {
+        id: String,
+        #[command(flatten)]
+        fields: FieldArgs,
+    },
+    /// Record that a retrieved lesson actually helped
+    Hit { id: String },
+    /// Hide a lesson from search because a newer one replaces it
+    Retire {
+        id: String,
+        /// The id of the lesson that replaces it
+        #[arg(long)]
+        by: String,
     },
 }
 
@@ -120,6 +148,19 @@ struct FieldArgs {
 }
 
 impl FieldArgs {
+    fn into_patch(self) -> LessonPatch {
+        LessonPatch {
+            title: self.title,
+            problem: self.problem,
+            context: self.context,
+            root_cause: self.root_cause,
+            resolution: self.resolution,
+            failed_tries: self.failed_tries,
+            tags: self.tags,
+            env_versions: self.env_versions,
+        }
+    }
+
     fn into_new_lesson(self) -> Result<NewLesson> {
         match (self.title, self.problem) {
             (Some(title), Some(problem)) => Ok(NewLesson {
@@ -149,6 +190,15 @@ fn main() -> Result<()> {
         Command::Init { domain } => run_init(&lessons_home, domain),
         Command::Add(add_args) => run_add(&lessons_home, add_args),
         Command::Show { id, format } => run_show(&lessons_home, &id, format),
+        Command::List {
+            in_domains,
+            limit,
+            tag,
+            format,
+        } => run_list(&lessons_home, &in_domains.0, limit, tag.as_deref(), format),
+        Command::Update { id, fields } => run_update(&lessons_home, &id, fields.into_patch()),
+        Command::Hit { id } => run_hit(&lessons_home, &id),
+        Command::Retire { id, by } => run_retire(&lessons_home, &id, &by),
     }
 }
 
@@ -271,23 +321,8 @@ fn new_lesson_from_editor() -> Result<(NewLesson, PathBuf)> {
 
 fn run_show(lessons_home: &Path, lesson_id: &str, format: OutputFormat) -> Result<()> {
     let opened = db::open_existing_domains(lessons_home, &Domain::ALL)?;
-    let searched_names: Vec<&str> = opened
-        .iter()
-        .map(|(domain, _conn)| domain.as_str())
-        .collect();
-    let found: FoundLesson = store::find_in_domains(&opened, lesson_id)?.with_context(|| {
-        if searched_names.is_empty() {
-            format!(
-                "no DB files under {}; run `lessons init`",
-                lessons_home.display()
-            )
-        } else {
-            format!(
-                "no lesson with id {lesson_id} in {}",
-                searched_names.join(", ")
-            )
-        }
-    })?;
+    let found: FoundLesson = store::find_in_domains(&opened, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
     match format {
         OutputFormat::Text => print!("{}", lesson_as_text(&found)),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&found)?),
@@ -331,4 +366,145 @@ fn lesson_as_text(found: &FoundLesson) -> String {
         lesson.updated_at,
         lesson.hits
     )
+}
+
+/// The parsed `--in` value. A newtype because clap reads a bare `Vec` field as a repeatable flag.
+#[derive(Clone, Debug)]
+struct DomainList(Vec<Domain>);
+
+/// Parses `--in`: `all`, or a comma-separated list of domain names, without repeats.
+fn parse_domain_list(domains_text: &str) -> std::result::Result<DomainList, String> {
+    let fn_parse_one = |domain_name: &str| {
+        Domain::from_str(domain_name.trim(), true).map_err(|_| {
+            format!("unknown domain `{domain_name}`; use work, personal, shared or all")
+        })
+    };
+    if domains_text.trim().eq_ignore_ascii_case("all") {
+        Ok(DomainList(Domain::ALL.to_vec()))
+    } else {
+        let parsed: Vec<Domain> = domains_text
+            .split(',')
+            .map(fn_parse_one)
+            .collect::<std::result::Result<Vec<Domain>, String>>()?;
+        Ok(DomainList(
+            Domain::ALL
+                .into_iter()
+                .filter(|domain| parsed.contains(domain))
+                .collect(),
+        )) // fixed order, and a repeated name opens its file once
+    }
+}
+
+/// The error text for an id found in none of the open files, naming what was searched.
+fn lesson_not_found(
+    lessons_home: &Path,
+    opened: &[(Domain, rusqlite::Connection)],
+    lesson_id: &str,
+) -> String {
+    let searched_names: Vec<&str> = opened
+        .iter()
+        .map(|(domain, _conn)| domain.as_str())
+        .collect();
+    if searched_names.is_empty() {
+        format!(
+            "no DB files under {}; run `lessons init`",
+            lessons_home.display()
+        )
+    } else {
+        format!(
+            "no lesson with id {lesson_id} in {}",
+            searched_names.join(", ")
+        )
+    }
+}
+
+fn run_list(
+    lessons_home: &Path,
+    in_domains: &[Domain],
+    limit: usize,
+    tag: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let opened = db::open_existing_domains(lessons_home, in_domains)?;
+    // Each file returns its newest `limit`; merged and cut again, that is the newest `limit` overall.
+    let per_file: Vec<Vec<FoundLesson>> = opened
+        .iter()
+        .map(|(domain, conn)| {
+            store::list(conn, limit, tag).map(|lessons| {
+                lessons
+                    .into_iter()
+                    .map(|lesson| FoundLesson {
+                        domain: domain.as_str(),
+                        lesson,
+                    })
+                    .collect()
+            })
+        })
+        .collect::<Result<Vec<Vec<FoundLesson>>>>()?;
+    let mut mut_newest: Vec<FoundLesson> = per_file.into_iter().flatten().collect();
+    mut_newest.sort_by(|left_lesson, right_lesson| {
+        right_lesson
+            .lesson
+            .created_at
+            .cmp(&left_lesson.lesson.created_at)
+            .then_with(|| right_lesson.lesson.id.cmp(&left_lesson.lesson.id))
+    });
+    mut_newest.truncate(limit);
+    match format {
+        OutputFormat::Text => mut_newest.iter().for_each(|found| {
+            let retired_note: &str = if found.lesson.superseded_by.is_some() {
+                " (retired)"
+            } else {
+                ""
+            };
+            println!(
+                "{} [{}] {}{retired_note}",
+                found.lesson.id, found.domain, found.lesson.title
+            );
+        }),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&mut_newest)?),
+    }
+    Ok(())
+}
+
+fn run_update(lessons_home: &Path, lesson_id: &str, patch: LessonPatch) -> Result<()> {
+    let opened = db::open_existing_domains(lessons_home, &Domain::ALL)?;
+    let (domain, conn) = store::owner_of(&opened, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
+    store::update(conn, lesson_id, &patch)?;
+    println!("updated {lesson_id} [{}]", domain.as_str());
+    Ok(())
+}
+
+fn run_hit(lessons_home: &Path, lesson_id: &str) -> Result<()> {
+    let opened = db::open_existing_domains(lessons_home, &Domain::ALL)?;
+    let (domain, conn) = store::owner_of(&opened, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
+    let new_hits: i64 = store::bump_hits(conn, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?; // gone between the lookup and the update
+    println!("hit {lesson_id} [{}]: {new_hits} hits", domain.as_str());
+    Ok(())
+}
+
+fn run_retire(lessons_home: &Path, lesson_id: &str, superseded_by_id: &str) -> Result<()> {
+    if lesson_id == superseded_by_id {
+        bail!("a lesson cannot replace itself");
+    }
+    let opened = db::open_existing_domains(lessons_home, &Domain::ALL)?;
+    // The replacement may live in another file, so no foreign key can enforce it; check here so a
+    // typo cannot hide a lesson behind an id that does not exist.
+    store::owner_of(&opened, superseded_by_id)?.with_context(|| {
+        format!(
+            "the replacement: {}",
+            lesson_not_found(lessons_home, &opened, superseded_by_id)
+        )
+    })?;
+    let (domain, conn) = store::owner_of(&opened, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
+    store::retire(conn, lesson_id, superseded_by_id)?;
+    println!(
+        "retired {lesson_id} [{}], superseded by {superseded_by_id}",
+        domain.as_str()
+    );
+    Ok(())
 }
