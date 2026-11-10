@@ -63,6 +63,12 @@ fn normalized_literal(literal: &str) -> String {
     match radix_literal {
         Some((radix, digits)) => u128::from_str_radix(digits, radix)
             .map_or(number_part.to_string(), |value| value.to_string()),
+        // An exponent literal compares by value, so `1e0` counts as 1.
+        None if number_part.contains(['e', 'E']) => match number_part.parse::<f64>() {
+            Ok(0.0) => "0".to_string(),
+            Ok(1.0) => "1".to_string(),
+            Ok(_) | Err(_) => number_part.to_string(),
+        },
         None => number_part.to_string(),
     }
 }
@@ -228,13 +234,26 @@ fn blank_out_const_values(code_text: &str) -> String {
         });
         // An item reads `const NAME: Type = ...`: an uppercase name, then a `:`.
         let is_named_item: bool = after_keyword.is_some_and(|name_search_start| {
-            let name_start: Option<usize> = (name_search_start..code_chars.len())
-                .find(|&scan_index| !code_chars[scan_index].is_whitespace());
+            let fn_next_non_space = |search_from: usize| -> Option<usize> {
+                (search_from..code_chars.len())
+                    .find(|&scan_index| !code_chars[scan_index].is_whitespace())
+            };
+            // `static mut NAME: ...` keeps its name after the `mut`.
+            let name_start: Option<usize> =
+                fn_next_non_space(name_search_start).and_then(|word_start| {
+                    let mut_keyword: Vec<char> = "mut ".chars().collect();
+                    if code_chars[word_start..].starts_with(&mut_keyword) {
+                        fn_next_non_space(word_start + mut_keyword.len())
+                    } else {
+                        Some(word_start)
+                    }
+                });
             name_start.is_some_and(|name_start| {
                 let name_end: usize = (name_start..code_chars.len())
                     .find(|&scan_index| !is_identifier_char(code_chars[scan_index]))
                     .unwrap_or(code_chars.len());
-                code_chars[name_start].is_ascii_uppercase()
+                // `_` names the compile-time assert idiom, `const _: () = assert!(...);`
+                (code_chars[name_start].is_ascii_uppercase() || code_chars[name_start] == '_')
                     && code_chars[name_end..]
                         .iter()
                         .find(|after_name| !after_name.is_whitespace())
@@ -301,19 +320,31 @@ fn number_literals_in(code_line: &str) -> Vec<String> {
             current_char.is_ascii_digit() && !previous_char.is_some_and(is_identifier_char);
         let is_field_index: bool = previous_char == Some('.')
             && before_previous.is_some_and(|before_char| {
-                is_identifier_char(before_char) || before_char == ')' || before_char == ']'
+                is_identifier_char(before_char) || [')', ']', '}', '?'].contains(&before_char)
             });
         if starts_number {
+            let literal_is_radix: bool = current_char == '0'
+                && line_chars
+                    .get(mut_char_index + 1)
+                    .is_some_and(|radix_char| matches!(radix_char, 'x' | 'o' | 'b'));
             let literal_end: usize = (mut_char_index..line_chars.len())
                 .find(|&scan_index| {
                     let scanned_char: char = line_chars[scan_index];
                     // A '.' belongs to the literal only when a digit follows (10.5, not 0..8 or 1.max()).
+                    // The sign of an exponent (2E-3) belongs to a decimal literal, not to the next token.
+                    let is_exponent_sign: bool = (scanned_char == '-' || scanned_char == '+')
+                        && !literal_is_radix
+                        && scan_index > mut_char_index
+                        && matches!(line_chars[scan_index - 1], 'e' | 'E')
+                        && line_chars
+                            .get(scan_index + 1)
+                            .is_some_and(char::is_ascii_digit);
                     let is_decimal_point: bool = scanned_char == '.'
                         && !is_field_index
                         && line_chars
                             .get(scan_index + 1)
                             .is_some_and(char::is_ascii_digit);
-                    !(is_identifier_char(scanned_char) || is_decimal_point)
+                    !(is_identifier_char(scanned_char) || is_decimal_point || is_exponent_sign)
                 })
                 .unwrap_or(line_chars.len());
             if !is_field_index {
@@ -384,6 +415,9 @@ fn retry<'a>(pair: (u8, u8, u8), name: &'static str) -> &'a str {
 }
 fn sized<const N: usize>() -> usize { let generic_body = 77; generic_body }
 impl<T, const M: u8> Holder<T, M> { fn held(&self) { let impl_body = 99; } }
+static mut COUNTER: u32 = 5;
+const _: () = assert!(4 > 3);
+fn tails() { let via_try = parse()?.2; let via_block = { pair }.2; let unit_exp = 1e0; let small_exp = 2E-3; }
 "##;
     let flagged: Vec<String> = magic_numbers_in(sample_source)
         .into_iter()
@@ -391,6 +425,8 @@ impl<T, const M: u8> Holder<T, M> { fn held(&self) { let impl_body = 99; } }
         .collect();
     assert_eq!(
         flagged,
-        vec!["7", "250", "8", "2.5", "1_000u32", "0o777", "77", "99"]
+        vec![
+            "7", "250", "8", "2.5", "1_000u32", "0o777", "77", "99", "2E-3"
+        ]
     );
 }
