@@ -106,7 +106,7 @@ Use the absolute path to `lessons` if it is not on the PATH the hook sees.
 
 Sync them through a **private git repo** (GitHub, GitLab, any host) with `lessons sync`. The `.db` files never leave your machines: each sync writes their lessons as text, one JSON line per lesson (`work.jsonl`, `personal.jsonl`, `shared.jsonl`), merges those with the repo's copy, and updates the local `.db` from the result.
 
-1. Create one private repo for the lessons, e.g. `<you>/llm-lessons-dbs`. If your work and personal GitHub accounts are separate, add the other account as a collaborator, so both can push. A gist does not work for this: only its owner can push, it cannot have collaborators, and a secret gist is readable by anyone who has its URL.
+1. Create one private repo for the lessons, e.g. `<you>/<private-repo>`. If your work and personal GitHub accounts are separate, add the other account as a collaborator, so both can push. A gist does not work for this: only its owner can push, it cannot have collaborators, and a secret gist is readable by anyone who has its URL.
 2. Copy [`docs/config.sample.toml`](docs/config.sample.toml) to `~/.lessons/config.toml` (your private copy; never commit it) and fill in one `[sync.<domain>]` section per database this machine should sync: the repo's `remote`, the `ssh_key` for it, and `update = "live"` (sync after each change) or `"on-demand"` (sync when reading, at most every `pull_every_minutes`). All three may name the same repo.
 3. Run `lessons sync`, or let `update` trigger it in the background. `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
