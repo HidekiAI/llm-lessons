@@ -19,6 +19,13 @@ fn every_private_data_file_is_ignored_by_git() {
         "lessons.sqlite3-wal",
         ".lessons/config.toml",
         ".lessons/work.db",
+        "config.toml",
+        "nested/config.toml",
+        ".env",
+        ".env.local",
+        "shared.jsonl",
+        "sync/work.jsonl",
+        "shared.conflicts.jsonl",
     ];
     // --no-index checks the rules alone, so the paths need not exist and nothing is tracked.
     let check_output = Command::new("git")
@@ -41,5 +48,24 @@ fn every_private_data_file_is_ignored_by_git() {
         report.lines().count(),
         private_paths.len(),
         "git check-ignore output: {report}"
+    );
+}
+
+#[test]
+fn the_committed_sample_config_is_not_ignored() {
+    // The ignore rules for private config must not catch the sample that documents it.
+    let check_status = Command::new("git")
+        .args([
+            "check-ignore",
+            "--no-index",
+            "-q",
+            "docs/config.sample.toml",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("run git check-ignore");
+    assert!(
+        !check_status.success(),
+        "docs/config.sample.toml is ignored, so it could not be committed"
     );
 }

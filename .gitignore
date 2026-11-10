@@ -36,3 +36,9 @@ rustc-ice-*.txt
 *.sqlite3-*
 # A LESSONS_HOME pointed inside the repo, which also holds config.toml.
 .lessons/
+# Private per-machine settings (sync remotes, key paths): only docs/config.sample.toml is committed.
+config.toml
+.env
+.env.*
+# Synced lessons as JSON lines are the private DBs as text.
+*.jsonl

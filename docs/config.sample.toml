@@ -1,0 +1,40 @@
+# lessons settings. Copy this file to $LESSONS_HOME/config.toml (default ~/.lessons/config.toml) and edit the copy.
+# The copy is private: it names your remotes and key paths. Never commit it; the code repo's .gitignore ignores config.toml.
+# Every section and key is optional; a missing one keeps its default. A misspelled key is an error.
+
+# Domains `lessons search` uses when --in is omitted.
+default_search = ["work", "personal", "shared"]
+
+# Domains the Claude Code prompt hook may read. personal is left out on purpose.
+[hook]
+domains = ["work", "shared"]
+max_results = 5
+
+# Domains the MCP tools (search_lessons, record_lesson) may search or record into.
+[mcp]
+domains = ["work", "shared"]
+max_results = 5
+
+# Sync: one section per domain this machine should sync, through a PRIVATE git repo (a public one is refused).
+# All three may name the same repo; domains that share a repo must use the same ssh_key on one machine (one clone, one key).
+# ssh_key is a private key file, or a .pub whose private key an agent holds.
+# update = "live"      also sync in the background after each change
+# update = "on-demand" sync only when reading
+# Both modes pull in the background when reading, at most every pull_every_minutes.
+[sync.work]
+remote = "git@github.com:<owner>/<private-repo>.git"
+ssh_key = "~/.ssh/id_ed25519"
+update = "live"
+pull_every_minutes = 10
+
+[sync.personal]
+remote = "git@github.com:<owner>/<private-repo>.git"
+ssh_key = "~/.ssh/id_ed25519"
+update = "live"
+pull_every_minutes = 10
+
+[sync.shared]
+remote = "git@github.com:<owner>/<private-repo>.git"
+ssh_key = "~/.ssh/id_ed25519"
+update = "live"
+pull_every_minutes = 10
