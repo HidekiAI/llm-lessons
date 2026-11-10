@@ -408,6 +408,153 @@ fn list_merges_files_newest_first_and_filters_by_domain_and_tag() {
     );
 }
 
+/// Lessons in work and shared only, as on a work laptop; personal.db is absent.
+fn work_laptop_home() -> (tempfile::TempDir, String, String) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    expect_success(run_lessons(temp_dir.path(), &["init", "--domain", "work"]));
+    expect_success(run_lessons(
+        temp_dir.path(),
+        &["init", "--domain", "shared"],
+    ));
+    let shared_id: String = expect_success(run_lessons(temp_dir.path(), &FIRST_LESSON_ARGS))
+        .trim()
+        .to_string();
+    let work_id: String = add_lesson(
+        temp_dir.path(),
+        "work",
+        "ssh agent refuses deploy key",
+        "ssh",
+    );
+    (temp_dir, shared_id, work_id)
+}
+
+fn search_ids(lessons_home: &Path, args: &[&str]) -> Vec<String> {
+    let search_json: String = expect_success(run_lessons(lessons_home, args));
+    let hits: Vec<serde_json::Value> = serde_json::from_str(&search_json).expect("search JSON");
+    hits.iter()
+        .map(|hit| hit["id"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn search_finds_the_first_lesson_by_its_exact_error_code() {
+    let (temp_dir, shared_id, _work_id) = work_laptop_home();
+    let search_text: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &["search", "not_found_or_no_access"],
+    ));
+    assert!(
+        search_text.starts_with(&format!("{shared_id} [shared] CI build cannot")),
+        "{search_text}"
+    );
+    assert!(search_text.contains("fix"), "{search_text}");
+}
+
+#[test]
+fn search_spans_files_skips_the_missing_one_and_honours_in() {
+    let (temp_dir, shared_id, work_id) = work_laptop_home();
+    let both_ids: Vec<String> = search_ids(temp_dir.path(), &["search", "ssh", "--format", "json"]);
+    assert_eq!(both_ids.len(), 2, "{both_ids:?}");
+    assert!(both_ids.contains(&shared_id) && both_ids.contains(&work_id));
+    assert_eq!(
+        search_ids(
+            temp_dir.path(),
+            &["search", "ssh", "--in", "work", "--format", "json"]
+        ),
+        vec![work_id]
+    );
+    assert!(
+        !temp_dir.path().join("personal.db").exists(),
+        "search must not create the missing file"
+    );
+}
+
+#[test]
+fn search_json_carries_domain_and_score() {
+    let (temp_dir, _shared_id, _work_id) = work_laptop_home();
+    let search_json: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &["search", "ssh", "--in", "work", "--format", "json"],
+    ));
+    let hits: Vec<serde_json::Value> = serde_json::from_str(&search_json).unwrap();
+    assert_eq!(hits[0]["domain"], "work");
+    assert!(hits[0]["score"].is_f64(), "{search_json}");
+}
+
+#[test]
+fn search_uses_default_search_from_config() {
+    let (temp_dir, _shared_id, work_id) = work_laptop_home();
+    std::fs::write(
+        temp_dir.path().join("config.toml"),
+        "default_search = [\"work\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        search_ids(temp_dir.path(), &["search", "ssh", "--format", "json"]),
+        vec![work_id]
+    );
+}
+
+#[test]
+fn search_hides_a_retired_lesson() {
+    let (temp_dir, shared_id, work_id) = work_laptop_home();
+    expect_success(run_lessons(
+        temp_dir.path(),
+        &["retire", &shared_id, "--by", &work_id],
+    ));
+    assert_eq!(
+        search_ids(temp_dir.path(), &["search", "ssh", "--format", "json"]),
+        vec![work_id]
+    );
+}
+
+#[test]
+fn search_survives_hostile_text_and_prints_nothing_when_nothing_is_searchable() {
+    let (temp_dir, _shared_id, _work_id) = work_laptop_home();
+    [
+        "say \"hi",
+        "NOT ssh",
+        "-flag (foo",
+        "title:ssh*",
+        "^ssh AND",
+    ]
+    .iter()
+    .for_each(|hostile_text| {
+        expect_success(run_lessons(temp_dir.path(), &["search", hostile_text]));
+    });
+    assert_eq!(
+        expect_success(run_lessons(temp_dir.path(), &["search", "the a of"])),
+        ""
+    );
+    assert_eq!(
+        expect_success(run_lessons(
+            temp_dir.path(),
+            &["search", "!!!", "--format", "json"]
+        ))
+        .trim(),
+        "[]"
+    );
+}
+
+#[test]
+fn search_raw_passes_fts5_syntax_and_reports_a_bad_expression() {
+    let (temp_dir, _shared_id, work_id) = work_laptop_home();
+    assert_eq!(
+        search_ids(
+            temp_dir.path(),
+            &["search", "ssh NOT docker", "--raw", "--format", "json"]
+        ),
+        vec![work_id]
+    );
+    let bad_output: Output = run_lessons(temp_dir.path(), &["search", "say \"hi", "--raw"]);
+    assert!(!bad_output.status.success());
+    assert!(
+        stderr_of(&bad_output).contains("invalid FTS5 query from --raw"),
+        "{}",
+        stderr_of(&bad_output)
+    );
+}
+
 #[cfg(unix)]
 mod editor {
     use super::*;

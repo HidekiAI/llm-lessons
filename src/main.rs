@@ -1,5 +1,6 @@
 //! `lessons`: a personal knowledge base of problems, their fixes, and the attempts that failed.
 
+mod config;
 mod db;
 mod journal;
 mod query;
@@ -12,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::db::{Domain, OpenMode};
-use crate::store::{FoundLesson, LessonPatch, NewLesson};
+use crate::store::{FoundLesson, LessonPatch, NewLesson, SearchHit};
 
 #[derive(Parser)]
 #[command(
@@ -65,6 +66,22 @@ enum Command {
     },
     /// Record that a retrieved lesson actually helped
     Hit { id: String },
+    /// Search lessons by keywords or pasted error text
+    Search {
+        /// Keywords or pasted error text; may start with `-`, as error text often does
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+        /// Comma-separated domains (work,personal,shared) or `all`; default from config.toml
+        #[arg(long = "in", value_name = "DOMAINS", value_parser = parse_domain_list)]
+        in_domains: Option<DomainList>,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Pass TEXT to FTS5 unchanged, as a query expression
+        #[arg(long)]
+        raw: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
     /// Hide a lesson from search because a newer one replaces it
     Retire {
         id: String,
@@ -198,6 +215,13 @@ fn main() -> Result<()> {
         } => run_list(&lessons_home, &in_domains.0, limit, tag.as_deref(), format),
         Command::Update { id, fields } => run_update(&lessons_home, &id, fields.into_patch()),
         Command::Hit { id } => run_hit(&lessons_home, &id),
+        Command::Search {
+            text,
+            in_domains,
+            limit,
+            raw,
+            format,
+        } => run_search(&lessons_home, &text, in_domains, limit, raw, format),
         Command::Retire { id, by } => run_retire(&lessons_home, &id, &by),
     }
 }
@@ -507,4 +531,63 @@ fn run_retire(lessons_home: &Path, lesson_id: &str, superseded_by_id: &str) -> R
         domain.as_str()
     );
     Ok(())
+}
+
+fn run_search(
+    lessons_home: &Path,
+    search_text: &str,
+    in_domains: Option<DomainList>,
+    limit: usize,
+    raw: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let domains: Vec<Domain> = match in_domains {
+        Some(domain_list) => domain_list.0,
+        None => config::load(lessons_home)?.default_search,
+    };
+    // Raw text goes through the cleaner unless the user asked to write FTS5 syntax themselves.
+    let fts_query: Option<String> = if raw {
+        Some(search_text.to_string())
+    } else {
+        query::fts_query_from_text(search_text)
+    };
+    journal!("search: {search_text:?} -> {fts_query:?} in {domains:?}");
+    let hits: Vec<SearchHit> = match &fts_query {
+        Some(fts_query) => {
+            let opened = db::open_existing_domains(lessons_home, &domains)?;
+            store::search_all(&opened, fts_query, limit).with_context(|| match raw {
+                true => format!("invalid FTS5 query from --raw: {fts_query}"),
+                false => format!("search failed for {fts_query}"),
+            })?
+        }
+        None => Vec::new(), // only stopwords or punctuation: nothing to look for, which is not an error
+    };
+    match format {
+        OutputFormat::Text => print!(
+            "{}",
+            hits.iter().map(search_hit_as_text).collect::<String>()
+        ),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&hits)?),
+    }
+    Ok(())
+}
+
+/// Three compact lines per hit: id and title, then the first line of the problem and of the fix.
+fn search_hit_as_text(hit: &SearchHit) -> String {
+    let fn_first_line = |text: &str| text.lines().next().unwrap_or("").to_string();
+    let fix_line: String = hit
+        .lesson
+        .resolution
+        .as_deref()
+        .map_or(String::new(), |resolution| {
+            format!("  {:<LABEL_WIDTH$}{}\n", "fix", fn_first_line(resolution))
+        });
+    format!(
+        "{} [{}] {}\n  {:<LABEL_WIDTH$}{}\n{fix_line}",
+        hit.lesson.id,
+        hit.domain,
+        hit.lesson.title,
+        "problem",
+        fn_first_line(&hit.lesson.problem)
+    )
 }

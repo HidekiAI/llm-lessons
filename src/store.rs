@@ -260,6 +260,77 @@ pub fn retire(conn: &Connection, lesson_id: &str, superseded_by_id: &str) -> Res
     Ok(changed_rows == 1)
 }
 
+/// A search result: the lesson, its file, and its bm25 score (lower ranks higher).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SearchHit {
+    pub domain: &'static str,
+    pub score: f64,
+    #[serde(flatten)]
+    pub lesson: Lesson,
+}
+
+/// The best `limit` live lessons of one file for an FTS5 `fts_query`, best first.
+pub fn search(
+    conn: &Connection,
+    domain: Domain,
+    fts_query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    // Both tables have columns named title, problem, ...; qualify and alias each, so the join is
+    // unambiguous and `lesson_from_row` still reads them by their plain names.
+    let qualified_columns: String = LESSON_SELECT_COLUMNS
+        .split(',')
+        .map(|column_name| format!("l.{0} AS {0}", column_name.trim()))
+        .collect::<Vec<String>>()
+        .join(", ");
+    let bm25_weights: String = FTS_COLUMNS
+        .iter()
+        .map(|(_column_name, weight)| format!("{weight:?}")) // Debug keeps the ".0", so SQLite reads a real, not an integer
+        .collect::<Vec<String>>()
+        .join(", ");
+    let mut mut_statement = conn.prepare(&format!(
+        "SELECT {qualified_columns}, bm25(lesson_fts, {bm25_weights}) AS score \
+         FROM lesson_fts JOIN lesson l ON l.seq = lesson_fts.rowid \
+         WHERE lesson_fts MATCH ?1 AND l.superseded_by IS NULL \
+         ORDER BY score LIMIT ?2"
+    ))?;
+    let hits: Vec<SearchHit> = mut_statement
+        .query_map(
+            (fts_query, i64::try_from(limit).unwrap_or(i64::MAX)),
+            |row| {
+                Ok(SearchHit {
+                    domain: domain.as_str(),
+                    score: row.get("score")?,
+                    lesson: lesson_from_row(row)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<SearchHit>>>()?;
+    journal!(
+        "search {}: {} hit(s) for {fts_query}",
+        domain.as_str(),
+        hits.len()
+    );
+    Ok(hits)
+}
+
+/// Searches every open file and merges the results by score. Scores from different files are not
+/// strictly comparable (each file has its own word statistics) but rank well enough for a top N.
+pub fn search_all(
+    opened: &[(Domain, Connection)],
+    fts_query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    let per_file: Vec<Vec<SearchHit>> = opened
+        .iter()
+        .map(|(domain, conn)| search(conn, *domain, fts_query, limit))
+        .collect::<Result<Vec<Vec<SearchHit>>>>()?;
+    let mut mut_best: Vec<SearchHit> = per_file.into_iter().flatten().collect();
+    mut_best.sort_by(|left_hit, right_hit| left_hit.score.total_cmp(&right_hit.score));
+    mut_best.truncate(limit);
+    Ok(mut_best)
+}
+
 /// The newest `limit` lessons of one file, optionally only those carrying `tag` as a whole tag.
 pub fn list(conn: &Connection, limit: usize, tag: Option<&str>) -> Result<Vec<Lesson>> {
     // instr, not LIKE: `_` and `%` are wildcards in LIKE, and `_` is common in tags.
@@ -505,6 +576,103 @@ mod tests {
             Some(Domain::Shared)
         );
         assert!(owner_of(&opened, "01NOSUCHID").unwrap().is_none());
+    }
+
+    fn search_ids(conn: &Connection, fts_query: &str) -> Vec<String> {
+        search(conn, Domain::Shared, fts_query, 10)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.lesson.id)
+            .collect()
+    }
+
+    #[test]
+    fn search_ranks_a_title_match_above_a_problem_match() {
+        let (_temp_dir, conn) = temp_conn();
+        let problem_id: String = insert(
+            &conn,
+            &NewLesson {
+                title: "unrelated".into(),
+                problem: "segfault in the loader".into(),
+                ..NewLesson::default()
+            },
+        )
+        .unwrap();
+        let title_id: String = insert(
+            &conn,
+            &NewLesson {
+                title: "segfault".into(),
+                problem: "it crashed in the loader".into(),
+                ..NewLesson::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search_ids(&conn, "\"segfault\""),
+            vec![title_id, problem_id]
+        );
+    }
+
+    #[test]
+    fn search_hides_retired_lessons() {
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        assert_eq!(search_ids(&conn, "\"linker\""), vec![lesson_id.clone()]);
+        retire(&conn, &lesson_id, "01NEWER").unwrap();
+        assert!(search_ids(&conn, "\"linker\"").is_empty());
+    }
+
+    #[test]
+    fn search_sees_an_update_and_forgets_the_old_text() {
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        let patch = LessonPatch {
+            title: Some("loader error".into()),
+            ..LessonPatch::default()
+        };
+        update(&conn, &lesson_id, &patch).unwrap();
+        assert_eq!(search_ids(&conn, "\"loader\""), vec![lesson_id]);
+        assert!(search_ids(&conn, "\"linker\"").is_empty());
+    }
+
+    #[test]
+    fn search_all_merges_files_by_score_and_cuts_to_the_limit() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let work_conn: Connection =
+            open(&temp_dir.path().join("work.db"), OpenMode::Create).unwrap();
+        let shared_conn: Connection =
+            open(&temp_dir.path().join("shared.db"), OpenMode::Create).unwrap();
+        // Distinct match strengths (title, tags, problem) so the scores differ, plus a non-matching
+        // lesson per file so the term is not in every document (bm25 flattens such terms).
+        let fn_insert = |conn: &Connection, title: &str, problem: &str, tags: Option<&str>| {
+            insert(
+                conn,
+                &NewLesson {
+                    title: title.into(),
+                    problem: problem.into(),
+                    tags: tags.map(str::to_string),
+                    ..NewLesson::default()
+                },
+            )
+            .unwrap()
+        };
+        fn_insert(&work_conn, "linker error", "build broke", None);
+        fn_insert(&work_conn, "unrelated", "printer jam", None);
+        fn_insert(&shared_conn, "other", "it broke", Some("linker"));
+        fn_insert(&shared_conn, "another", "linker broke once", None);
+        fn_insert(&shared_conn, "unrelated", "printer jam", None);
+        let opened: Vec<(Domain, Connection)> =
+            vec![(Domain::Work, work_conn), (Domain::Shared, shared_conn)];
+        let all_hits: Vec<SearchHit> = search_all(&opened, "\"linker\"", 10).unwrap();
+        assert_eq!(all_hits.len(), 3);
+        assert_eq!(all_hits[0].domain, "work", "the title match ranks first");
+        assert!(
+            all_hits
+                .windows(2)
+                .all(|pair| pair[0].score <= pair[1].score),
+            "sorted best first"
+        );
+        assert_eq!(search_all(&opened, "\"linker\"", 2).unwrap().len(), 2);
     }
 
     #[test]

@@ -20,7 +20,8 @@ use crate::journal;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The three domains, one DB file each.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")] // config.toml spells domains as the file stems do
 pub enum Domain {
     Work,
     Personal,
