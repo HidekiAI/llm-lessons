@@ -113,6 +113,17 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                     domain.as_str(),
                     crate::sync::redact_credentials(&sync_config.remote)
                 ),
+                // One clone has one remote text, so the other section's credentials would be dropped silently (a rotated
+                // token in only one section would then fail with an auth error pointing nowhere near the config).
+                Some(existing_clone) if existing_clone.remote != sync_config.remote
+                    && has_credentials(&existing_clone.remote)
+                    && has_credentials(&sync_config.remote) => anyhow::bail!(
+                    "[sync.{}] and [sync.{}] name the same repository {} with different credentials; \
+                     write the same remote in both",
+                    existing_clone.domains.first().map_or("?", |first_domain| first_domain.as_str()),
+                    domain.as_str(),
+                    crate::sync::redact_credentials(&sync_config.remote)
+                ),
                 Some(existing_clone) => CloneSpec {
                     domains: existing_clone.domains.into_iter().chain(std::iter::once(domain)).collect(),
                     ..existing_clone
@@ -124,7 +135,7 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                     domains: vec![domain],
                 },
             };
-            journal!("config: [sync.{}] -> clone of {}", domain.as_str(), grown_clone.normalized_remote);
+            journal!("config: [sync.{}] -> clone of {}", domain.as_str(), crate::sync::redact_credentials(&grown_clone.normalized_remote));
             Ok(other_clones.into_iter().chain(std::iter::once(grown_clone)).collect())
         })
 }
@@ -151,6 +162,11 @@ pub fn sync_warnings(clones: &[CloneSpec]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `remote` is a URL that carries a user or password, which redaction would remove.
+fn has_credentials(remote: &str) -> bool {
+    crate::sync::redact_credentials(remote) != remote
+}
+
 /// The form two remotes are compared in: the host lower-cased, a trailing `/` and `.git` removed.
 /// The path keeps its case (it is case-sensitive on some hosts).
 fn normalize_remote(remote: &str) -> String {
@@ -164,31 +180,27 @@ fn normalize_remote(remote: &str) -> String {
     };
     let host_normalized: String = match trimmed_remote.split_once("://") {
         Some((scheme, after_scheme)) => {
+            // A '/', '?' or '#' typed raw inside a password ends the authority early; git wants those percent-encoded,
+            // and such a URL is not recognised (as in `redact_credentials`).
             let (authority, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
-            // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp form.
-            let is_portless_ssh: bool =
-                scheme.eq_ignore_ascii_case("ssh") && !authority.contains(':');
+            let (userinfo, host_part): (Option<&str>, &str) = authority
+                .rsplit_once('@')
+                .map_or((None, authority), |(userinfo_text, host_text)| {
+                    (Some(userinfo_text), host_text)
+                });
+            let host_lowercase: String = host_part.to_lowercase();
             // The credentials of an http(s) URL are not part of which repository it is, and this form is printed and used
-            // in a directory name. An ssh user is a login name, not a secret, and stays.
-            let fn_authority_kept = |authority: &str| -> String {
-                if scheme.eq_ignore_ascii_case("ssh") {
-                    fn_lowercase_host(authority)
-                } else {
-                    fn_lowercase_host(
-                        authority
-                            .rsplit_once('@')
-                            .map_or(authority, |(_, host_part)| host_part),
-                    )
-                }
-            };
-            if is_portless_ssh {
-                format!("{}:{path}", fn_lowercase_host(authority))
-            } else {
-                format!(
-                    "{}://{}/{path}",
-                    scheme.to_lowercase(),
-                    fn_authority_kept(authority)
-                )
+            // in a directory name. An ssh user is a login name and stays; an ssh password (git ignores it) does not.
+            let ssh_login_at_host: String = userinfo
+                .map(|userinfo_text| userinfo_text.split(':').next().unwrap_or(userinfo_text))
+                .map_or(host_lowercase.clone(), |login| {
+                    format!("{login}@{host_lowercase}")
+                });
+            match (scheme.eq_ignore_ascii_case("ssh"), host_part.contains(':')) {
+                // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp form.
+                (true, false) => format!("{ssh_login_at_host}:{path}"),
+                (true, true) => format!("ssh://{ssh_login_at_host}/{path}"),
+                (false, _) => format!("{}://{host_lowercase}/{path}", scheme.to_lowercase()),
             }
         }
         // scp-like `git@host:path`: a ':' before any '/'. Anything else (a local path) is left as is.
@@ -474,23 +486,21 @@ mod tests {
     }
 
     #[test]
-    fn two_credentialed_spellings_of_one_repository_are_one_clone() {
-        let one_repo_two_tokens = SyncSection {
+    fn a_credentialed_and_a_plain_spelling_of_one_repository_are_one_clone() {
+        let credentialed_and_plain = SyncSection {
             work: Some(sync_entry(
                 "https://a:token-one@host.example/r.git",
                 "/keys/one",
             )),
             personal: None,
-            shared: Some(sync_entry(
-                "https://b:token-two@host.example/r.git",
-                "/keys/one",
-            )),
+            shared: Some(sync_entry("https://host.example/r.git", "/keys/one")),
         };
-        let clones: Vec<CloneSpec> = clone_specs(&one_repo_two_tokens).unwrap();
+        let clones: Vec<CloneSpec> = clone_specs(&credentialed_and_plain).unwrap();
         assert_eq!(clones.len(), 1, "{clones:?}");
         assert_eq!(sync_warnings(&clones).len(), 1, "work now shares a clone");
         assert!(!clones[0].normalized_remote.contains("token"), "{clones:?}");
     }
+
     #[test]
     fn the_work_sharing_warning_never_prints_a_credential_of_the_remote() {
         let credentialed = "https://user:secret-token@github.com/owner/repo.git";
@@ -567,6 +577,35 @@ mod tests {
             });
     }
 
+    #[test]
+    fn an_ssh_password_is_dropped_from_the_normal_form_and_its_login_kept() {
+        assert_eq!(
+            normalize_remote("ssh://git:secret@GitHub.com:2222/Owner/Repo.git"),
+            "ssh://git@github.com:2222/Owner/Repo"
+        );
+        assert_eq!(
+            normalize_remote("ssh://git:secret@GitHub.com/Owner/Repo.git"),
+            "git@github.com:Owner/Repo"
+        );
+    }
+
+    #[test]
+    fn one_repository_spelled_with_different_credentials_is_refused_and_the_error_hides_them() {
+        let rotated_in_one_section = SyncSection {
+            work: Some(sync_entry(
+                "https://a:old-token@host.example/r.git",
+                "/keys/one",
+            )),
+            personal: None,
+            shared: Some(sync_entry(
+                "https://a:new-token@host.example/r.git",
+                "/keys/one",
+            )),
+        };
+        let error_text: String = format!("{:#}", clone_specs(&rotated_in_one_section).unwrap_err());
+        assert!(error_text.contains("different credentials"), "{error_text}");
+        assert!(!error_text.contains("token"), "{error_text}");
+    }
     #[test]
     fn an_ssh_url_and_the_scp_form_of_one_repo_share_a_clone() {
         let sync_section = SyncSection {

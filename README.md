@@ -139,7 +139,7 @@ In a terminal, `setup.sh` then asks, per domain, for the repo URL (use the real 
 
 Without a terminal (a script, CI), pass the answers as flags instead; they apply to every domain given: `scripts/setup.sh --domains work,personal,shared --remote git@github.com:<you>/<private-repo>.git --ssh-key ~/.ssh/id_ed25519` (add `--update on-demand` or `--pull-every-minutes N` to change the defaults, or `--no-sync` to skip sync). The new config is checked by loading it with `lessons search`, and put back as it was if it does not load.
 
-After that, `lessons sync` runs by itself in the background as `update` says, or by hand. `lessons` makes and manages its own clone under `~/.lessons/sync/`.
+After that, run `lessons sync` by hand (running it by itself in the background, as `update` says, is not built yet). `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
 How the merge works:
 
