@@ -543,9 +543,11 @@ fn id_summary(lesson_ids: &[&str]) -> String {
 }
 
 /// Makes the file hold exactly `merged`, given that it held `ours` when the caller's transaction began. It takes the
-/// transaction, not a connection, so it cannot run outside one; the caller opens it with `begin_sync_transaction`, so it
-/// is IMMEDIATE and no local writer slips in between reading OURS and this apply. Inserts and updates go through `copy_into`, whose upsert keeps the search index in step; deletes fire the
-/// index's delete trigger.
+/// transaction, not a connection, so it cannot run outside one; the caller opens it with `begin_sync_transaction`, so
+/// it is IMMEDIATE and no local writer slips in between reading OURS and this apply.
+///
+/// Inserts and updates go through `copy_into`, whose upsert keeps the search index in step; deletes fire the index's
+/// delete trigger.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "called by the sync cycle (plan step S4)")
@@ -1286,7 +1288,10 @@ mod tests {
         let (_temp_dir, mut mut_conn) = three_lessons();
         mut_conn
             .execute_batch(
-                "CREATE TRIGGER refuse_insert BEFORE INSERT ON lesson BEGIN SELECT RAISE(ABORT, 'forced'); END;\n                 CREATE TRIGGER refuse_delete BEFORE DELETE ON lesson BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+                "CREATE TRIGGER refuse_insert BEFORE INSERT ON lesson \
+                 BEGIN SELECT RAISE(ABORT, 'forced'); END; \
+                 CREATE TRIGGER refuse_delete BEFORE DELETE ON lesson \
+                 BEGIN SELECT RAISE(ABORT, 'forced'); END;",
             )
             .unwrap();
         let fn_apply_error = |conn: &mut Connection, merged: &[Lesson]| -> String {
@@ -1361,7 +1366,8 @@ mod tests {
     fn a_local_write_never_lands_between_the_read_and_the_apply() {
         let (temp_dir, mut mut_conn) = three_lessons();
         let writer_conn: Connection = Connection::open(temp_dir.path().join("shared.db")).unwrap();
-        writer_conn.busy_timeout(std::time::Duration::ZERO).unwrap(); // refused at once while locked: no wait, no timing
+        // Zero: refused at once while locked, so the test never waits or depends on timing.
+        writer_conn.busy_timeout(std::time::Duration::ZERO).unwrap();
 
         copy_into(&writer_conn, &full_lesson(ID_D, "delta")).unwrap(); // writer first
         let transaction = begin_sync_transaction(&mut mut_conn).unwrap();
