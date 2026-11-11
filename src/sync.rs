@@ -360,16 +360,17 @@ pub fn merge_queue(
         .chain(theirs_by_key.keys())
         .collect::<BTreeSet<&GroupKey>>()
         .into_iter()
+        .filter(|key| {
+            let resolved_on_one_side: bool = base_by_key.contains_key(*key)
+                && !(live_by_key.contains_key(*key) && theirs_by_key.contains_key(*key));
+            !resolved_on_one_side
+        })
         .filter_map(|key| {
-            let (live_group, theirs_group) = (
+            fn_union_of(
                 live_by_key.get(key).copied(),
                 theirs_by_key.get(key).copied(),
-            );
-            let resolved_on_one_side: bool =
-                base_by_key.contains_key(key) && (live_group.is_none() || theirs_group.is_none());
-            fn_union_of(live_group, theirs_group)
-                .filter(|_| !resolved_on_one_side)
-                .map(|group| (key.clone(), group))
+            )
+            .map(|group| (key.clone(), group))
         })
         .collect();
     phase_one
@@ -648,6 +649,10 @@ mod tests {
                 assert_eq!(
                     field_value(&ours_changed.merged[0], field),
                     Some("ours"),
+                    "{field:?} theirs == base"
+                );
+                assert!(
+                    ours_changed.conflicts.is_empty(),
                     "{field:?} theirs == base"
                 );
 
@@ -973,6 +978,9 @@ mod tests {
         assert_eq!((again.merged, again.conflicts.len()), (first.merged, 0));
     }
 
+    /// (base, live, theirs, new conflicts): one input set of `merge_queue`.
+    type QueueInputs = (Vec<Conflict>, Vec<Conflict>, Vec<Conflict>, Vec<Conflict>);
+
     #[test]
     fn queue_merge_three_way() {
         let resolved = group(
@@ -1030,11 +1038,53 @@ mod tests {
             vec![union_expected],
             "in base, on both"
         );
-        assert_eq!(
-            merge_queue(&[], &[tags_group.clone()], &[other_side.clone()], &[]),
-            merge_queue(&[], &[other_side], &[tags_group], &[]),
-            "symmetric"
+        // Symmetric over every phase-one case and with new conflicts, on inputs that differ on each side.
+        let resolution_group = group(
+            OTHER_ID,
+            MergedField::Resolution,
+            vec![version("p", EARLY), version("q", MIDDLE)],
         );
+        let fresh = group(
+            OTHER_ID,
+            MergedField::Resolution,
+            vec![version("r", LATE), version("s", LATE)],
+        );
+        let symmetry_cases: Vec<QueueInputs> = vec![
+            (
+                vec![],
+                vec![tags_group.clone()],
+                vec![other_side.clone()],
+                vec![],
+            ),
+            (
+                vec![tags_group.clone()],
+                vec![tags_group.clone()],
+                vec![other_side.clone()],
+                vec![],
+            ),
+            (
+                vec![tags_group.clone()],
+                vec![tags_group.clone()],
+                vec![],
+                vec![],
+            ),
+            (
+                vec![resolution_group.clone()],
+                vec![resolution_group.clone(), tags_group.clone()],
+                vec![other_side.clone()],
+                vec![fresh.clone()],
+            ),
+            (vec![], vec![resolution_group], vec![], vec![fresh]),
+        ];
+        symmetry_cases
+            .iter()
+            .for_each(|(base, live, theirs, new_conflicts)| {
+                assert_eq!(
+                    merge_queue(base, live, theirs, new_conflicts),
+                    merge_queue(base, theirs, live, new_conflicts),
+                    "symmetric for base {base:?}"
+                );
+            });
     }
 
     /// A group resolved on one side while a new conflict appears on the same key: only the new versions remain.
