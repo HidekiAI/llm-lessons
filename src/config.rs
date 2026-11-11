@@ -47,7 +47,7 @@ pub struct SyncConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateMode {
-    /// Also sync in the background after each change.
+    /// Meant to also sync in the background after each change (not built yet).
     Live,
     /// Sync only when reading.
     OnDemand,
@@ -115,9 +115,10 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                 ),
                 // One clone has one remote text, so the other section's credentials would be dropped silently (a rotated
                 // token in only one section would then fail with an auth error pointing nowhere near the config).
-                Some(existing_clone) if existing_clone.remote != sync_config.remote
-                    && has_credentials(&existing_clone.remote)
-                    && has_credentials(&sync_config.remote) => anyhow::bail!(
+                Some(existing_clone)
+                    if url_credentials(&existing_clone.remote).is_some()
+                        && url_credentials(&sync_config.remote).is_some()
+                        && url_credentials(&existing_clone.remote) != url_credentials(&sync_config.remote) => anyhow::bail!(
                     "[sync.{}] and [sync.{}] name the same repository {} with different credentials; \
                      write the same remote in both",
                     existing_clone.domains.first().map_or("?", |first_domain| first_domain.as_str()),
@@ -135,6 +136,7 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                     domains: vec![domain],
                 },
             };
+            // The normal form is already credential-free; redacting again is defence in depth for a form that is not.
             journal!("config: [sync.{}] -> clone of {}", domain.as_str(), crate::sync::redact_credentials(&grown_clone.normalized_remote));
             Ok(other_clones.into_iter().chain(std::iter::once(grown_clone)).collect())
         })
@@ -162,9 +164,16 @@ pub fn sync_warnings(clones: &[CloneSpec]) -> Vec<String> {
         .collect()
 }
 
-/// Whether `remote` is a URL that carries a user or password, which redaction would remove.
-fn has_credentials(remote: &str) -> bool {
-    crate::sync::redact_credentials(remote) != remote
+/// The user and password of a non-ssh `scheme://user:password@host/...` URL, which `normalize_remote` drops; an ssh
+/// login is a name, not a secret, and is not one.
+fn url_credentials(remote: &str) -> Option<&str> {
+    remote
+        .split_once("://")
+        .filter(|(scheme, _)| !scheme.eq_ignore_ascii_case("ssh"))
+        .and_then(|(_, after_scheme)| {
+            let authority: &str = after_scheme.split('/').next().unwrap_or(after_scheme);
+            authority.rsplit_once('@').map(|(userinfo, _)| userinfo)
+        })
 }
 
 /// The form two remotes are compared in: the host lower-cased, a trailing `/` and `.git` removed.
@@ -191,15 +200,18 @@ fn normalize_remote(remote: &str) -> String {
             let host_lowercase: String = host_part.to_lowercase();
             // The credentials of an http(s) URL are not part of which repository it is, and this form is printed and used
             // in a directory name. An ssh user is a login name and stays; an ssh password (git ignores it) does not.
-            let ssh_login_at_host: String = userinfo
-                .map(|userinfo_text| userinfo_text.split(':').next().unwrap_or(userinfo_text))
-                .map_or(host_lowercase.clone(), |login| {
-                    format!("{login}@{host_lowercase}")
-                });
+            let fn_ssh_login_at_host = || -> String {
+                userinfo
+                    .and_then(|userinfo_text| userinfo_text.split(':').next())
+                    .filter(|login| !login.is_empty())
+                    .map_or(host_lowercase.clone(), |login| {
+                        format!("{login}@{host_lowercase}")
+                    })
+            };
             match (scheme.eq_ignore_ascii_case("ssh"), host_part.contains(':')) {
                 // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp form.
-                (true, false) => format!("{ssh_login_at_host}:{path}"),
-                (true, true) => format!("ssh://{ssh_login_at_host}/{path}"),
+                (true, false) => format!("{}:{path}", fn_ssh_login_at_host()),
+                (true, true) => format!("ssh://{}/{path}", fn_ssh_login_at_host()),
                 (false, _) => format!("{}://{host_lowercase}/{path}", scheme.to_lowercase()),
             }
         }
@@ -605,6 +617,39 @@ mod tests {
         let error_text: String = format!("{:#}", clone_specs(&rotated_in_one_section).unwrap_err());
         assert!(error_text.contains("different credentials"), "{error_text}");
         assert!(!error_text.contains("token"), "{error_text}");
+    }
+
+    #[test]
+    fn spellings_with_the_same_credentials_still_group_whatever_else_differs() {
+        let spelling_pairs: &[(&str, &str)] = &[
+            (
+                "ssh://git@host.example/o/r",
+                "ssh://git@host.example/o/r.git",
+            ),
+            (
+                "https://u:tok@host.example/r.git",
+                "https://u:tok@HOST.example/r",
+            ),
+        ];
+        spelling_pairs
+            .iter()
+            .for_each(|(work_remote, shared_remote)| {
+                let section = SyncSection {
+                    work: Some(sync_entry(work_remote, "/keys/one")),
+                    personal: None,
+                    shared: Some(sync_entry(shared_remote, "/keys/one")),
+                };
+                let clones: Vec<CloneSpec> = clone_specs(&section).unwrap();
+                assert_eq!(clones.len(), 1, "{work_remote} and {shared_remote}");
+            });
+    }
+
+    #[test]
+    fn an_at_sign_in_an_ssh_password_does_not_leak_into_the_normal_form() {
+        assert_eq!(
+            normalize_remote("ssh://git:p@ss@Host.example:2222/o/r.git"),
+            "ssh://git@host.example:2222/o/r"
+        );
     }
     #[test]
     fn an_ssh_url_and_the_scp_form_of_one_repo_share_a_clone() {
