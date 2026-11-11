@@ -159,33 +159,35 @@ struct AddArgs {
     fields: FieldArgs,
 }
 
-/// The lesson fields as flags, shared by `add` (and `update` later).
+/// The lesson fields as flags, shared by `add` and `update`. Every value may start with `-`: pasted
+/// error text and command lines often do (`-o IdentityFile=none`), and clap would read them as options.
+/// The cost: a flag-like word right after a field flag is taken as its value (`--failed --tags` stores "--tags").
 #[derive(Args)]
 #[group(id = "fields", multiple = true)]
 struct FieldArgs {
     /// One-line summary
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     title: Option<String>,
     /// What went wrong; paste the exact error text when there is one
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     problem: Option<String>,
     /// Why it went wrong (may be filled in later)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     root_cause: Option<String>,
     /// What worked
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     resolution: Option<String>,
     /// What did NOT work
-    #[arg(long = "failed")]
+    #[arg(long = "failed", allow_hyphen_values = true)]
     failed_tries: Option<String>,
     /// Where: repo name, 'car', 'home network', ...
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     context: Option<String>,
     /// Space-separated tags
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     tags: Option<String>,
     /// Versions or dates that let a reader judge staleness
-    #[arg(long = "env")]
+    #[arg(long = "env", allow_hyphen_values = true)]
     env_versions: Option<String>,
 }
 

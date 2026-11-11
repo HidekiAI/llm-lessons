@@ -794,6 +794,66 @@ fn mcp_server_speaks_json_rpc_lines_over_stdio_and_exits_when_stdin_closes() {
     assert!(search_text.contains(&shared_id), "{search_text}");
 }
 
+#[test]
+fn field_values_may_start_with_a_hyphen() {
+    // Pasted error text and command lines often start with `-`; clap must not read them as options.
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_id: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &[
+            "add",
+            "--to",
+            "shared",
+            "--title",
+            "-F /dev/null isolates ssh keys",
+            "--problem",
+            "--verbose was read as a flag",
+            "--failed",
+            "-o IdentityFile=none",
+            "--root-cause",
+            "-i adds to the config keys",
+            "--context",
+            "-repo",
+            "--tags",
+            "-ssh",
+            "--env",
+            "-OpenSSH_10",
+        ],
+    ))
+    .trim()
+    .to_string();
+    expect_success(run_lessons(
+        temp_dir.path(),
+        &["update", &lesson_id, "--resolution", "-F /dev/null"],
+    ));
+    let lesson_json: serde_json::Value = serde_json::from_str(&expect_success(run_lessons(
+        temp_dir.path(),
+        &["show", &lesson_id, "--format", "json"],
+    )))
+    .unwrap();
+    assert_eq!(lesson_json["title"], "-F /dev/null isolates ssh keys");
+    assert_eq!(lesson_json["problem"], "--verbose was read as a flag");
+    assert_eq!(lesson_json["failed_tries"], "-o IdentityFile=none");
+    assert_eq!(lesson_json["resolution"], "-F /dev/null");
+    assert_eq!(lesson_json["root_cause"], "-i adds to the config keys");
+    assert_eq!(lesson_json["context"], "-repo");
+    assert_eq!(lesson_json["tags"], "-ssh");
+    assert_eq!(lesson_json["env_versions"], "-OpenSSH_10");
+    // The documented cost: a flag-like word right after a field flag is that flag's value, not a flag.
+    expect_success(run_lessons(
+        temp_dir.path(),
+        &["update", &lesson_id, "--failed", "--tags"],
+    ));
+    let literal_json: serde_json::Value = serde_json::from_str(&expect_success(run_lessons(
+        temp_dir.path(),
+        &["show", &lesson_id, "--format", "json"],
+    )))
+    .unwrap();
+    assert_eq!(literal_json["failed_tries"], "--tags");
+    assert_eq!(literal_json["tags"], "-ssh", "the tags were not touched");
+}
+
 #[cfg(unix)]
 mod editor {
     use super::*;
