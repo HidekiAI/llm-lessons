@@ -116,9 +116,7 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                 // One clone has one remote text, so the other section's credentials would be dropped silently (a rotated
                 // token in only one section would then fail with an auth error pointing nowhere near the config).
                 Some(existing_clone)
-                    if url_credentials(&existing_clone.remote).is_some()
-                        && url_credentials(&sync_config.remote).is_some()
-                        && url_credentials(&existing_clone.remote) != url_credentials(&sync_config.remote) => anyhow::bail!(
+                    if url_credentials(&existing_clone.remote) != url_credentials(&sync_config.remote) => anyhow::bail!(
                     "[sync.{}] and [sync.{}] name the same repository {} with different credentials; \
                      write the same remote in both",
                     existing_clone.domains.first().map_or("?", |first_domain| first_domain.as_str()),
@@ -498,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn a_credentialed_and_a_plain_spelling_of_one_repository_are_one_clone() {
+    fn a_credentialed_and_a_plain_spelling_of_one_repository_are_refused_not_merged() {
         let credentialed_and_plain = SyncSection {
             work: Some(sync_entry(
                 "https://a:token-one@host.example/r.git",
@@ -507,10 +505,9 @@ mod tests {
             personal: None,
             shared: Some(sync_entry("https://host.example/r.git", "/keys/one")),
         };
-        let clones: Vec<CloneSpec> = clone_specs(&credentialed_and_plain).unwrap();
-        assert_eq!(clones.len(), 1, "{clones:?}");
-        assert_eq!(sync_warnings(&clones).len(), 1, "work now shares a clone");
-        assert!(!clones[0].normalized_remote.contains("token"), "{clones:?}");
+        let error_text: String = format!("{:#}", clone_specs(&credentialed_and_plain).unwrap_err());
+        assert!(error_text.contains("different credentials"), "{error_text}");
+        assert!(!error_text.contains("token"), "{error_text}");
     }
 
     #[test]
@@ -651,6 +648,7 @@ mod tests {
             "ssh://git@host.example:2222/o/r"
         );
     }
+
     #[test]
     fn an_ssh_url_and_the_scp_form_of_one_repo_share_a_clone() {
         let sync_section = SyncSection {

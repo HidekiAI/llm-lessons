@@ -236,8 +236,9 @@ fn attempt(cycle: &Cycle, attempt_number: u32) -> Result<Option<String>> {
     plans
         .iter()
         .try_for_each(|(domain, plan)| write_clone_files(cycle, *domain, plan))?;
-    let committed: bool = !cycle.runner.run(&["diff", "--cached", "--quiet"])?.exit_ok;
-    if committed {
+    // `diff --quiet` exits 1 for changes and 128 for a git error; both count, and the commit then fails loudly.
+    let has_staged_changes: bool = !cycle.runner.run(&["diff", "--cached", "--quiet"])?.exit_ok;
+    if has_staged_changes {
         let domain_names: Vec<&str> = plans.iter().map(|(domain, _)| domain.as_str()).collect();
         cycle.runner.run_checked(&[
             "commit",
@@ -486,9 +487,13 @@ pub fn sync_configured(
                     println!("{shown_remote}: another sync is running, nothing to do");
                     CycleOutcome::LockHeld
                 }
-                Ok(done) => {
+                Ok(CycleOutcome::Synced) => {
                     println!("{shown_remote}: synced");
-                    done
+                    CycleOutcome::Synced
+                }
+                Ok(CycleOutcome::Failed) => {
+                    eprintln!("lessons sync: {shown_remote}: the cycle failed");
+                    CycleOutcome::Failed
                 }
                 Err(sync_error) => {
                     eprintln!(
@@ -651,10 +656,22 @@ mod tests {
         }
     }
 
+    /// A git runner that ignores the tester's global and system configuration, like `Machine`'s.
+    fn isolated_git(directory: &Path) -> GitRunner {
+        [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ]
+        .into_iter()
+        .fold(GitRunner::new(directory, "ssh"), |runner, (name, value)| {
+            runner.with_env(name, value)
+        })
+    }
+
     /// A bare remote whose HEAD names `REMOTE_BRANCH`, as a local path.
     fn bare_remote(root: &Path) -> String {
         let remote_path: PathBuf = root.join("remote.git");
-        let runner = GitRunner::new(root, "ssh");
+        let runner = isolated_git(root);
         runner
             .run_checked(&[
                 "init",
@@ -669,7 +686,7 @@ mod tests {
     }
 
     fn remote_commit_count(root: &Path, remote: &str) -> usize {
-        let output: String = GitRunner::new(root, "ssh")
+        let output: String = isolated_git(root)
             .run(&["--git-dir", remote, "rev-list", "--count", REMOTE_BRANCH])
             .map(|git_output| git_output.stdout)
             .unwrap_or_default();
@@ -677,7 +694,7 @@ mod tests {
     }
 
     fn remote_file(root: &Path, remote: &str, name: &str) -> Option<String> {
-        let output = GitRunner::new(root, "ssh")
+        let output = isolated_git(root)
             .run(&[
                 "--git-dir",
                 remote,
@@ -748,7 +765,7 @@ mod tests {
             .join("trunk-remote.git")
             .to_string_lossy()
             .into_owned();
-        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let runner = isolated_git(temp_dir.path());
         runner
             .run_checked(&["init", "-q", "--bare", "-b", "trunk", &trunk_remote])
             .unwrap();
@@ -1275,7 +1292,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let git = GitRunner::new(temp_dir.path(), "ssh");
+        let git = isolated_git(temp_dir.path());
         [&personal_remote, &shared_remote]
             .iter()
             .for_each(|remote| {
@@ -1379,7 +1396,7 @@ mod tests {
         right.set_resolution(&lesson_id, "right");
         left.sync(&remote);
         right.sync(&remote);
-        let listing: String = GitRunner::new(temp_dir.path(), "ssh")
+        let listing: String = isolated_git(temp_dir.path())
             .run_checked(&[
                 "--git-dir",
                 &remote,

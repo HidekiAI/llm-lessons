@@ -21,9 +21,9 @@ max_results = 5
 # ssh_key is a private key file, or a .pub whose private key an agent holds.
 # remote must use the real host (git@github.com:...), not a ~/.ssh/config Host alias: sync runs ssh with -F /dev/null
 # so that only ssh_key is offered, which also skips the aliases in your ssh config.
-# update = "live"      also sync in the background after each change
+# update = "live"      meant to also sync in the background after each change (not built yet: run `lessons sync`)
 # update = "on-demand" sync only when reading
-# Both modes pull in the background when reading, at most every pull_every_minutes.
+# Pulling in the background when reading, at most every pull_every_minutes, is not built yet either.
 [sync.work]
 remote = "git@github.com:<owner>/<private-repo>.git"
 ssh_key = "~/.ssh/id_ed25519"

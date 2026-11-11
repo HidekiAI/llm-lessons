@@ -141,11 +141,13 @@ Without a terminal (a script, CI), pass the answers as flags instead; they apply
 
 After that, run `lessons sync` by hand (running it by itself in the background, as `update` says, is not built yet). `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
+Prefer an ssh remote. A token written into an https URL is kept in plain text in `~/.lessons/sync/<slug>/.git/config` and shows in the process list while git runs; `lessons` never prints it.
+
 How the merge works:
 
 - Each lesson is merged field by field against the last synced version, so edits to different fields on two machines are both kept.
 - When both machines changed the same field differently, sync keeps one value and queues the other; nothing is dropped. `lessons resolve` then asks you per field: keep one, keep the other, combine both (tagged `needs-reword`, for you to reword later), edit, or skip to keep it queued.
-- A sync never prompts: it runs in the background, so a passphrase or an unknown-host question makes it fail, not wait.
+- A sync never prompts (it is meant to run in the background), so a passphrase or an unknown-host question makes it fail, not wait.
 
 When `work` shares a repo with `personal` or `shared`, sync notes once per sync that work data is readable by everyone with access to that repo.
 
@@ -155,7 +157,7 @@ An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One ne
 
 So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commits that text. The merge itself never runs in git: `lessons sync` merges in-process, field by field, three ways (against the version both machines last agreed on), then commits the result on top of the repo's latest commit, so every push is a plain fast-forward and there are no merge commits. The local `.db` is rebuilt from the merged result.
 
-What pays off is syncing often (`update = "live"`): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
+What pays off is syncing often (`update = "live"`, once background sync is built; until then run `lessons sync` often): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
 
 ### Why a git repo, and not a gist or a cloud drive?
 
@@ -173,7 +175,7 @@ A repo that holds work lessons stays private because they may belong to your emp
 
 It looks like duplicated work, because lessons also compares two versions against a common base, keeps conflicts for later, writes its files through a temp file and a rename, and stores lessons as sorted lines of text. Those are git's tools too.
 
-But git merges lines of text, and one lesson is one line of JSON. Two machines that edit different fields of one lesson would conflict in git, and git would stop and wait for a person. Sync runs in the background and cannot wait.
+But git merges lines of text, and one lesson is one line of JSON. Two machines that edit different fields of one lesson would conflict in git, and git would stop and wait for a person. Sync is meant to run in the background and cannot wait.
 
 So lessons merges each lesson field by field, against the version both machines last agreed on, and keeps both edits. If both machines changed the same field, it keeps one value, queues the other, and asks you later with `lessons resolve`.
 

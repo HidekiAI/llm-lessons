@@ -1,6 +1,6 @@
 //! End-to-end tests: run the real `lessons` binary against a throwaway LESSONS_HOME.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -32,12 +32,18 @@ fn run_lessons_with_stdin(lessons_home: &Path, args: &[&str], stdin_text: &str) 
         .expect("spawn lessons");
     // A command that exits without reading its stdin (a mistyped hook command) closes the pipe: a broken-pipe error is
     // the command's answer, not a test failure, and it only shows up when the child wins the race.
-    mut_child
+    let write_result = mut_child
         .stdin
         .take()
         .expect("stdin")
-        .write_all(stdin_text.as_bytes())
-        .ok();
+        .write_all(stdin_text.as_bytes());
+    assert!(
+        write_result.is_ok()
+            || write_result
+                .as_ref()
+                .is_err_and(|write_error| write_error.kind() == ErrorKind::BrokenPipe),
+        "write stdin: {write_result:?}"
+    );
     mut_child.wait_with_output().expect("wait for lessons")
 }
 
