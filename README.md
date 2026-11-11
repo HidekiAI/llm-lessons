@@ -117,7 +117,7 @@ Sync them through a git repo (GitHub, GitLab, any host) with `lessons sync`. The
 > [!CAUTION]
 > Keep any repo that holds **work** lessons **private**: your employer's rules on its data apply, and anything pushed stays in the history, and in forks and archives, even after you delete it. `shared` and `personal` are your call: if you have nothing to hide, a public repo lets others learn from your lessons. A repo's visibility is set in its Settings, under Danger Zone. While a synced repo is public, every `lessons` command prints a warning.
 
-**Before you start**, create 1, 2 or 3 repos dedicated to the lessons DBs (private unless you chose otherwise above).
+**Before you start**, create 1, 2 or 3 repos dedicated to the lessons DBs (private unless you chose otherwise above), not a gist or a cloud-drive folder (see the FAQ below).
 
 **Scenario A: separate work and personal accounts.** Create the repo(s) with your personal account and add your work account as a collaborator (Settings > Collaborators), so both can push. Either one repo for all three DBs, or a work-only repo plus one for `personal` and `shared`; with a work-only repo, sync also checks that no other key on the machine can read it. Then, on each machine:
 
@@ -156,15 +156,15 @@ What pays off is syncing often (`update = "live"`): the less each machine change
 
 ### Why a git repo, and not a gist or a cloud drive?
 
-Because only a git repo merges and can be shared with your other accounts. A cloud drive overwrites; a gist is owner-only.
+Because only a git repo gives `lessons sync` a shared history to merge against, and can be shared with your other accounts. A cloud drive does not merge; a gist is owner-only.
 
-Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dropbox). A cloud drive syncs whole files. Two machines change the same `.db`. On a conflict the drive silently keeps one copy, so the other machine's lessons are gone. It can also copy a `.db` in the middle of a write, or apart from its `-wal` file, which can corrupt it.
+Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dropbox). A cloud drive syncs whole files. Two machines change the same `.db`. On a conflict the drive keeps one side, or leaves a conflicted copy that nothing merges. It can also copy a `.db` in the middle of a write, or apart from its `-wal` file, which can corrupt it.
 
 A gist is a git repo, but only its owner can push. It cannot have collaborators. A secret gist is readable by anyone who has its URL.
 
 With a git repo, `lessons sync` merges the JSON lines per lesson and per field. A real conflict only happens when two machines change the same field of the same lesson. Then nothing is dropped: `lessons resolve` asks you.
 
-The repo stays private because work lessons may belong to your employer, and anything pushed stays in the history.
+A repo that holds work lessons stays private because they may belong to your employer, and anything pushed stays in the history.
 
 ## Contributing
 
