@@ -515,5 +515,10 @@ mod tests {
             vec![Domain::Work, Domain::Shared],
             "a domain listed twice is synced once, in first-seen order"
         );
+        assert_eq!(
+            domains_to_sync(&[Domain::Work, Domain::Work, Domain::Work], None).unwrap(),
+            vec![Domain::Work],
+            "three copies of one domain"
+        );
     }
 }

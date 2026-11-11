@@ -15,6 +15,14 @@ set -euo pipefail
 unset GREP_OPTIONS GREP_COLOR GREP_COLORS
 grep() { command grep --color=never "$@"; }
 
+# --test must touch nothing of the user's, and log_step appends to a log under XDG_STATE_HOME: point it at a temp dir.
+if [[ "${1:-}" == --test ]]; then
+    test_state_dir="$(mktemp -d "${TMPDIR:-/tmp}/lessons-setup-state.XXXXXX")"
+    # shellcheck disable=SC2064 # expand test_state_dir now: it is gone when the trap runs
+    trap "rm -rf '$test_state_dir'" EXIT
+    export XDG_STATE_HOME="$test_state_dir"
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPO_ROOT
 readonly KNOWN_DOMAINS="work personal shared"
@@ -713,6 +721,8 @@ run_self_test() {
         "$(agent_register_command opencode /bin/lessons | tr '\n' ' ' | sed 's/ $//')"
     check_equal "claude registers for the user" "claude mcp add --scope user lessons -- /bin/lessons mcp" \
         "$(agent_register_command claude /bin/lessons | tr '\n' ' ' | sed 's/ $//')"
+    check_equal "--test logs into a temp directory, not the user's state directory" "yes" \
+        "$([[ "$LOG_FILE" == "${test_state_dir:-unset}"/* ]] && echo yes || echo no)"
     check_equal "platform: Linux and macOS are unix" "unix unix" \
         "$(platform_kind Linux 6.1.0-18-amd64 '') $(platform_kind Darwin 25.1.0 '')"
     check_equal "platform: WSL2 by its kernel or a custom kernel in a WSL distro; a Microsoft kernel without WSL2 is WSL1" "wsl2 wsl2 wsl1 wsl1" \
