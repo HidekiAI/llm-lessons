@@ -144,7 +144,7 @@ pub fn sync_warnings(clones: &[CloneSpec]) -> Vec<String> {
                 .collect();
             format!(
                 "WARNING: work shares {} with {}: work data is readable by everyone with access to that repo",
-                clone_spec.remote,
+                crate::sync::redact_credentials(&clone_spec.remote),
                 other_domains.join(" and ")
             )
         })
@@ -460,6 +460,18 @@ mod tests {
         assert!(sync_warnings(&separate_clones).is_empty());
     }
 
+    #[test]
+    fn the_work_sharing_warning_never_prints_a_credential_of_the_remote() {
+        let credentialed = "https://user:secret-token@github.com/owner/repo.git";
+        let shared_remote = SyncSection {
+            work: Some(sync_entry(credentialed, "/keys/one")),
+            personal: None,
+            shared: Some(sync_entry(credentialed, "/keys/one")),
+        };
+        let warnings: Vec<String> = sync_warnings(&clone_specs(&shared_remote).unwrap());
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("secret-token"), "{warnings:?}");
+    }
     #[test]
     fn sync_sections_refuse_unknown_keys_domains_and_modes_and_need_a_remote() {
         assert!(

@@ -198,6 +198,8 @@ impl GitRunner {
             self.working_dir.display()
         );
         let output: Output = Command::new("git")
+            // A background sync must not start a daemon (fsmonitor) or a detached repack (auto gc) in the clone.
+            .args(["-c", "core.fsmonitor=false", "-c", "gc.auto=0"])
             .args(args)
             .current_dir(&self.working_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -254,8 +256,9 @@ pub fn detect_default_branch(runner: &GitRunner, remote: &str) -> Result<String>
 
 /// Makes the clone exist and be configured, whatever state it is in: `git init -b <branch>` when there is no
 /// repository yet (so the branch name never depends on `init.defaultBranch`), the remote URL, the ssh command, and
-/// commit signing and every hook off (a signing key may need a prompt or an agent a background process lacks; hooks
-/// belong to the user's own repositories). Safe to repeat, but not safe to run twice at once: the caller holds the
+/// commit signing and the hooks of a global `core.hooksPath` off (a signing key may need a prompt or an agent a
+/// background process lacks; hooks belong to the user's own repositories). Hooks that git 2.54+ reads from config are
+/// not covered by that path. Safe to repeat, but not safe to run twice at once: the caller holds the
 /// clone lock (plan step S4c).
 pub fn ensure_clone(
     runner: &GitRunner,

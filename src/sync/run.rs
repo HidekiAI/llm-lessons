@@ -52,6 +52,9 @@ pub struct CloneJob<'job> {
     pub normalized_remote: &'job str,
     pub ssh_command: String,
     pub domains: &'job [Domain],
+    /// True when `domains` is every domain the clone carries. The single remembered BASE describes the whole clone, so
+    /// a run of only some domains must not advance it: the others would then look deleted on the next full run.
+    pub whole_clone: bool,
     /// Extra environment for every git call; tests point git at their own config.
     pub git_env: &'job [(String, String)],
 }
@@ -65,7 +68,10 @@ pub fn sync_clone(
     let paths = ClonePaths::new(job.lessons_home, job.normalized_remote);
     match lock_clone(&paths)? {
         None => {
-            journal!("sync {}: another sync holds the lock", job.remote);
+            journal!(
+                "sync {}: another sync holds the lock",
+                redact_credentials(job.remote)
+            );
             Ok(CycleOutcome::LockHeld)
         }
         Some(_held_lock) => {
@@ -73,7 +79,8 @@ pub fn sync_clone(
             let cycle: Result<Option<String>> = run_cycle(job, &paths, &state_before, on_step);
             let recorded: CycleResult = match &cycle {
                 Ok(last_synced) => CycleResult::Succeeded {
-                    last_synced: last_synced.clone(),
+                    // A partial run leaves BASE where it was; see `CloneJob::whole_clone`.
+                    last_synced: last_synced.clone().filter(|_| job.whole_clone),
                 },
                 Err(_) => CycleResult::Failed,
             };
@@ -90,7 +97,7 @@ pub fn sync_clone(
                 (Err(cycle_error), Err(state_error)) => {
                     journal!(
                         "sync {}: the state file was not written either: {state_error:#}",
-                        job.remote
+                        redact_credentials(job.remote)
                     );
                     Err(cycle_error)
                 }
@@ -179,15 +186,15 @@ fn run_cycle(
     attempt(&cycle, 1)
 }
 
+/// The commit `revision` names, or none when it names nothing (an empty remote, a branch with no commits yet).
+fn verified_commit(runner: &GitRunner, revision: &str) -> Result<Option<String>> {
+    let output = runner.run(&["rev-parse", "--verify", "-q", revision])?;
+    Ok(output.exit_ok.then(|| output.stdout.trim().to_string()))
+}
+
 /// The remote's tip of `branch`, or none when the remote is still empty.
 fn remote_tip(runner: &GitRunner, branch: &str) -> Result<Option<String>> {
-    let output = runner.run(&[
-        "rev-parse",
-        "--verify",
-        "-q",
-        &format!("refs/remotes/origin/{branch}"),
-    ])?;
-    Ok(output.exit_ok.then(|| output.stdout.trim().to_string()))
+    verified_commit(runner, &format!("refs/remotes/origin/{branch}"))
 }
 
 /// The text of `file` at `commit` (BASE or THEIRS), empty for no commit or a file the commit does not have.
@@ -233,15 +240,12 @@ fn attempt(cycle: &Cycle, attempt_number: u32) -> Result<Option<String>> {
         cycle.runner.run_checked(&[
             "commit",
             "-q",
-            "--no-verify", // the user's hooks are for their own repositories, not this one
+            "--no-verify", // skips pre-commit and commit-msg; the user's hooks are for their own repositories
             "-m",
             &format!("sync {}", domain_names.join(", ")),
         ])?;
     }
-    let head: Option<String> = {
-        let output = cycle.runner.run(&["rev-parse", "--verify", "-q", "HEAD"])?;
-        output.exit_ok.then(|| output.stdout.trim().to_string())
-    };
+    let head: Option<String> = verified_commit(&cycle.runner, "HEAD")?;
     // Also a commit left by a crashed cycle: nothing new to commit, but the remote does not have it yet.
     let needs_push: bool = head.is_some() && head != tip;
     (cycle.on_step)(SyncStep::BeforePush)?;
@@ -255,7 +259,7 @@ fn attempt(cycle: &Cycle, attempt_number: u32) -> Result<Option<String>> {
     let pushed = cycle.runner.run(&[
         "push",
         "-q",
-        "--no-verify", // a pre-push hook of the user's (a gate for their work repositories) must not block a sync
+        "--no-verify", // skips pre-push; a gate of the user's for their work repositories must not block a sync
         "origin",
         &format!("HEAD:refs/heads/{}", cycle.branch),
     ])?;
@@ -302,18 +306,19 @@ fn merge_domain(
 ) -> Result<DomainPlan> {
     let lessons_name: String = lessons_file_name(domain);
     let queue_name: String = queue_file_name(domain);
-    let lessons_at = |commit: Option<&str>| -> Result<Vec<Lesson>> {
+    let fn_lessons_at = |commit: Option<&str>| -> Result<Vec<Lesson>> {
         let text: String = text_at(&cycle.runner, commit, &lessons_name)?;
         from_jsonl(&text, |row: &Lesson| row.id.clone())
             .with_context(|| format!("{lessons_name} at {commit:?}"))
     };
-    let queue_at = |commit: Option<&str>| -> Result<Vec<Conflict>> {
+    let fn_queue_at = |commit: Option<&str>| -> Result<Vec<Conflict>> {
         let text: String = text_at(&cycle.runner, commit, &queue_name)?;
         from_jsonl(&text, group_key).with_context(|| format!("{queue_name} at {commit:?}"))
     };
-    let (base, theirs): (Vec<Lesson>, Vec<Lesson>) = (lessons_at(base_commit)?, lessons_at(tip)?);
+    let (base, theirs): (Vec<Lesson>, Vec<Lesson>) =
+        (fn_lessons_at(base_commit)?, fn_lessons_at(tip)?);
     let (base_queue, theirs_queue): (Vec<Conflict>, Vec<Conflict>) =
-        (queue_at(base_commit)?, queue_at(tip)?);
+        (fn_queue_at(base_commit)?, fn_queue_at(tip)?);
     let live_queue_path: PathBuf = cycle.paths.live_queue(domain);
     let live_queue: Vec<Conflict> = from_jsonl(&read_text_or_empty(&live_queue_path)?, group_key)
         .with_context(|| format!("{}", live_queue_path.display()))?;
@@ -411,7 +416,7 @@ fn write_clone_files(cycle: &Cycle, domain: Domain, plan: &DomainPlan) -> Result
 fn identity_agent_of(remote: &str) -> Option<String> {
     let host: String = ssh_host_of(remote)?;
     let described = std::process::Command::new("ssh")
-        .args(["-G", &host])
+        .args(["-G", "--", &host])
         .output();
     match described {
         Ok(output) if output.status.success() => {
@@ -468,6 +473,7 @@ pub fn sync_configured(
                             identity_agent_of(&clone.remote).as_deref(),
                         ),
                         domains: &domains,
+                        whole_clone: domains.len() == clone.domains.len(),
                         git_env,
                     };
                     sync_clone(&job, &|_| Ok(()), now_secs)
@@ -608,6 +614,7 @@ mod tests {
                 normalized_remote: remote,
                 ssh_command: "ssh".to_string(),
                 domains: ONLY_SHARED,
+                whole_clone: true,
                 git_env: &self.git_env,
             }
         }
@@ -701,10 +708,10 @@ mod tests {
         assert_eq!(left.sync(&remote), CycleOutcome::Synced);
         assert_eq!(right.sync(&remote), CycleOutcome::Synced);
         assert_eq!(left.sync(&remote), CycleOutcome::Synced);
-        let mut expected: Vec<String> = vec![left_id, right_id];
-        expected.sort();
-        assert_eq!(left.ids(), expected);
-        assert_eq!(right.ids(), expected);
+        let mut mut_expected: Vec<String> = vec![left_id, right_id];
+        mut_expected.sort();
+        assert_eq!(left.ids(), mut_expected);
+        assert_eq!(right.ids(), mut_expected);
     }
 
     #[test]
@@ -853,7 +860,9 @@ mod tests {
     }
 
     /// The user's own hooks (a pre-push gate, a commit scanner, in a hooks directory or as git's config-based
-    /// `[hook "name"]`) are meant for their work repositories: none of them may run, or block, a sync.
+    /// `[hook "name"]`) are meant for their work repositories: none of the pre-commit and pre-push ones may block a
+    /// sync. Config-based hooks of other events (post-commit, reference-transaction) are not turned off on git 2.54+,
+    /// so they are not covered here.
     #[cfg(unix)]
     #[test]
     fn the_users_global_hooks_never_block_a_sync() {
@@ -1088,10 +1097,10 @@ mod tests {
             );
             assert_eq!(right.sync(&remote), CycleOutcome::Synced);
             left.sync(&remote);
-            let mut expected: Vec<String> = vec![left_id, right_id];
-            expected.sort();
-            assert_eq!(left.ids(), expected, "{crash_step:?}");
-            assert_eq!(right.ids(), expected, "{crash_step:?}");
+            let mut mut_expected: Vec<String> = vec![left_id, right_id];
+            mut_expected.sort();
+            assert_eq!(left.ids(), mut_expected, "{crash_step:?}");
+            assert_eq!(right.ids(), mut_expected, "{crash_step:?}");
             let state: SyncState = read_state(&right.paths(&remote).state_file());
             assert_eq!(
                 state.consecutive_failures, 0,
@@ -1129,26 +1138,26 @@ mod tests {
                 .iter()
                 .map(|name| Machine::new(temp_dir.path(), name))
                 .collect();
-            let by_name = |name: &str| {
+            let fn_by_name = |name: &str| {
                 machines
                     .iter()
                     .find(|machine| machine.home.ends_with(name))
                     .unwrap()
             };
-            let (racer, rival) = (by_name(first), by_name(second));
+            let (racer, rival) = (fn_by_name(first), fn_by_name(second));
             let racer_id = racer.add("racer");
             let rival_id = rival.add("rival");
             racer.sync(&remote);
             let racer_second_id = racer.add("racer, second lesson"); // something new to push, so a race can happen
             let rival_pushed = Cell::new(false);
-            let race = |step: SyncStep| -> Result<()> {
+            let fn_race = |step: SyncStep| -> Result<()> {
                 if step == SyncStep::BeforePush && !rival_pushed.replace(true) {
                     rival.sync(&remote); // the other machine pushes between our fetch and our push
                 }
                 Ok(())
             };
             assert_eq!(
-                racer.sync_with(&remote, &race).unwrap(),
+                racer.sync_with(&remote, &fn_race).unwrap(),
                 CycleOutcome::Synced,
                 "{first} vs {second}"
             );
@@ -1183,12 +1192,12 @@ mod tests {
             .unwrap();
         held.lock().unwrap();
         let fetched = Cell::new(false);
-        let probe = |_step: SyncStep| -> Result<()> {
+        let fn_probe = |_step: SyncStep| -> Result<()> {
             fetched.set(true);
             Ok(())
         };
         assert_eq!(
-            machine.sync_with(&remote, &probe).unwrap(),
+            machine.sync_with(&remote, &fn_probe).unwrap(),
             CycleOutcome::LockHeld
         );
         assert!(!fetched.get(), "no step ran while the lock was held");
@@ -1377,10 +1386,10 @@ mod tests {
                 REMOTE_BRANCH,
             ])
             .unwrap();
-        let mut names: Vec<&str> = listing.lines().collect();
-        names.sort_unstable();
+        let mut mut_names: Vec<&str> = listing.lines().collect();
+        mut_names.sort_unstable();
         assert_eq!(
-            names,
+            mut_names,
             vec!["shared.conflicts.jsonl", "shared.jsonl"],
             "only the JSON lines are committed"
         );
@@ -1413,5 +1422,58 @@ mod tests {
         let text: String = remote_file(temp_dir.path(), &remote, "shared.jsonl").unwrap();
         let rows: Vec<Lesson> = from_jsonl(&text, |row: &Lesson| row.id.clone()).unwrap();
         assert_eq!(rows, vec![machine.lesson(&lesson_id).unwrap()]);
+    }
+
+    /// One URL can carry several domains and the clone has ONE remembered BASE. A run of only one domain must leave it
+    /// alone: advancing it would make the other domain's newer remote rows look deleted on the next full run.
+    #[test]
+    fn a_run_of_one_domain_of_a_shared_clone_does_not_delete_the_other_domains_remote_rows() {
+        const BOTH: &[Domain] = &[Domain::Shared, Domain::Personal];
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let (left, right) = (
+            Machine::new(temp_dir.path(), "left"),
+            Machine::new(temp_dir.path(), "right"),
+        );
+        let personal_conn = |machine: &Machine| -> Connection {
+            drop(open(&Domain::Personal.file_path(&machine.home), OpenMode::Create).unwrap());
+            open(
+                &Domain::Personal.file_path(&machine.home),
+                OpenMode::Existing,
+            )
+            .unwrap()
+        };
+        let sync_domains = |machine: &Machine, domains: &[Domain], whole_clone: bool| {
+            let job = CloneJob {
+                domains,
+                whole_clone,
+                ..machine.job(&remote)
+            };
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap()
+        };
+        let (left_personal, right_personal) = (personal_conn(&left), personal_conn(&right));
+        sync_domains(&right, BOTH, true);
+        let new_row_id: String = insert(
+            &left_personal,
+            &NewLesson {
+                title: "personal row".to_string(),
+                problem: "written on the left".to_string(),
+                ..NewLesson::default()
+            },
+        )
+        .unwrap();
+        sync_domains(&left, BOTH, true);
+        sync_domains(&right, ONLY_SHARED, false);
+        sync_domains(&right, BOTH, true);
+        assert!(
+            find_by_id(&right_personal, &new_row_id).unwrap().is_some(),
+            "the right machine receives the row"
+        );
+        assert!(
+            remote_file(temp_dir.path(), &remote, "personal.jsonl")
+                .unwrap()
+                .contains(&new_row_id),
+            "the remote still has the row"
+        );
     }
 }

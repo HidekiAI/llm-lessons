@@ -15,6 +15,7 @@ mod git;
 mod run;
 
 pub use cycle::exit_for;
+pub use git::redact_credentials;
 pub use run::sync_configured;
 
 /// Added to `tags` by a combine in `lessons resolve`, so `lessons list --tag needs-reword` finds the lesson.

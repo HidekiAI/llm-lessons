@@ -259,17 +259,17 @@ fn main() -> Result<ExitCode> {
     };
 
     // Every command but `sync` ends in success or in an error (exit 1); `sync` also has an exit code of its own.
-    let done = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
+    let fn_done = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
     match cli.command {
-        Command::Init { domain } => done(run_init(&fn_lessons_home()?, domain)),
-        Command::Add(add_args) => done(run_add(&fn_lessons_home()?, add_args)),
-        Command::Show { id, format } => done(run_show(&fn_lessons_home()?, &id, format)),
+        Command::Init { domain } => fn_done(run_init(&fn_lessons_home()?, domain)),
+        Command::Add(add_args) => fn_done(run_add(&fn_lessons_home()?, add_args)),
+        Command::Show { id, format } => fn_done(run_show(&fn_lessons_home()?, &id, format)),
         Command::List {
             in_domains,
             limit,
             tag,
             format,
-        } => done(run_list(
+        } => fn_done(run_list(
             &fn_lessons_home()?,
             &in_domains.0,
             limit,
@@ -277,16 +277,16 @@ fn main() -> Result<ExitCode> {
             format,
         )),
         Command::Update { id, fields } => {
-            done(run_update(&fn_lessons_home()?, &id, fields.into_patch()))
+            fn_done(run_update(&fn_lessons_home()?, &id, fields.into_patch()))
         }
-        Command::Hit { id } => done(run_hit(&fn_lessons_home()?, &id)),
+        Command::Hit { id } => fn_done(run_hit(&fn_lessons_home()?, &id)),
         Command::Search {
             text,
             in_domains,
             limit,
             raw,
             format,
-        } => done(run_search(
+        } => fn_done(run_search(
             &fn_lessons_home()?,
             &text,
             in_domains,
@@ -294,10 +294,10 @@ fn main() -> Result<ExitCode> {
             raw,
             format,
         )),
-        Command::Retire { id, by } => done(run_retire(&fn_lessons_home()?, &id, &by)),
-        Command::Move { id, to } => done(run_move(&fn_lessons_home()?, &id, to)),
+        Command::Retire { id, by } => fn_done(run_retire(&fn_lessons_home()?, &id, &by)),
+        Command::Move { id, to } => fn_done(run_move(&fn_lessons_home()?, &id, to)),
         Command::Sync { domain } => run_sync(&fn_lessons_home()?, domain),
-        Command::Mcp => done(mcp::serve(
+        Command::Mcp => fn_done(mcp::serve(
             &fn_lessons_home()?,
             std::io::stdin().lock(),
             std::io::stdout().lock(),
@@ -377,7 +377,8 @@ fn run_add(lessons_home: &Path, add_args: AddArgs) -> Result<()> {
             None => insert_error,
         })?;
     if let Some(template_path) = &edited_template {
-        std::fs::remove_file(template_path).ok(); // a leftover file in the temp dir is harmless, so a failed delete is ignored
+        // a leftover file in the temp dir is harmless, so a failed delete is ignored
+        std::fs::remove_file(template_path).ok();
     }
     println!("{lesson_id}");
     Ok(())
