@@ -122,16 +122,26 @@ pub fn new_last_synced(
 pub fn domains_to_sync(clone_domains: &[Domain], requested: Option<Domain>) -> Result<Vec<Domain>> {
     // A domain that is not configured for this clone must fail loudly: skipping it would look like a successful sync.
     match requested {
-        None => Ok(clone_domains.to_vec()),
+        // First occurrence wins, so a domain listed twice is synced once.
+        None => Ok(clone_domains
+            .iter()
+            .enumerate()
+            .filter(|(position, domain)| !clone_domains[..*position].contains(domain))
+            .map(|(_, domain)| *domain)
+            .collect()),
         Some(domain) if clone_domains.contains(&domain) => Ok(vec![domain]),
         Some(domain) => bail!(
             "domain {} is not configured for this remote (configured: {})",
             domain.as_str(),
-            clone_domains
-                .iter()
-                .map(|configured| configured.as_str())
-                .collect::<Vec<&str>>()
-                .join(", ")
+            Some(
+                clone_domains
+                    .iter()
+                    .map(|configured| configured.as_str())
+                    .collect::<Vec<&str>>()
+                    .join(", ")
+            )
+            .filter(|names| !names.is_empty())
+            .unwrap_or_else(|| "none".to_string())
         ),
     }
 }
@@ -149,10 +159,13 @@ mod tests {
     const EARLY: &str = "2026-11-01T00:00:00Z";
     const MIDDLE: &str = "2026-11-02T00:00:00Z";
     const LATE: &str = "2026-11-03T00:00:00Z";
+    /// The throwaway identity git commits as in these tests.
+    const TEST_IDENTITY_NAME: &str = "sync test";
+    const TEST_IDENTITY_EMAIL: &str = "sync@test.invalid";
     const ID_A: &str = "01KAAAAAAAAAAAAAAAAAAAAAAA";
     const ID_B: &str = "01KBBBBBBBBBBBBBBBBBBBBBBB";
 
-    fn lesson(lesson_id: &str, updated_at: &str, resolution: &str) -> Lesson {
+    fn lesson_row(lesson_id: &str, updated_at: &str, resolution: &str) -> Lesson {
         Lesson {
             id: lesson_id.to_string(),
             created_at: EARLY.to_string(),
@@ -170,7 +183,7 @@ mod tests {
         }
     }
 
-    fn group(lesson_id: &str, versions: &[(&str, &str)]) -> Conflict {
+    fn conflict_group(lesson_id: &str, versions: &[(&str, &str)]) -> Conflict {
         Conflict {
             id: lesson_id.to_string(),
             field: MergedField::Resolution,
@@ -193,10 +206,10 @@ mod tests {
         let runner = GitRunner::new(temp_dir.path(), "ssh")
             .with_env("GIT_CONFIG_GLOBAL", &global_config.to_string_lossy())
             .with_env("GIT_CONFIG_NOSYSTEM", "1")
-            .with_env("GIT_AUTHOR_NAME", "t")
-            .with_env("GIT_AUTHOR_EMAIL", "t@t.invalid")
-            .with_env("GIT_COMMITTER_NAME", "t")
-            .with_env("GIT_COMMITTER_EMAIL", "t@t.invalid");
+            .with_env("GIT_AUTHOR_NAME", TEST_IDENTITY_NAME)
+            .with_env("GIT_AUTHOR_EMAIL", TEST_IDENTITY_EMAIL)
+            .with_env("GIT_COMMITTER_NAME", TEST_IDENTITY_NAME)
+            .with_env("GIT_COMMITTER_EMAIL", TEST_IDENTITY_EMAIL);
         runner.run_checked(&["init", "-q", "-b", "trunk"]).unwrap();
         fs::write(temp_dir.path().join("work.jsonl"), "{\"kept\":1}\n").unwrap();
         runner.run_checked(&["add", "work.jsonl"]).unwrap();
@@ -242,14 +255,17 @@ mod tests {
 
     #[test]
     fn two_edits_to_different_lessons_both_survive_and_nothing_is_queued() {
-        let base = [lesson(ID_A, EARLY, "one"), lesson(ID_B, EARLY, "two")];
+        let base = [
+            lesson_row(ID_A, EARLY, "one"),
+            lesson_row(ID_B, EARLY, "two"),
+        ];
         let ours = [
-            lesson(ID_A, LATE, "one edited here"),
-            lesson(ID_B, EARLY, "two"),
+            lesson_row(ID_A, LATE, "one edited here"),
+            lesson_row(ID_B, EARLY, "two"),
         ];
         let theirs = [
-            lesson(ID_A, EARLY, "one"),
-            lesson(ID_B, MIDDLE, "two edited there"),
+            lesson_row(ID_A, EARLY, "one"),
+            lesson_row(ID_B, MIDDLE, "two edited there"),
         ];
         let plan = plan_domain_merge(&DomainInputs {
             base: &base,
@@ -271,9 +287,9 @@ mod tests {
 
     #[test]
     fn a_real_conflict_keeps_the_newer_value_and_queues_both() {
-        let base = [lesson(ID_A, EARLY, "base")];
-        let ours = [lesson(ID_A, LATE, "ours")];
-        let theirs = [lesson(ID_A, MIDDLE, "theirs")];
+        let base = [lesson_row(ID_A, EARLY, "base")];
+        let ours = [lesson_row(ID_A, LATE, "ours")];
+        let theirs = [lesson_row(ID_A, MIDDLE, "theirs")];
         let inputs = DomainInputs {
             base: &base,
             ours: &ours,
@@ -302,14 +318,20 @@ mod tests {
     /// Every machine must compute the same rows and the same queue, whichever side it calls ours.
     #[test]
     fn the_plan_is_the_same_with_the_two_sides_swapped() {
-        let base = [lesson(ID_A, EARLY, "base"), lesson(ID_B, EARLY, "keep")];
-        let ours = [lesson(ID_A, LATE, "ours"), lesson(ID_B, EARLY, "keep")];
-        let theirs = [
-            lesson(ID_A, MIDDLE, "theirs"),
-            lesson(ID_B, MIDDLE, "keep edited"),
+        let base = [
+            lesson_row(ID_A, EARLY, "base"),
+            lesson_row(ID_B, EARLY, "keep"),
         ];
-        let ours_queue = [group(ID_B, &[("x", EARLY), ("y", MIDDLE)])];
-        let theirs_queue = [group(ID_B, &[("y", LATE), ("z", EARLY)])];
+        let ours = [
+            lesson_row(ID_A, LATE, "ours"),
+            lesson_row(ID_B, EARLY, "keep"),
+        ];
+        let theirs = [
+            lesson_row(ID_A, MIDDLE, "theirs"),
+            lesson_row(ID_B, MIDDLE, "keep edited"),
+        ];
+        let ours_queue = [conflict_group(ID_B, &[("x", EARLY), ("y", MIDDLE)])];
+        let theirs_queue = [conflict_group(ID_B, &[("y", LATE), ("z", EARLY)])];
         let forward = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
@@ -332,10 +354,10 @@ mod tests {
     /// The settle step's all-versions winner applies only to a field that conflicted THIS cycle.
     #[test]
     fn an_existing_group_does_not_override_a_field_that_did_not_conflict_this_cycle() {
-        let base = [lesson(ID_A, EARLY, "base")];
-        let ours = [lesson(ID_A, MIDDLE, "base")];
-        let theirs = [lesson(ID_A, LATE, "theirs")];
-        let old_group = [group(
+        let base = [lesson_row(ID_A, EARLY, "base")];
+        let ours = [lesson_row(ID_A, MIDDLE, "base")];
+        let theirs = [lesson_row(ID_A, LATE, "theirs")];
+        let old_group = [conflict_group(
             ID_A,
             &[("base", EARLY), ("older", EARLY), ("newest ever", LATE)],
         )];
@@ -357,10 +379,13 @@ mod tests {
     /// The converse: a field that DOES conflict this cycle takes the newest of all versions of its existing group.
     #[test]
     fn a_field_that_conflicts_this_cycle_takes_the_newest_version_of_its_group() {
-        let base = [lesson(ID_A, EARLY, "base")];
-        let ours = [lesson(ID_A, MIDDLE, "ours")];
-        let theirs = [lesson(ID_A, EARLY, "theirs")];
-        let old_group = [group(ID_A, &[("newest ever", LATE), ("older", EARLY)])];
+        let base = [lesson_row(ID_A, EARLY, "base")];
+        let ours = [lesson_row(ID_A, MIDDLE, "ours")];
+        let theirs = [lesson_row(ID_A, EARLY, "theirs")];
+        let old_group = [conflict_group(
+            ID_A,
+            &[("newest ever", LATE), ("older", EARLY)],
+        )];
         let plan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
@@ -375,8 +400,8 @@ mod tests {
 
     #[test]
     fn a_group_of_a_deleted_lesson_is_cleared_and_reported() {
-        let base = [lesson(ID_A, EARLY, "base")];
-        let orphan = [group(ID_A, &[("a", EARLY), ("b", MIDDLE)])];
+        let base = [lesson_row(ID_A, EARLY, "base")];
+        let orphan = [conflict_group(ID_A, &[("a", EARLY), ("b", MIDDLE)])];
         let plan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &[],
@@ -391,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_superseded_by_conflict_is_reported_and_not_queued() {
-        let base = [lesson(ID_A, EARLY, "x")];
+        let base = [lesson_row(ID_A, EARLY, "x")];
         let ours = [Lesson {
             superseded_by: Some("01KOURS".to_string()),
             updated_at: LATE.to_string(),
@@ -477,5 +502,18 @@ mod tests {
             "{refusal}"
         );
         assert!(domains_to_sync(&[], None).unwrap().is_empty());
+        let nothing_configured: String = format!(
+            "{:#}",
+            domains_to_sync(&[], Some(Domain::Work)).unwrap_err()
+        );
+        assert!(
+            nothing_configured.contains("(configured: none)"),
+            "{nothing_configured}"
+        );
+        assert_eq!(
+            domains_to_sync(&[Domain::Work, Domain::Shared, Domain::Work], None).unwrap(),
+            vec![Domain::Work, Domain::Shared],
+            "a domain listed twice is synced once, in first-seen order"
+        );
     }
 }

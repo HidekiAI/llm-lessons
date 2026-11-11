@@ -412,11 +412,11 @@ platform_kind() {
     case "$kernel_name" in
         MINGW* | MSYS* | CYGWIN*) printf 'windows\n' ;;
         *)
-            # WSL1 always reports a Microsoft kernel that does not say WSL2. A WSL distro with any other kernel is a WSL2
-            # running a custom kernel.
+            # WSL1 reports a kernel with a capital M, `4.4.0-19041-Microsoft`; WSL2 kernels say `microsoft-standard-WSL2` in
+            # lower case, and a custom one may drop the `WSL2`. A WSL distro with any other kernel is a WSL2 as well.
             case "$kernel_release" in
-                *WSL2*) printf 'wsl2\n' ;;
-                *[Mm]icrosoft*) printf 'wsl1\n' ;;
+                *WSL2* | *microsoft*) printf 'wsl2\n' ;;
+                *Microsoft*) printf 'wsl1\n' ;;
                 *)
                     case "$wsl_distro" in
                         '') printf 'unix\n' ;;
@@ -443,7 +443,7 @@ check_platform() {
             ;;
         wsl2)
             case "$lessons_home" in
-                /mnt/[a-z]/*) log_step "WARNING: $lessons_home is on the Windows drive; keep LESSONS_HOME inside the Linux filesystem (file modes and SQLite locking are unreliable there)" ;;
+                /mnt/[a-z] | /mnt/[a-z]/*) log_step "WARNING: $lessons_home is on the Windows drive; keep LESSONS_HOME inside the Linux filesystem (file modes and SQLite locking are unreliable there)" ;;
                 *) ;;
             esac
             ;;
@@ -719,12 +719,14 @@ run_self_test() {
         "$(platform_kind Linux 5.15.153.1-microsoft-standard-WSL2 '') $(platform_kind Linux 6.6.0-custom Debian) $(platform_kind Linux 4.4.0-19041-Microsoft Debian) $(platform_kind Linux 4.4.0-19041-Microsoft '')"
     check_equal "platform: a distro name that mentions Microsoft or WSL2 does not change the verdict" "wsl2 wsl2 unix" \
         "$(platform_kind Linux 6.6.0-custom Microsoft-Debian) $(platform_kind Linux 6.6.0-custom WSL2-Ubuntu) $(platform_kind Linux 6.1.0 '')"
+    check_equal "platform: a custom WSL2 kernel that says microsoft but not WSL2 is still WSL2" "wsl2 wsl2" \
+        "$(platform_kind Linux 6.6.0-microsoft-custom Debian) $(platform_kind Linux 6.6.0-microsoft-custom '')"
     check_equal "platform: Git Bash, MSYS and Cygwin are native Windows" "windows windows windows" \
         "$(platform_kind MINGW64_NT-10.0-22631 3.5.4 '') $(platform_kind MSYS_NT-10.0 3.5.4 '') $(platform_kind CYGWIN_NT-10.0 3.5.4 '')"
     check_equal "platform: Windows and WSL1 are refused with a pointer to WSL2, WSL2 and Unix pass" "refused refused ok ok" \
         "$(check_platform MINGW64_NT '' '' /x >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Linux 4.4.0-Microsoft Debian /x >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Darwin 25.1.0 '' /Users/u/.lessons >/dev/null 2>&1 && echo ok || echo refused)"
-    check_equal "platform: a WSL2 LESSONS_HOME on the Windows drive is warned about" "1 0" \
-        "$(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c/Users/u/.lessons 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons 2>&1 | grep -c 'Windows drive')"
+    check_equal "platform: a WSL2 LESSONS_HOME on the Windows drive is warned about, also the drive root itself" "1 1 0" \
+        "$(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c/Users/u/.lessons 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons 2>&1 | grep -c 'Windows drive')"
     run_sync_self_test
     if [[ "$failures" -eq 0 ]]; then
         printf 'setup self-test: all checks passed\n'
