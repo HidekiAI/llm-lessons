@@ -472,6 +472,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(!warnings[0].contains("secret-token"), "{warnings:?}");
     }
+
     #[test]
     fn sync_sections_refuse_unknown_keys_domains_and_modes_and_need_a_remote() {
         assert!(
