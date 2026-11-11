@@ -132,7 +132,9 @@ scripts/setup.sh --domains personal,shared    # a home machine
 scripts/setup.sh --domains work,personal,shared
 ```
 
-In a terminal, `setup.sh` then asks, per domain, for the repo URL (use the real host name, `git@github.com:...`, not a `~/.ssh/config` alias, which sync does not read; Enter skips syncing that domain; the previous answer is offered again, so one repo can serve all three), the SSH key for it (from the keys in `~/.ssh`; domains sharing a repo share its key), `live` (sync after each change) or `on-demand` (sync when reading), and `pull_every_minutes` (default 10). Sync commits use your global git name and email. It writes the answers to `~/.lessons/config.toml`, your private copy (never commit it), creating it if needed and otherwise only adding the missing `[sync.<domain>]` sections. To write the file by hand instead, start from [`docs/config.sample.toml`](docs/config.sample.toml).
+In a terminal, `setup.sh` then asks, per domain, for the repo URL (use the real host name, `git@github.com:...`, not a `~/.ssh/config` alias, which sync does not read; Enter on the first question skips syncing that domain; after that the previous URL is offered, Enter reuses it so one repo can serve all three, and `-` skips the domain), the SSH key for it (from the keys in `~/.ssh`; domains sharing a repo share its key), `live` (sync after each change) or `on-demand` (sync when reading), and `pull_every_minutes` (default 10). Sync commits use your global git name and email. It writes the answers to `~/.lessons/config.toml`, your private copy (never commit it), creating it if needed and otherwise only adding the missing `[sync.<domain>]` sections. To write the file by hand instead, start from [`docs/config.sample.toml`](docs/config.sample.toml).
+
+Without a terminal (a script, CI), pass the answers as flags instead; they apply to every domain given: `scripts/setup.sh --domains work,personal,shared --remote git@github.com:<you>/<private-repo>.git --ssh-key ~/.ssh/id_ed25519` (add `--update on-demand` or `--pull-every-minutes N` to change the defaults, or `--no-sync` to skip sync). The new config is checked by loading it with `lessons search`, and put back as it was if it does not load.
 
 After that, `lessons sync` runs by itself in the background as `update` says, or by hand. `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
@@ -145,6 +147,15 @@ How the merge works:
 When `work` shares a repo with `personal` or `shared`, sync notes once per sync that work data is readable by everyone with access to that repo.
 
 Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dropbox). A sync client can copy a `.db` mid-write, or apart from its `-wal` file, which can corrupt it, and on a conflict it silently keeps one copy.
+
+### Why does git store JSON lines, and never the `.db` itself?
+
+An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One new lesson can rewrite bytes in several pages, so git sees an opaque blob. It cannot show a readable diff, it cannot merge two machines' versions (one side simply wins), and every commit stores a whole new copy, so the history grows by the size of the database each time.
+
+So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commits that text. The merge itself never runs in git: `lessons sync` merges in-process, field by field, three ways (against the version both machines last agreed on), then commits the result on top of the repo's latest commit, so every push is a plain fast-forward and there are no merge commits. The local `.db` is rebuilt from the merged result.
+
+What pays off is syncing often (`update = "live"`): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
+
 
 ## Contributing
 
