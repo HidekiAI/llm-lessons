@@ -7,6 +7,7 @@ mod journal;
 mod mcp;
 mod query;
 mod store;
+mod sync;
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;

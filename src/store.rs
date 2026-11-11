@@ -24,7 +24,7 @@ pub const FTS_COLUMNS: &[(&str, f64)] = &[
 ];
 
 /// One stored lesson. Its serde field names are the LLM-facing JSON contract: rename nothing.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lesson {
     pub id: String,
     pub created_at: String,
