@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs;
 use std::io::{ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -28,6 +30,10 @@ pub const LOCK_FILE_SUFFIX: &str = ".lock";
 pub const STATE_FILE_SUFFIX: &str = ".state";
 /// `<file>.tmp`: where `write_atomically` writes before the rename.
 pub const TEMP_FILE_SUFFIX: &str = ".tmp";
+/// Permissions of every file `write_atomically` writes: the owner only. The lessons may belong to an employer, and a
+/// file follows the process umask otherwise, which on a shared host is usually readable by every user.
+#[cfg(unix)]
+pub const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// Longest slug in bytes, far below the 255-byte file-name limit, so `.state`, `.lock` and the
 /// `.<domain>.conflicts.jsonl` suffix still fit.
@@ -211,6 +217,11 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<()> {
     fs::create_dir_all(parent_dir).with_context(|| format!("create {}", parent_dir.display()))?;
     let mut mut_temp_file =
         fs::File::create(&temp_path).with_context(|| format!("create {}", temp_path.display()))?;
+    // Set on the open file, not only at creation: a temp file left by a crash keeps the mode it was created with.
+    #[cfg(unix)]
+    mut_temp_file
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+        .with_context(|| format!("restrict {} to its owner", temp_path.display()))?;
     mut_temp_file
         .write_all(text.as_bytes())
         .and_then(|()| mut_temp_file.sync_all())
@@ -237,8 +248,9 @@ pub struct SyncState {
 
 /// The state file, or the default when it is missing, empty, corrupt or unreadable. The default has no
 /// `last_synced_commit`, which the cycle treats as an empty BASE: a union that deletes nothing. Losing the state costs
-/// a re-merge, never a lesson, so a bad state file is logged, and the next write replaces it, rather than
-/// stopping sync.
+/// a re-merge, never a lesson, so a bad state file is logged rather than stopping sync. The next write replaces a
+/// corrupt or empty file; a path that cannot be read (a directory in its place) is not replaced, and that write's
+/// error surfaces to the caller.
 pub fn read_state(path: &Path) -> SyncState {
     // A bad state file costs a re-merge from an empty BASE, never a lesson, so it is logged and the next write
     // replaces it.
@@ -456,6 +468,21 @@ mod tests {
     }
 
     #[test]
+    fn from_jsonl_refuses_three_copies_of_a_key() {
+        let three_copies: String = to_jsonl(
+            &[lesson(ID_A), lesson(ID_A), lesson(ID_B), lesson(ID_A)],
+            lesson_key,
+        )
+        .unwrap();
+        let three_error: String =
+            format!("{:#}", from_jsonl(&three_copies, lesson_key).unwrap_err());
+        assert!(
+            three_error.contains(ID_A) && !three_error.contains(ID_B),
+            "{three_error}"
+        );
+    }
+
+    #[test]
     fn from_jsonl_refuses_a_duplicate_key_and_names_it() {
         let text: String =
             to_jsonl(&[lesson(ID_A), lesson(ID_B), lesson(ID_A)], lesson_key).unwrap();
@@ -510,6 +537,23 @@ mod tests {
         );
         assert!(write_error.contains("rename"), "{write_error}");
         assert!(target_path.is_dir(), "the directory is untouched");
+    }
+
+    /// Every file written is the owner's alone, even when a crash left a world-readable temp file of the same name.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_leaves_only_the_owner_able_to_read_the_file() {
+        const OPEN_MODE: u32 = 0o644;
+        const PERMISSION_BITS: u32 = 0o777;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_path: PathBuf = temp_dir.path().join("work.jsonl");
+        let stale_temp: PathBuf = temp_dir.path().join("work.jsonl.tmp");
+        fs::write(&stale_temp, "left by a crash").unwrap();
+        fs::set_permissions(&stale_temp, fs::Permissions::from_mode(OPEN_MODE)).unwrap();
+        write_atomically(&target_path, "private\n").unwrap();
+        let written_mode: u32 =
+            fs::metadata(&target_path).unwrap().permissions().mode() & PERMISSION_BITS;
+        assert_eq!(written_mode, PRIVATE_FILE_MODE);
     }
 
     #[test]
