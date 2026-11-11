@@ -26,6 +26,8 @@ lessons init                  # creates the DB files (--domain work|personal|sha
 
 `setup.sh` requires `--domains`, so it never creates a file this machine should not hold. `--dry-run` shows the steps without running them.
 
+`lessons sync` runs the `git` command, so git must be installed and on your PATH. Without it, sync fails with an error; every other `lessons` command still works. On Windows, use WSL2 and keep `~/.lessons` inside the Linux filesystem.
+
 ## Data: three files, never in git
 
 | File | Holds |
@@ -34,7 +36,7 @@ lessons init                  # creates the DB files (--domain work|personal|sha
 | `personal.db` | home and personal problems |
 | `shared.db` | generic lessons, useful anywhere |
 
-They live in `~/.lessons/` (Windows: `%USERPROFILE%\.lessons\`), or wherever `LESSONS_HOME` points. They are separate files, not one table with a column, because only a missing file can keep work data off a personal machine and personal data out of work tooling. Create only the ones a machine should hold, e.g. `lessons init --domain work` on a work laptop. Commands skip missing files.
+They live in `~/.lessons/` (on Windows, inside WSL2), or wherever `LESSONS_HOME` points. They are separate files, not one table with a column, because only a missing file can keep work data off a personal machine and personal data out of work tooling. Create only the ones a machine should hold, e.g. `lessons init --domain work` on a work laptop. Commands skip missing files.
 
 The DB files are private data. `.gitignore` excludes every SQLite file form, and `tests/gitignore.rs` fails if a rule is removed. `git add -f` still gets past both, so never force-add a DB file: a pushed file stays retrievable from history even after it is deleted.
 
@@ -52,6 +54,7 @@ lessons update <id> --resolution "..."          # an empty value clears a field
 lessons hit <id>                                # this lesson helped
 lessons retire <id> --by <newer-id>             # hide from search
 lessons move <id> --to shared
+lessons sync                                    # --domain shared: only that domain's repo
 ```
 
 `--verbose` (or `LESSONS_LOG=1`) logs each step to stderr. `$LESSONS_HOME/config.toml` is optional:
