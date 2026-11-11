@@ -1,8 +1,7 @@
 //! The pure merge behind `lessons sync` (plan step S2): BASE (the lessons at the last synced commit), OURS (the local
-//! DB)
-//! and THEIRS (the fetched tip) become one set of rows plus a conflict queue. Nothing here touches git, the DB or a
-//! clock. Every rule depends on the unordered pair (ours, theirs) plus BASE, never on which side is "ours", so every
-//! machine computes the same rows and the same queue.
+//! DB) and THEIRS (the fetched tip) become one set of rows plus a conflict queue. Nothing here touches git, the DB or
+//! a clock. Every rule depends on the unordered pair (ours, theirs) plus BASE, never on which side is "ours", so
+//! every machine computes the same rows and the same queue.
 #![cfg_attr(
     not(test),
     expect(dead_code, reason = "called by the sync cycle (plan step S4)")
@@ -479,8 +478,8 @@ pub fn settle_queue(merged: Vec<Lesson>, queue: Vec<Conflict>, conflicted: &[Gro
 
 // Unit tests only: every function here is pure, with no shared state, clock or I/O, so no race or back-to-back case
 // applies at this layer. The idempotency a back-to-back sync needs is pinned by
-// `merging_a_result_again_changes_nothing`;
-// the races (two machines, push rejected, crash points) are E2E rows of later steps.
+// `merging_a_result_again_changes_nothing`; the races (two machines, push rejected, crash points) are E2E rows of
+// later steps.
 #[cfg(test)]
 #[expect(
     clippy::cloned_ref_to_slice_refs,
