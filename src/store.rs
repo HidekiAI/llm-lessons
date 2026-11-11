@@ -3,8 +3,10 @@
 //! Commands, search and the hook go through these types and functions, so adding a column touches
 //! a migration in `db.rs` and this file, nothing else.
 
-use anyhow::{Result, bail};
-use rusqlite::{Connection, OptionalExtension, Row};
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
+
+use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Domain;
@@ -451,6 +453,129 @@ pub fn list(conn: &Connection, limit: usize, tag: Option<&str>) -> Result<Vec<Le
         )? // a limit beyond i64 means "all"
         .collect::<rusqlite::Result<Vec<Lesson>>>()?;
     Ok(lessons)
+}
+
+/// Every lesson in the file, retired ones included, sorted by id: OURS for a sync. The sync reads it inside its
+/// write transaction, so no local write lands between this read and `apply_merged`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
+)]
+pub fn all_lessons(conn: &Connection) -> Result<Vec<Lesson>> {
+    // ORDER BY id, so OURS is sorted the same way the merge and the JSON lines are.
+    let mut mut_statement = conn.prepare(&format!(
+        "SELECT {LESSON_SELECT_COLUMNS} FROM lesson ORDER BY id"
+    ))?;
+    let lessons: Vec<Lesson> = mut_statement
+        .query_map([], lesson_from_row)?
+        .collect::<rusqlite::Result<Vec<Lesson>>>()?;
+    journal!("all_lessons: {} row(s)", lessons.len());
+    Ok(lessons)
+}
+
+/// What `apply_merged` wrote, for the sync journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedCounts {
+    pub inserted: usize,
+    pub updated: usize,
+    pub deleted: usize,
+}
+
+/// The writes that turn `ours` into `merged`.
+struct PlannedWrites<'rows> {
+    inserts: Vec<&'rows Lesson>,
+    updates: Vec<&'rows Lesson>,
+    deletes: Vec<&'rows str>,
+}
+
+/// Rows of `merged` missing from `ours` are inserts, rows that differ are updates, ids of `ours` missing from
+/// `merged` are deletes. A row equal on both sides is not written, so applying the same MERGED twice writes nothing.
+fn planned_writes<'rows>(ours: &'rows [Lesson], merged: &'rows [Lesson]) -> PlannedWrites<'rows> {
+    // Values are compared, so an unchanged row is never rewritten and a repeated apply writes nothing.
+    let ours_by_id: BTreeMap<&str, &Lesson> =
+        ours.iter().map(|row| (row.id.as_str(), row)).collect();
+    let merged_ids: BTreeSet<&str> = merged.iter().map(|row| row.id.as_str()).collect();
+    let (inserts, kept): (Vec<&Lesson>, Vec<&Lesson>) = merged
+        .iter()
+        .partition(|row| !ours_by_id.contains_key(row.id.as_str()));
+    let updates: Vec<&Lesson> = kept
+        .into_iter()
+        .filter(|row| ours_by_id.get(row.id.as_str()) != Some(row))
+        .collect();
+    let deletes: Vec<&str> = ours_by_id
+        .keys()
+        .copied()
+        .filter(|lesson_id| !merged_ids.contains(lesson_id))
+        .collect();
+    PlannedWrites {
+        inserts,
+        updates,
+        deletes,
+    }
+}
+
+/// Ids listed per kind in the apply journal line; past it only the count is logged, so a first sync of a large file
+/// stays one readable line.
+const JOURNAL_ID_LIMIT: usize = 20;
+
+/// "<count> [first ids]" for the apply journal line, with " and more" once past `JOURNAL_ID_LIMIT`.
+fn id_summary(lesson_ids: &[&str]) -> String {
+    let listed: &[&str] = lesson_ids.get(..JOURNAL_ID_LIMIT).unwrap_or(lesson_ids);
+    let more: &str = lesson_ids
+        .get(JOURNAL_ID_LIMIT..)
+        .filter(|unlisted| !unlisted.is_empty())
+        .map_or("", |_unlisted| " and more");
+    format!("{} {listed:?}{more}", lesson_ids.len())
+}
+
+/// Makes the file hold exactly `merged`, given that it held `ours` when the caller's transaction began. It takes the
+/// transaction, not a connection, so it cannot run outside one; the caller opens it with
+/// `TransactionBehavior::Immediate`, because a deferred one lets a local writer slip in between reading OURS and this
+/// apply. Inserts and updates go through `copy_into`, whose upsert keeps the search index in step; deletes fire the
+/// index's delete trigger.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
+)]
+pub fn apply_merged(
+    transaction: &Transaction,
+    ours: &[Lesson],
+    merged: &[Lesson],
+) -> Result<AppliedCounts> {
+    // Upserts through copy_into, so the search index follows every insert and update.
+    let planned: PlannedWrites = planned_writes(ours, merged);
+    planned
+        .inserts
+        .iter()
+        .chain(&planned.updates)
+        .try_for_each(|lesson| {
+            copy_into(transaction, lesson)
+                .with_context(|| format!("apply_merged: upsert of {} failed", lesson.id))
+        })?;
+    planned
+        .deletes
+        .iter()
+        .try_for_each(|lesson_id| -> Result<()> {
+            transaction
+                .execute("DELETE FROM lesson WHERE id = ?1", [lesson_id])
+                .with_context(|| format!("apply_merged: delete of {lesson_id} failed"))?;
+            Ok(())
+        })?;
+    let (inserted_ids, updated_ids): (Vec<&str>, Vec<&str>) = (
+        planned.inserts.iter().map(|row| row.id.as_str()).collect(),
+        planned.updates.iter().map(|row| row.id.as_str()).collect(),
+    );
+    journal!(
+        "apply_merged: inserted {}, updated {}, deleted {}",
+        id_summary(&inserted_ids),
+        id_summary(&updated_ids),
+        id_summary(&planned.deletes)
+    );
+    Ok(AppliedCounts {
+        inserted: planned.inserts.len(),
+        updated: planned.updates.len(),
+        deleted: planned.deletes.len(),
+    })
 }
 
 #[cfg(test)]
@@ -939,5 +1064,300 @@ mod tests {
         let parse_result =
             serde_json::from_str::<NewLesson>(r#"{"title":"t","problem":"p","rootcause":"typo"}"#);
         assert!(parse_result.is_err());
+    }
+
+    // all_lessons and apply_merged (plan step S3). Race: a local writer against the sync's transaction, forced in both
+    // orders by holding the transaction, never by timing. Back-to-back: applying the same MERGED twice writes nothing.
+    const ID_A: &str = "01KAAAAAAAAAAAAAAAAAAAAAAA";
+    const ID_B: &str = "01KBBBBBBBBBBBBBBBBBBBBBBB";
+    const ID_C: &str = "01KCCCCCCCCCCCCCCCCCCCCCCC";
+    const ID_D: &str = "01KDDDDDDDDDDDDDDDDDDDDDDD";
+    const SYNC_HITS: i64 = 7;
+    /// How long the second writer waits for the lock: long enough to be a real attempt, short so the test is fast.
+    const WRITER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// A lesson with every optional field set and a word only it holds (`marker`), so a dropped field or a stale
+    /// search index shows.
+    fn full_lesson(lesson_id: &str, marker: &str) -> Lesson {
+        Lesson {
+            id: lesson_id.to_string(),
+            created_at: "2026-11-01T00:00:00Z".to_string(),
+            updated_at: "2026-11-02T00:00:00Z".to_string(),
+            title: format!("title {marker}"),
+            context: Some("context".to_string()),
+            problem: "problem".to_string(),
+            root_cause: Some("root cause".to_string()),
+            resolution: Some("resolution".to_string()),
+            failed_tries: Some("failed tries".to_string()),
+            tags: Some("rust".to_string()),
+            env_versions: Some("rustc 1.95".to_string()),
+            superseded_by: None,
+            hits: 0,
+        }
+    }
+
+    /// A file holding lessons A, B and C, written in the order C, A, B so an id sort is visible.
+    fn three_lessons() -> (tempfile::TempDir, Connection) {
+        let (temp_dir, conn) = temp_conn();
+        [
+            full_lesson(ID_C, "charlie"),
+            full_lesson(ID_A, "alpha"),
+            full_lesson(ID_B, "bravo"),
+        ]
+        .iter()
+        .for_each(|lesson| copy_into(&conn, lesson).unwrap());
+        (temp_dir, conn)
+    }
+
+    fn apply_in_transaction(conn: &mut Connection, merged: &[Lesson]) -> AppliedCounts {
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let ours: Vec<Lesson> = all_lessons(&transaction).unwrap();
+        let counts: AppliedCounts = apply_merged(&transaction, &ours, merged).unwrap();
+        transaction.commit().unwrap();
+        counts
+    }
+
+    #[test]
+    fn all_lessons_returns_every_row_sorted_by_id_retired_included() {
+        let (_temp_dir, conn) = three_lessons();
+        retire(&conn, ID_A, ID_B).unwrap();
+        let read_back: Vec<Lesson> = all_lessons(&conn).unwrap();
+        assert_eq!(
+            read_back
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![ID_A, ID_B, ID_C]
+        );
+        assert_eq!(
+            read_back[0].superseded_by.as_deref(),
+            Some(ID_B),
+            "a retired lesson is still synced"
+        );
+        assert_eq!(
+            read_back[1],
+            full_lesson(ID_B, "bravo"),
+            "every field read back"
+        );
+        let json_round_trip: Vec<Lesson> = read_back
+            .iter()
+            .map(|row| serde_json::from_str(&serde_json::to_string(row).unwrap()).unwrap())
+            .collect();
+        assert_eq!(json_round_trip, read_back);
+    }
+
+    #[test]
+    fn apply_merged_inserts_updates_deletes_and_skips_unchanged_rows() {
+        let (_temp_dir, mut mut_conn) = three_lessons();
+        let edited_a = Lesson {
+            resolution: Some("rewritten".to_string()),
+            hits: SYNC_HITS,
+            ..full_lesson(ID_A, "alpha")
+        };
+        let merged: Vec<Lesson> = vec![
+            edited_a,
+            full_lesson(ID_C, "charlie"),
+            full_lesson(ID_D, "delta"),
+        ]; // B dropped
+        let counts: AppliedCounts = apply_in_transaction(&mut mut_conn, &merged);
+        assert_eq!(
+            counts,
+            AppliedCounts {
+                inserted: 1,
+                updated: 1,
+                deleted: 1
+            }
+        );
+        assert_eq!(all_lessons(&mut_conn).unwrap(), merged);
+    }
+
+    #[test]
+    fn apply_merged_keeps_the_search_index_in_step() {
+        let (_temp_dir, mut mut_conn) = three_lessons();
+        let retitled_a = Lesson {
+            title: "title echo".to_string(),
+            ..full_lesson(ID_A, "alpha")
+        };
+        apply_in_transaction(
+            &mut mut_conn,
+            &[
+                retitled_a,
+                full_lesson(ID_C, "charlie"),
+                full_lesson(ID_D, "delta"),
+            ],
+        );
+        assert_eq!(
+            search_ids(&mut_conn, "delta"),
+            vec![ID_D],
+            "inserted row is indexed"
+        );
+        assert_eq!(
+            search_ids(&mut_conn, "echo"),
+            vec![ID_A],
+            "updated row is re-indexed"
+        );
+        assert!(
+            search_ids(&mut_conn, "alpha").is_empty(),
+            "old text is gone from the index"
+        );
+        assert!(
+            search_ids(&mut_conn, "bravo").is_empty(),
+            "deleted row is gone from the index"
+        );
+    }
+
+    /// A back-to-back sync: the second apply of the same MERGED writes nothing, and `hits` stays a value, not a sum.
+    #[test]
+    fn applying_the_same_merged_twice_writes_nothing_the_second_time() {
+        let (_temp_dir, mut mut_conn) = three_lessons();
+        let merged: Vec<Lesson> = vec![
+            Lesson {
+                hits: SYNC_HITS,
+                ..full_lesson(ID_A, "alpha")
+            },
+            full_lesson(ID_D, "delta"),
+        ];
+        apply_in_transaction(&mut mut_conn, &merged);
+        let second: AppliedCounts = apply_in_transaction(&mut mut_conn, &merged);
+        assert_eq!(
+            second,
+            AppliedCounts {
+                inserted: 0,
+                updated: 0,
+                deleted: 0
+            }
+        );
+        assert_eq!(all_lessons(&mut_conn).unwrap(), merged);
+    }
+
+    #[test]
+    fn id_summary_lists_up_to_the_limit_and_marks_the_rest() {
+        let many_ids: Vec<String> = (0..=JOURNAL_ID_LIMIT)
+            .map(|index| format!("id{index}"))
+            .collect();
+        let many_refs: Vec<&str> = many_ids.iter().map(String::as_str).collect();
+        let at_limit: &[&str] = &many_refs[..JOURNAL_ID_LIMIT];
+        assert_eq!(id_summary(&[]), "0 []");
+        assert_eq!(id_summary(&[ID_A]), format!("1 [\"{ID_A}\"]"));
+        assert!(
+            !id_summary(at_limit).ends_with(" and more"),
+            "exactly the limit lists every id"
+        );
+        let last_listed: String = format!("\"id{}\"", JOURNAL_ID_LIMIT - 1);
+        assert!(
+            id_summary(at_limit).contains(&last_listed),
+            "the last id within the limit is listed"
+        );
+        assert!(
+            id_summary(&many_refs).contains(&last_listed),
+            "past the limit, the first ids are still listed"
+        );
+        let over_limit: String = id_summary(&many_refs);
+        assert!(
+            over_limit.starts_with(&format!("{} ", JOURNAL_ID_LIMIT + 1)),
+            "{over_limit}"
+        );
+        assert!(
+            over_limit.ends_with(" and more")
+                && !over_limit.contains(&format!("\"id{JOURNAL_ID_LIMIT}\"")),
+            "{over_limit}"
+        );
+    }
+
+    /// A failed write names its lesson id (forced by a trigger that aborts it), so a failed sync can be retraced.
+    #[test]
+    fn a_failed_upsert_or_delete_names_its_lesson_id() {
+        let (_temp_dir, mut mut_conn) = three_lessons();
+        mut_conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_insert BEFORE INSERT ON lesson BEGIN SELECT RAISE(ABORT, 'forced'); END;\n                 CREATE TRIGGER refuse_delete BEFORE DELETE ON lesson BEGIN SELECT RAISE(ABORT, 'forced'); END;",
+            )
+            .unwrap();
+        let fn_apply_error = |conn: &mut Connection, merged: &[Lesson]| -> String {
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let ours: Vec<Lesson> = all_lessons(&transaction).unwrap();
+            format!(
+                "{:#}",
+                apply_merged(&transaction, &ours, merged).unwrap_err()
+            )
+        };
+        let all_three: Vec<Lesson> = all_lessons(&mut_conn).unwrap();
+        let with_new_d: Vec<Lesson> = all_three
+            .iter()
+            .cloned()
+            .chain([full_lesson(ID_D, "delta")])
+            .collect();
+        assert!(
+            fn_apply_error(&mut mut_conn, &with_new_d)
+                .contains(&format!("upsert of {ID_D} failed"))
+        );
+        assert!(
+            fn_apply_error(&mut mut_conn, &all_three[1..])
+                .contains(&format!("delete of {ID_A} failed"))
+        );
+    }
+
+    /// A transaction dropped before its commit (a crash between the queue write and the DB commit) changes nothing.
+    #[test]
+    fn an_uncommitted_apply_changes_nothing() {
+        let (_temp_dir, mut mut_conn) = three_lessons();
+        let before: Vec<Lesson> = all_lessons(&mut_conn).unwrap();
+        let transaction = mut_conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        apply_merged(&transaction, &before, &[full_lesson(ID_D, "delta")]).unwrap();
+        drop(transaction);
+        assert_eq!(all_lessons(&mut_conn).unwrap(), before);
+    }
+
+    /// Both orders of a local write against the sync: while the sync's transaction is open the writer is refused (it
+    /// would wait on `busy_timeout`, never slip in between the read and the apply); after the commit it lands; and a
+    /// write made before the transaction is in OURS.
+    #[test]
+    fn a_local_write_never_lands_between_the_read_and_the_apply() {
+        let (temp_dir, mut mut_conn) = three_lessons();
+        let writer_conn: Connection = Connection::open(temp_dir.path().join("shared.db")).unwrap();
+        writer_conn.busy_timeout(WRITER_BUSY_TIMEOUT).unwrap();
+
+        copy_into(&writer_conn, &full_lesson(ID_D, "delta")).unwrap(); // writer first
+        let transaction = mut_conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let ours: Vec<Lesson> = all_lessons(&transaction).unwrap();
+        assert!(
+            ours.iter().any(|row| row.id == ID_D),
+            "a write before the transaction is in OURS"
+        );
+
+        let blocked = copy_into(
+            &writer_conn,
+            &Lesson {
+                hits: SYNC_HITS,
+                ..full_lesson(ID_A, "alpha")
+            },
+        ); // sync first
+        assert!(
+            blocked.is_err(),
+            "a writer cannot write while the sync holds the transaction"
+        );
+        apply_merged(&transaction, &ours, &ours).unwrap();
+        transaction.commit().unwrap();
+        copy_into(
+            &writer_conn,
+            &Lesson {
+                hits: SYNC_HITS,
+                ..full_lesson(ID_A, "alpha")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_by_id(&mut_conn, ID_A).unwrap().map(|row| row.hits),
+            Some(SYNC_HITS),
+            "it lands after the commit"
+        );
     }
 }
