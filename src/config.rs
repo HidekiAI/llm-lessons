@@ -111,7 +111,7 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                      domains sharing a remote must share its key (one clone has one key)",
                     existing_clone.domains.first().map_or("?", |first_domain| first_domain.as_str()),
                     domain.as_str(),
-                    sync_config.remote
+                    crate::sync::redact_credentials(&sync_config.remote)
                 ),
                 Some(existing_clone) => CloneSpec {
                     domains: existing_clone.domains.into_iter().chain(std::iter::once(domain)).collect(),
@@ -168,13 +168,26 @@ fn normalize_remote(remote: &str) -> String {
             // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp form.
             let is_portless_ssh: bool =
                 scheme.eq_ignore_ascii_case("ssh") && !authority.contains(':');
+            // The credentials of an http(s) URL are not part of which repository it is, and this form is printed and used
+            // in a directory name. An ssh user is a login name, not a secret, and stays.
+            let fn_authority_kept = |authority: &str| -> String {
+                if scheme.eq_ignore_ascii_case("ssh") {
+                    fn_lowercase_host(authority)
+                } else {
+                    fn_lowercase_host(
+                        authority
+                            .rsplit_once('@')
+                            .map_or(authority, |(_, host_part)| host_part),
+                    )
+                }
+            };
             if is_portless_ssh {
                 format!("{}:{path}", fn_lowercase_host(authority))
             } else {
                 format!(
                     "{}://{}/{path}",
                     scheme.to_lowercase(),
-                    fn_lowercase_host(authority)
+                    fn_authority_kept(authority)
                 )
             }
         }
@@ -460,6 +473,24 @@ mod tests {
         assert!(sync_warnings(&separate_clones).is_empty());
     }
 
+    #[test]
+    fn two_credentialed_spellings_of_one_repository_are_one_clone() {
+        let one_repo_two_tokens = SyncSection {
+            work: Some(sync_entry(
+                "https://a:token-one@host.example/r.git",
+                "/keys/one",
+            )),
+            personal: None,
+            shared: Some(sync_entry(
+                "https://b:token-two@host.example/r.git",
+                "/keys/one",
+            )),
+        };
+        let clones: Vec<CloneSpec> = clone_specs(&one_repo_two_tokens).unwrap();
+        assert_eq!(clones.len(), 1, "{clones:?}");
+        assert_eq!(sync_warnings(&clones).len(), 1, "work now shares a clone");
+        assert!(!clones[0].normalized_remote.contains("token"), "{clones:?}");
+    }
     #[test]
     fn the_work_sharing_warning_never_prints_a_credential_of_the_remote() {
         let credentialed = "https://user:secret-token@github.com/owner/repo.git";
