@@ -227,11 +227,23 @@ fn attempt(cycle: &Cycle, attempt_number: u32) -> Result<Option<String>> {
                 .map(|plan| (*domain, plan))
         })
         .collect::<Result<Vec<(Domain, DomainPlan)>>>()?;
-    if let Some(tip_commit) = &tip {
-        // Drops any file a crashed cycle left uncommitted, and follows the remote.
-        cycle
-            .runner
-            .run_checked(&["checkout", "-q", "-f", "-B", cycle.branch, tip_commit])?;
+    match &tip {
+        Some(tip_commit) => {
+            // Drops any file a crashed cycle left uncommitted, and follows the remote.
+            cycle
+                .runner
+                .run_checked(&["checkout", "-q", "-f", "-B", cycle.branch, tip_commit])?;
+        }
+        // No remote tip to reset to: put the index back to what the clone's own commit holds (nothing, when it has
+        // none), so a file a crashed cycle left staged is not committed by a later run that covers other domains.
+        // Planned files are staged again right below.
+        None => {
+            let own_commit: Option<String> = verified_commit(&cycle.runner, "HEAD")?;
+            let index_reset: &[&str] = own_commit
+                .as_ref()
+                .map_or(&["read-tree", "--empty"], |_| &["reset", "-q"]);
+            cycle.runner.run_checked(index_reset)?;
+        }
     }
     plans
         .iter()
@@ -493,8 +505,8 @@ pub fn sync_configured(
                     println!("{shown_remote}: synced");
                     CycleOutcome::Synced
                 }
-                // `sync_clone` reports a failed cycle as `Err`, so this arm is not reached today; it is listed so a new variant of
-                // the outcome cannot be printed as "synced".
+                // `sync_clone` reports a failed cycle as `Err`, so this arm is not reached today; it is listed so a new
+                // variant of the outcome cannot be printed as "synced".
                 Ok(CycleOutcome::Failed) => {
                     eprintln!("lessons sync: {shown_remote}: the cycle failed");
                     CycleOutcome::Failed
@@ -1498,6 +1510,38 @@ mod tests {
                 .unwrap()
                 .contains(&new_row_id),
             "the remote still has the row"
+        );
+    }
+
+    /// A crashed cycle can leave a file staged in the clone. With no remote tip nothing resets the clone, so a later
+    /// run of OTHER domains must not commit and push that stale file.
+    #[test]
+    fn a_file_a_crashed_cycle_left_staged_is_not_pushed_by_a_run_of_other_domains() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("shared lesson");
+        assert!(
+            machine
+                .sync_with(&remote, &crash_at(SyncStep::AfterFetch))
+                .is_err(),
+            "the first cycle makes the clone, then crashes"
+        );
+        let stale_name: &str = "personal.jsonl";
+        fs::write(
+            machine.paths(&remote).clone_dir().join(stale_name),
+            "stale\n",
+        )
+        .unwrap();
+        machine
+            .git(&remote)
+            .run_checked(&["add", stale_name])
+            .unwrap();
+        machine.sync(&remote);
+        assert_eq!(
+            remote_file(temp_dir.path(), &remote, stale_name),
+            None,
+            "the stale staged file never reaches the remote"
         );
     }
 }
