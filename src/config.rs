@@ -113,8 +113,9 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                     domain.as_str(),
                     crate::sync::redact_credentials(&sync_config.remote)
                 ),
-                // One clone has one remote text, so the other section's credentials would be dropped silently (a rotated
-                // token in only one section would then fail with an auth error pointing nowhere near the config).
+                // One clone has one remote text, so the other section's credentials would be dropped silently (a
+                // rotated token in only one section would then fail with an auth error pointing nowhere near the
+                // config).
                 Some(existing_clone)
                     if url_credentials(&existing_clone.remote) != url_credentials(&sync_config.remote) => anyhow::bail!(
                     "[sync.{}] and [sync.{}] name the same repository {} with different credentials; \
@@ -135,7 +136,11 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
                 },
             };
             // The normal form is already credential-free; redacting again is defence in depth for a form that is not.
-            journal!("config: [sync.{}] -> clone of {}", domain.as_str(), crate::sync::redact_credentials(&grown_clone.normalized_remote));
+            journal!(
+                "config: [sync.{}] -> clone of {}",
+                domain.as_str(),
+                crate::sync::redact_credentials(&grown_clone.normalized_remote)
+            );
             Ok(other_clones.into_iter().chain(std::iter::once(grown_clone)).collect())
         })
 }
@@ -196,8 +201,8 @@ fn normalize_remote(remote: &str) -> String {
                     (Some(userinfo_text), host_text)
                 });
             let host_lowercase: String = host_part.to_lowercase();
-            // The credentials of an http(s) URL are not part of which repository it is, and this form is printed and used
-            // in a directory name. An ssh user is a login name and stays; an ssh password (git ignores it) does not.
+            // The credentials of an http(s) URL are not part of which repository it is, and this form is printed and
+            // used in a directory name. An ssh user is a login name and stays; an ssh password (git ignores it) does not.
             let fn_ssh_login_at_host = || -> String {
                 userinfo
                     .and_then(|userinfo_text| userinfo_text.split(':').next())
@@ -207,7 +212,8 @@ fn normalize_remote(remote: &str) -> String {
                     })
             };
             match (scheme.eq_ignore_ascii_case("ssh"), host_part.contains(':')) {
-                // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp form.
+                // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp
+                // form.
                 (true, false) => format!("{}:{path}", fn_ssh_login_at_host()),
                 (true, true) => format!("ssh://{}/{path}", fn_ssh_login_at_host()),
                 (false, _) => format!("{}://{host_lowercase}/{path}", scheme.to_lowercase()),
