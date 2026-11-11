@@ -246,6 +246,21 @@ pub fn exit_for(outcome: CycleOutcome) -> ExitCode {
     }
 }
 
+/// How a run over several clones ended: one failed clone fails the run (the others were still tried); a run in which
+/// every clone was locked is a held lock; anything else, including nothing configured, is a success.
+pub fn combine_outcomes(outcomes: &[CycleOutcome]) -> CycleOutcome {
+    // Every combination of the three questions is an arm, so a fourth outcome could not be forgotten here.
+    match (
+        outcomes.contains(&CycleOutcome::Failed),
+        outcomes.contains(&CycleOutcome::Synced),
+        outcomes.contains(&CycleOutcome::LockHeld),
+    ) {
+        (true, _, _) => CycleOutcome::Failed,
+        (false, true, _) | (false, false, false) => CycleOutcome::Synced,
+        (false, false, true) => CycleOutcome::LockHeld,
+    }
+}
+
 // Unit tests only; `interpret_show` is checked against the stderr a real git prints, in a temp repository. These
 // functions are pure, so no race or back-to-back case applies here: the cycle's own races and repeats are S4c-2's E2E
 // rows. `plan_domain_merge` is also run with the two sides swapped, because every machine must compute the same result.
@@ -710,6 +725,25 @@ mod tests {
         assert_eq!(
             fn_code(CycleOutcome::Failed),
             format!("{:?}", ExitCode::FAILURE)
+        );
+    }
+
+    #[test]
+    fn a_run_over_several_clones_fails_if_any_fails_and_is_locked_only_if_all_are() {
+        use CycleOutcome::{Failed, LockHeld, Synced};
+        assert_eq!(
+            combine_outcomes(&[Synced, Failed, LockHeld]),
+            Failed,
+            "the others were tried, the run still failed"
+        );
+        assert_eq!(combine_outcomes(&[LockHeld, Synced]), Synced);
+        assert_eq!(combine_outcomes(&[LockHeld, LockHeld]), LockHeld);
+        assert_eq!(combine_outcomes(&[Synced]), Synced);
+        assert_eq!(combine_outcomes(&[Failed]), Failed);
+        assert_eq!(
+            combine_outcomes(&[]),
+            Synced,
+            "nothing configured is not a failure"
         );
     }
 

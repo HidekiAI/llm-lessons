@@ -126,14 +126,6 @@ impl ClonePaths {
         self.sync_dir
             .join(format!("{}.{}", self.slug, queue_file_name(domain)))
     }
-
-    pub fn committed_lessons(&self, domain: Domain) -> PathBuf {
-        self.clone_dir().join(lessons_file_name(domain))
-    }
-
-    pub fn committed_queue(&self, domain: Domain) -> PathBuf {
-        self.clone_dir().join(queue_file_name(domain))
-    }
 }
 
 /// One JSON object per line, ordered by `fn_sort_key`, each line ending in `\n`; no rows is the empty string. Sorting
@@ -409,14 +401,6 @@ mod tests {
         assert_eq!(
             paths.live_queue(Domain::Shared),
             sync_dir.join("x_2fy.shared.conflicts.jsonl")
-        );
-        assert_eq!(
-            paths.committed_lessons(Domain::Work),
-            sync_dir.join("x_2fy").join("work.jsonl")
-        );
-        assert_eq!(
-            paths.committed_queue(Domain::Work),
-            sync_dir.join("x_2fy").join("work.conflicts.jsonl")
         );
     }
 

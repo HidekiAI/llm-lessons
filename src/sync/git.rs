@@ -11,6 +11,8 @@ use crate::journal;
 
 /// The branch used when the remote is empty and so has no default branch to follow.
 pub const SYNC_FALLBACK_BRANCH: &str = "main";
+/// A `core.hooksPath` that holds no hooks.
+const NO_HOOKS_PATH: &str = "/dev/null";
 /// The one remote of a sync clone.
 const REMOTE_NAME: &str = "origin";
 /// `git ls-remote --symref <remote> HEAD` prints `ref: refs/heads/<branch>\tHEAD` for the default branch.
@@ -252,8 +254,9 @@ pub fn detect_default_branch(runner: &GitRunner, remote: &str) -> Result<String>
 
 /// Makes the clone exist and be configured, whatever state it is in: `git init -b <branch>` when there is no
 /// repository yet (so the branch name never depends on `init.defaultBranch`), the remote URL, the ssh command, and
-/// commit signing off (a signing key may need a prompt or an agent a background process lacks). Safe to repeat, but
-/// not safe to run twice at once: the caller holds the clone lock (plan step S4c).
+/// commit signing and every hook off (a signing key may need a prompt or an agent a background process lacks; hooks
+/// belong to the user's own repositories). Safe to repeat, but not safe to run twice at once: the caller holds the
+/// clone lock (plan step S4c).
 pub fn ensure_clone(
     runner: &GitRunner,
     clone_dir: &Path,
@@ -274,6 +277,9 @@ pub fn ensure_clone(
     runner.run_checked(&["remote", remote_verb, "--", REMOTE_NAME, remote])?;
     runner.run_checked(&["config", "core.sshCommand", ssh_command])?;
     runner.run_checked(&["config", "commit.gpgsign", "false"])?;
+    // The clone is the tool's own repository: a hook from the user's global `core.hooksPath` is meant for their work
+    // repositories and would block, slow or scan every sync.
+    runner.run_checked(&["config", "core.hooksPath", NO_HOOKS_PATH])?;
     Ok(())
 }
 
@@ -288,6 +294,9 @@ mod tests {
     use std::path::PathBuf;
 
     const SOME_KEY: &str = "/keys/id_work";
+    /// `rwxr-xr-x`: a hook only runs when it is executable.
+    #[cfg(unix)]
+    const EXECUTABLE_MODE: u32 = 0o755;
     const SOME_SOCKET: &str = "/run/agent.sock";
 
     /// A runner whose git ignores the tester's global and system config, with a throwaway identity for commits.
@@ -563,6 +572,48 @@ mod tests {
             1,
             "a second run does not add a second remote"
         );
+    }
+
+    /// The clone is the tool's own repository, not the user's work: a hook from the user's global `core.hooksPath` (a
+    /// pre-push gate, a commit scanner) must not run in it, or the sync would be blocked by rules meant for other
+    /// repos.
+    #[cfg(unix)]
+    #[test]
+    fn the_clone_runs_no_hooks_from_the_users_global_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (remote_path, global_config) = bare_remote(temp_dir.path(), "trunk");
+        let hooks_dir: PathBuf = temp_dir.path().join("global-hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        ["pre-commit", "pre-push"].iter().for_each(|hook_name| {
+            let hook_path: PathBuf = hooks_dir.join(hook_name);
+            fs::write(
+                &hook_path,
+                "#!/bin/sh\necho 'blocked by a global hook' >&2\nexit 1\n",
+            )
+            .unwrap();
+            fs::set_permissions(&hook_path, fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
+        });
+        fs::write(
+            &global_config,
+            format!("[core]\n\thooksPath = {}\n", hooks_dir.display()),
+        )
+        .unwrap();
+        let clone_dir: PathBuf = temp_dir.path().join("clone");
+        let runner = runner_in(
+            &isolated_runner(temp_dir.path(), &global_config),
+            &clone_dir,
+        );
+        ensure_clone(
+            &runner,
+            &clone_dir,
+            &remote_path.to_string_lossy(),
+            "trunk",
+            "ssh",
+        )
+        .unwrap();
+        let pushed = commit_and_push(&runner, &clone_dir, "one.txt", "trunk");
+        assert!(pushed.exit_ok, "{}", pushed.stderr);
     }
 
     #[test]

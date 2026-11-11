@@ -10,7 +10,7 @@ mod store;
 mod sync;
 
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Command as Process, ExitCode};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -101,6 +101,12 @@ enum Command {
         /// The id of the lesson that replaces it
         #[arg(long)]
         by: String,
+    },
+    /// Sync the lessons with the git repository each [sync.<domain>] names; needs git on the PATH
+    Sync {
+        /// Only this domain (work, personal or shared); default: every configured domain
+        #[arg(long)]
+        domain: Option<Domain>,
     },
     /// Serve search_lessons and record_lesson to an MCP client over stdio
     Mcp,
@@ -225,7 +231,7 @@ impl FieldArgs {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let cli: Cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // clap exits 2 on a usage error, and the agent reads exit 2 from the prompt hook as "block
@@ -240,7 +246,7 @@ fn main() -> Result<()> {
                 == Some("hook") =>
         {
             eprintln!("lessons hook: {parse_error}");
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         Err(parse_error) => parse_error.exit(),
     };
@@ -252,43 +258,61 @@ fn main() -> Result<()> {
         Ok(lessons_home)
     };
 
+    // Every command but `sync` ends in success or in an error (exit 1); `sync` also has an exit code of its own.
+    let done = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
     match cli.command {
-        Command::Init { domain } => run_init(&fn_lessons_home()?, domain),
-        Command::Add(add_args) => run_add(&fn_lessons_home()?, add_args),
-        Command::Show { id, format } => run_show(&fn_lessons_home()?, &id, format),
+        Command::Init { domain } => done(run_init(&fn_lessons_home()?, domain)),
+        Command::Add(add_args) => done(run_add(&fn_lessons_home()?, add_args)),
+        Command::Show { id, format } => done(run_show(&fn_lessons_home()?, &id, format)),
         Command::List {
             in_domains,
             limit,
             tag,
             format,
-        } => run_list(
+        } => done(run_list(
             &fn_lessons_home()?,
             &in_domains.0,
             limit,
             tag.as_deref(),
             format,
-        ),
-        Command::Update { id, fields } => run_update(&fn_lessons_home()?, &id, fields.into_patch()),
-        Command::Hit { id } => run_hit(&fn_lessons_home()?, &id),
+        )),
+        Command::Update { id, fields } => {
+            done(run_update(&fn_lessons_home()?, &id, fields.into_patch()))
+        }
+        Command::Hit { id } => done(run_hit(&fn_lessons_home()?, &id)),
         Command::Search {
             text,
             in_domains,
             limit,
             raw,
             format,
-        } => run_search(&fn_lessons_home()?, &text, in_domains, limit, raw, format),
-        Command::Retire { id, by } => run_retire(&fn_lessons_home()?, &id, &by),
-        Command::Move { id, to } => run_move(&fn_lessons_home()?, &id, to),
-        Command::Mcp => mcp::serve(
+        } => done(run_search(
+            &fn_lessons_home()?,
+            &text,
+            in_domains,
+            limit,
+            raw,
+            format,
+        )),
+        Command::Retire { id, by } => done(run_retire(&fn_lessons_home()?, &id, &by)),
+        Command::Move { id, to } => done(run_move(&fn_lessons_home()?, &id, to)),
+        Command::Sync { domain } => run_sync(&fn_lessons_home()?, domain),
+        Command::Mcp => done(mcp::serve(
             &fn_lessons_home()?,
             std::io::stdin().lock(),
             std::io::stdout().lock(),
-        ),
+        )),
         Command::Hook { event } => {
             run_hook(event, fn_lessons_home);
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Syncs the configured clones (all of them, or the ones carrying `--domain`) and exits as `sync::exit_for` says.
+fn run_sync(lessons_home: &Path, requested: Option<Domain>) -> Result<ExitCode> {
+    let config: config::Config = config::load(lessons_home)?;
+    sync::sync_configured(lessons_home, &config.sync, requested, &[]).map(sync::exit_for)
 }
 
 /// Runs the prompt hook. It never fails: every error goes to stderr and the exit code stays 0,

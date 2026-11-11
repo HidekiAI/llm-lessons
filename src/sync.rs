@@ -2,10 +2,6 @@
 //! DB) and THEIRS (the fetched tip) become one set of rows plus a conflict queue. Nothing here touches git, the DB or
 //! a clock. Every rule depends on the unordered pair (ours, theirs) plus BASE, never on which side is "ours", so
 //! every machine computes the same rows and the same queue.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
-)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,6 +12,10 @@ use crate::store::Lesson;
 mod cycle;
 mod files;
 mod git;
+mod run;
+
+pub use cycle::exit_for;
+pub use run::sync_configured;
 
 /// Added to `tags` by a combine in `lessons resolve`, so `lessons list --tag needs-reword` finds the lesson.
 pub const NEEDS_REWORD_TAG: &str = "needs-reword";

@@ -131,10 +131,6 @@ pub fn clone_specs(sync_section: &SyncSection) -> Result<Vec<CloneSpec>> {
 
 /// Warnings to print when syncing: `work` sharing a clone with another domain means work data is
 /// readable by everyone with access to that repo, and the work-isolation probe has nothing to test.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "printed by the sync cycle (plan step S4)")
-)]
 pub fn sync_warnings(clones: &[CloneSpec]) -> Vec<String> {
     clones
         .iter()

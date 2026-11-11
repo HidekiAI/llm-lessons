@@ -457,10 +457,6 @@ pub fn list(conn: &Connection, limit: usize, tag: Option<&str>) -> Result<Vec<Le
 
 /// Every lesson in the file, retired ones included, sorted by id: OURS for a sync. The sync reads it inside its
 /// write transaction, so no local write lands between this read and `apply_merged`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
-)]
 pub fn all_lessons(conn: &Connection) -> Result<Vec<Lesson>> {
     // ORDER BY id, so OURS is sorted the same way the merge and the JSON lines are.
     let mut mut_statement = conn.prepare(&format!(
@@ -524,10 +520,6 @@ const JOURNAL_ID_LIMIT: usize = 20;
 
 /// Opens the transaction `all_lessons` and `apply_merged` run in. IMMEDIATE takes the write lock now, so no local
 /// writer can land between reading OURS and applying MERGED; a deferred one would let it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
-)]
 pub fn begin_sync_transaction(conn: &mut Connection) -> Result<Transaction<'_>> {
     Ok(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
 }
@@ -548,10 +540,6 @@ fn id_summary(lesson_ids: &[&str]) -> String {
 ///
 /// Inserts and updates go through `copy_into`, whose upsert keeps the search index in step; deletes fire the index's
 /// delete trigger.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
-)]
 pub fn apply_merged(
     transaction: &Transaction,
     ours: &[Lesson],
