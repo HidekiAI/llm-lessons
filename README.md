@@ -36,7 +36,7 @@ lessons init                  # creates the DB files (--domain work|personal|sha
 | `personal.db` | home and personal problems |
 | `shared.db` | generic lessons, useful anywhere |
 
-They live in `~/.lessons/` (on Windows, inside WSL2), or wherever `LESSONS_HOME` points. They are separate files, not one table with a column, because only a missing file can keep work data off a personal machine and personal data out of work tooling. Create only the ones a machine should hold, e.g. `lessons init --domain work` on a work laptop. Commands skip missing files.
+They live in `~/.lessons/` (on Windows, inside WSL2), or wherever `LESSONS_HOME` points. They are separate files, not one table with a column, because only a missing file can keep work data off a personal machine and personal data out of work tooling. Three files is the design, not an accident: [why](#why-do-you-need-3-different-databases). Create only the ones a machine should hold, e.g. `lessons init --domain work` on a work laptop. Commands skip missing files.
 
 The DB files are private data. `.gitignore` excludes every SQLite file form, and `tests/gitignore.rs` fails if a rule is removed. `git add -f` still gets past both, so never force-add a DB file: a pushed file stays retrievable from history even after it is deleted.
 
@@ -150,6 +150,13 @@ How the merge works:
 - A sync never prompts (it is meant to run in the background), so a passphrase or an unknown-host question makes it fail, not wait.
 
 When `work` shares a repo with `personal` or `shared`, sync notes once per sync that work data is readable by everyone with access to that repo.
+
+### Why do you need 3 different databases?
+
+- **The leak.** One database with a `domain` column keeps every lesson on every machine, so a work lesson (a server name, a customer, a ticket) would sit on your home machine.
+- **The missing file.** Three files fix that: a machine that never has `work.db` cannot expose it. Your home machine holds `personal.db` and `shared.db`; your work machine holds `work.db` and `shared.db`.
+- **The sync.** Each file syncs to its own private repo, or all three share one repo. Work lessons can go to a repo your work account can read, while personal ones never leave your own account (see the first FAQ entry).
+- **The search.** `lessons search --in work,shared` reads only the files you name, so a home search never touches work data.
 
 ### Why does git store JSON lines, and never the `.db` itself?
 
