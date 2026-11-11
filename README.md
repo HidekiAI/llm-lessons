@@ -166,6 +166,16 @@ With a git repo, `lessons sync` merges the JSON lines per lesson and per field. 
 
 A repo that holds work lessons stays private because they may belong to your employer, and anything pushed stays in the history.
 
+### Why does lessons merge on its own when git can merge?
+
+It looks like duplicated work, because lessons also compares two versions against a common base, keeps conflicts for later, writes its files through a temp file and a rename, and stores lessons as sorted lines of text. Those are git's tools too.
+
+But git merges lines of text, and one lesson is one line of JSON. Two machines that edit different fields of one lesson would conflict in git, and git would stop and wait for a person. Sync runs in the background and cannot wait.
+
+So lessons merges each lesson field by field, against the version both machines last agreed on, and keeps both edits. If both machines changed the same field, it keeps one value, queues the other, and asks you later with `lessons resolve`.
+
+Everything else is git: lessons only fetches, commits on top of the remote tip, and pushes. It never runs `git merge` or `git pull`.
+
 ## Contributing
 
 `cargo test` also enforces two repo rules: no DB file can be committed (`tests/gitignore.rs`), and no magic-number literal outside a named `const` (`tests/no_magic_numbers.rs`). `scripts/setup.sh --test` checks the setup script.
