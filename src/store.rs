@@ -490,13 +490,17 @@ struct PlannedWrites<'rows> {
 
 /// Rows of `merged` missing from `ours` are inserts, rows that differ are updates, ids of `ours` missing from
 /// `merged` are deletes. A row equal on both sides is not written, so applying the same MERGED twice writes nothing.
+/// A duplicate id in `merged` counts once and its last row wins, the row the upsert would have left.
 fn planned_writes<'rows>(ours: &'rows [Lesson], merged: &'rows [Lesson]) -> PlannedWrites<'rows> {
     // Values are compared, so an unchanged row is never rewritten and a repeated apply writes nothing.
     let ours_by_id: BTreeMap<&str, &Lesson> =
         ours.iter().map(|row| (row.id.as_str(), row)).collect();
-    let merged_ids: BTreeSet<&str> = merged.iter().map(|row| row.id.as_str()).collect();
-    let (inserts, kept): (Vec<&Lesson>, Vec<&Lesson>) = merged
-        .iter()
+    let merged_by_id: BTreeMap<&str, &Lesson> =
+        merged.iter().map(|row| (row.id.as_str(), row)).collect(); // collect keeps the last row of a duplicate id
+    let merged_ids: BTreeSet<&str> = merged_by_id.keys().copied().collect();
+    let (inserts, kept): (Vec<&Lesson>, Vec<&Lesson>) = merged_by_id
+        .values()
+        .copied()
         .partition(|row| !ours_by_id.contains_key(row.id.as_str()));
     let updates: Vec<&Lesson> = kept
         .into_iter()
@@ -518,6 +522,16 @@ fn planned_writes<'rows>(ours: &'rows [Lesson], merged: &'rows [Lesson]) -> Plan
 /// stays one readable line.
 const JOURNAL_ID_LIMIT: usize = 20;
 
+/// Opens the transaction `all_lessons` and `apply_merged` run in. IMMEDIATE takes the write lock now, so no local
+/// writer can land between reading OURS and applying MERGED; a deferred one would let it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by the sync cycle (plan step S4)")
+)]
+pub fn begin_sync_transaction(conn: &mut Connection) -> Result<Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+}
+
 /// "<count> [first ids]" for the apply journal line, with " and more" once past `JOURNAL_ID_LIMIT`.
 fn id_summary(lesson_ids: &[&str]) -> String {
     let listed: &[&str] = lesson_ids.get(..JOURNAL_ID_LIMIT).unwrap_or(lesson_ids);
@@ -529,9 +543,8 @@ fn id_summary(lesson_ids: &[&str]) -> String {
 }
 
 /// Makes the file hold exactly `merged`, given that it held `ours` when the caller's transaction began. It takes the
-/// transaction, not a connection, so it cannot run outside one; the caller opens it with
-/// `TransactionBehavior::Immediate`, because a deferred one lets a local writer slip in between reading OURS and this
-/// apply. Inserts and updates go through `copy_into`, whose upsert keeps the search index in step; deletes fire the
+/// transaction, not a connection, so it cannot run outside one; the caller opens it with `begin_sync_transaction`, so it
+/// is IMMEDIATE and no local writer slips in between reading OURS and this apply. Inserts and updates go through `copy_into`, whose upsert keeps the search index in step; deletes fire the
 /// index's delete trigger.
 #[cfg_attr(
     not(test),
@@ -544,6 +557,15 @@ pub fn apply_merged(
 ) -> Result<AppliedCounts> {
     // Upserts through copy_into, so the search index follows every insert and update.
     let planned: PlannedWrites = planned_writes(ours, merged);
+    let inserted_ids: Vec<&str> = planned.inserts.iter().map(|row| row.id.as_str()).collect();
+    let updated_ids: Vec<&str> = planned.updates.iter().map(|row| row.id.as_str()).collect();
+    // Logged before the writes, so a crash mid-apply still leaves what was planned on the journal.
+    journal!(
+        "apply_merged: planned inserts {}, updates {}, deletes {}",
+        id_summary(&inserted_ids),
+        id_summary(&updated_ids),
+        id_summary(&planned.deletes)
+    );
     planned
         .inserts
         .iter()
@@ -561,15 +583,11 @@ pub fn apply_merged(
                 .with_context(|| format!("apply_merged: delete of {lesson_id} failed"))?;
             Ok(())
         })?;
-    let (inserted_ids, updated_ids): (Vec<&str>, Vec<&str>) = (
-        planned.inserts.iter().map(|row| row.id.as_str()).collect(),
-        planned.updates.iter().map(|row| row.id.as_str()).collect(),
-    );
     journal!(
-        "apply_merged: inserted {}, updated {}, deleted {}",
-        id_summary(&inserted_ids),
-        id_summary(&updated_ids),
-        id_summary(&planned.deletes)
+        "apply_merged: applied {} insert(s), {} update(s), {} delete(s)",
+        inserted_ids.len(),
+        updated_ids.len(),
+        planned.deletes.len()
     );
     Ok(AppliedCounts {
         inserted: planned.inserts.len(),
@@ -1073,8 +1091,6 @@ mod tests {
     const ID_C: &str = "01KCCCCCCCCCCCCCCCCCCCCCCC";
     const ID_D: &str = "01KDDDDDDDDDDDDDDDDDDDDDDD";
     const SYNC_HITS: i64 = 7;
-    /// How long the second writer waits for the lock: long enough to be a real attempt, short so the test is fast.
-    const WRITER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// A lesson with every optional field set and a word only it holds (`marker`), so a dropped field or a stale
     /// search index shows.
@@ -1110,9 +1126,7 @@ mod tests {
     }
 
     fn apply_in_transaction(conn: &mut Connection, merged: &[Lesson]) -> AppliedCounts {
-        let transaction = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
+        let transaction = begin_sync_transaction(conn).unwrap();
         let ours: Vec<Lesson> = all_lessons(&transaction).unwrap();
         let counts: AppliedCounts = apply_merged(&transaction, &ours, merged).unwrap();
         transaction.commit().unwrap();
@@ -1276,9 +1290,7 @@ mod tests {
             )
             .unwrap();
         let fn_apply_error = |conn: &mut Connection, merged: &[Lesson]| -> String {
-            let transaction = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
+            let transaction = begin_sync_transaction(conn).unwrap();
             let ours: Vec<Lesson> = all_lessons(&transaction).unwrap();
             format!(
                 "{:#}",
@@ -1286,6 +1298,11 @@ mod tests {
             )
         };
         let all_three: Vec<Lesson> = all_lessons(&mut_conn).unwrap();
+        let without_a: Vec<Lesson> = all_three
+            .iter()
+            .filter(|row| row.id != ID_A)
+            .cloned()
+            .collect();
         let with_new_d: Vec<Lesson> = all_three
             .iter()
             .cloned()
@@ -1296,9 +1313,34 @@ mod tests {
                 .contains(&format!("upsert of {ID_D} failed"))
         );
         assert!(
-            fn_apply_error(&mut mut_conn, &all_three[1..])
-                .contains(&format!("delete of {ID_A} failed"))
+            fn_apply_error(&mut mut_conn, &without_a).contains(&format!("delete of {ID_A} failed"))
         );
+    }
+
+    #[test]
+    fn a_duplicate_id_in_merged_counts_once_and_its_last_row_wins() {
+        let (_temp_dir, mut mut_conn) = three_lessons();
+        let first_d: Lesson = full_lesson(ID_D, "delta");
+        let last_d: Lesson = Lesson {
+            resolution: Some("last".to_string()),
+            ..full_lesson(ID_D, "delta")
+        };
+        let kept_rows: Vec<Lesson> = all_lessons(&mut_conn).unwrap();
+        let merged: Vec<Lesson> = kept_rows
+            .iter()
+            .cloned()
+            .chain([first_d, last_d.clone()])
+            .collect();
+        let counts: AppliedCounts = apply_in_transaction(&mut mut_conn, &merged);
+        assert_eq!(
+            counts,
+            AppliedCounts {
+                inserted: 1,
+                updated: 0,
+                deleted: 0
+            }
+        );
+        assert_eq!(find_by_id(&mut_conn, ID_D).unwrap(), Some(last_d));
     }
 
     /// A transaction dropped before its commit (a crash between the queue write and the DB commit) changes nothing.
@@ -1306,9 +1348,7 @@ mod tests {
     fn an_uncommitted_apply_changes_nothing() {
         let (_temp_dir, mut mut_conn) = three_lessons();
         let before: Vec<Lesson> = all_lessons(&mut_conn).unwrap();
-        let transaction = mut_conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
+        let transaction = begin_sync_transaction(&mut mut_conn).unwrap();
         apply_merged(&transaction, &before, &[full_lesson(ID_D, "delta")]).unwrap();
         drop(transaction);
         assert_eq!(all_lessons(&mut_conn).unwrap(), before);
@@ -1321,12 +1361,10 @@ mod tests {
     fn a_local_write_never_lands_between_the_read_and_the_apply() {
         let (temp_dir, mut mut_conn) = three_lessons();
         let writer_conn: Connection = Connection::open(temp_dir.path().join("shared.db")).unwrap();
-        writer_conn.busy_timeout(WRITER_BUSY_TIMEOUT).unwrap();
+        writer_conn.busy_timeout(std::time::Duration::ZERO).unwrap(); // refused at once while locked: no wait, no timing
 
         copy_into(&writer_conn, &full_lesson(ID_D, "delta")).unwrap(); // writer first
-        let transaction = mut_conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
+        let transaction = begin_sync_transaction(&mut mut_conn).unwrap();
         let ours: Vec<Lesson> = all_lessons(&transaction).unwrap();
         assert!(
             ours.iter().any(|row| row.id == ID_D),
@@ -1340,9 +1378,14 @@ mod tests {
                 ..full_lesson(ID_A, "alpha")
             },
         ); // sync first
-        assert!(
-            blocked.is_err(),
-            "a writer cannot write while the sync holds the transaction"
+        let refusal_code: Option<rusqlite::ErrorCode> = blocked
+            .unwrap_err()
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code);
+        assert_eq!(
+            refusal_code,
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "a writer is refused for the lock while the sync holds the transaction"
         );
         apply_merged(&transaction, &ours, &ours).unwrap();
         transaction.commit().unwrap();
