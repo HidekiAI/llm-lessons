@@ -43,19 +43,21 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     })
 }
 
-/// A normalized remote as one path component. Letters, digits and `-` stay, lower-cased because the default macOS
-/// disk ignores case; `.` stays unless it comes first (so a slug is never `.`, `..` or hidden); every other byte
-/// becomes `_` and two hex digits, `_` included. Past `MAX_SLUG_BYTES` the slug keeps its head and ends in `-` and the
-/// 16-digit hash of the whole, so two long remotes that share a head still differ.
+/// The slug of the empty remote. No other input gives `_` alone, because every escape is `_` plus two hex digits.
+const EMPTY_REMOTE_SLUG: &str = "_";
+
+/// A normalized remote as one path component, made only of `a-z`, `0-9`, `-` and `_`. Letters and digits stay,
+/// lower-cased because the default macOS disk ignores case, and so does `-`; every other byte, `.` and `_` included,
+/// becomes `_` and two hex digits. With no `.` in it, a slug can never equal another remote's `<slug>.state`,
+/// `<slug>.lock` or `<slug>.<domain>.conflicts.jsonl`, and is never `.`, `..` or hidden. Past `MAX_SLUG_BYTES` the
+/// slug keeps its head and ends in `-` and the 16-digit hash of the whole, so two long remotes that share a head still
+/// differ.
 pub fn remote_slug(normalized_remote: &str) -> String {
-    // Every byte outside letters, digits, - and a non-leading dot is encoded, underscore included, so two remotes never
-    // share a slug.
+    // Every byte outside letters, digits and - is encoded, underscore included, so two remotes never share a slug.
     let encoded: String = normalized_remote
         .bytes()
-        .enumerate()
-        .map(|(byte_index, byte)| {
-            let is_kept: bool =
-                byte.is_ascii_alphanumeric() || byte == b'-' || (byte == b'.' && byte_index > 0);
+        .map(|byte| {
+            let is_kept: bool = byte.is_ascii_alphanumeric() || byte == b'-';
             if is_kept {
                 char::from(byte.to_ascii_lowercase()).to_string()
             } else {
@@ -69,6 +71,7 @@ pub fn remote_slug(normalized_remote: &str) -> String {
         .filter(|_| encoded.len() > MAX_SLUG_BYTES)
     {
         Some(head) => format!("{head}-{:016x}", fnv1a_64(encoded.as_bytes())),
+        None if encoded.is_empty() => EMPTY_REMOTE_SLUG.to_string(),
         None => encoded,
     }
 }
@@ -163,17 +166,18 @@ pub fn from_jsonl<Row: DeserializeOwned, UniqueKey: Ord + Debug>(
                 .with_context(|| format!("line {}: not a valid JSON row", line_index + 1))
         })
         .collect::<Result<Vec<Row>>>()?;
+    let unique_keys: Vec<UniqueKey> = rows.iter().map(&fn_unique_key).collect(); // each key computed once
     // A key whose last row is not this row appears again later: that is a duplicate.
-    let last_index_by_key: BTreeMap<UniqueKey, usize> = rows
+    let last_index_by_key: BTreeMap<&UniqueKey, usize> = unique_keys
         .iter()
         .enumerate()
-        .map(|(row_index, row)| (fn_unique_key(row), row_index))
+        .map(|(row_index, unique_key)| (unique_key, row_index))
         .collect();
-    let duplicated_key: Option<UniqueKey> = rows
+    let duplicated_key: Option<&UniqueKey> = unique_keys
         .iter()
         .enumerate()
-        .find(|(row_index, row)| last_index_by_key.get(&fn_unique_key(row)) != Some(row_index))
-        .map(|(_, row)| fn_unique_key(row));
+        .find(|(row_index, unique_key)| last_index_by_key.get(*unique_key) != Some(row_index))
+        .map(|(_, unique_key)| unique_key);
     match duplicated_key {
         Some(unique_key) => bail!("duplicate row for {unique_key:?}"),
         None => Ok(rows),
@@ -233,21 +237,25 @@ pub struct SyncState {
 
 /// The state file, or the default when it is missing, empty, corrupt or unreadable. The default has no
 /// `last_synced_commit`, which the cycle treats as an empty BASE: a union that deletes nothing. Losing the state costs
-/// a re-merge, never a lesson, so a bad state file is logged and replaced rather than stopping sync.
+/// a re-merge, never a lesson, so a bad state file is logged, and the next write replaces it, rather than
+/// stopping sync.
 pub fn read_state(path: &Path) -> SyncState {
-    // A bad state file costs a re-merge from an empty BASE, never a lesson, so it is logged and replaced.
-    read_text_or_empty(path)
-        .and_then(|state_text| {
-            // An empty file fails to parse like any other bad one, and lands on the same default below.
-            serde_json::from_str(&state_text).context("not a valid state file")
-        })
-        .unwrap_or_else(|read_error| {
-            journal!(
-                "state {}: no usable state, starting from an empty BASE: {read_error:#}",
-                path.display()
-            );
-            SyncState::default()
-        })
+    // A bad state file costs a re-merge from an empty BASE, never a lesson, so it is logged and the next write
+    // replaces it.
+    let fn_start_empty = |why: &str| {
+        journal!(
+            "state {}: {why}, starting from an empty BASE",
+            path.display()
+        );
+        SyncState::default()
+    };
+    match read_text_or_empty(path) {
+        Ok(state_text) if state_text.trim().is_empty() => fn_start_empty("no state yet"),
+        Ok(state_text) => serde_json::from_str(&state_text).unwrap_or_else(|parse_error| {
+            fn_start_empty(&format!("corrupt state ({parse_error})"))
+        }),
+        Err(read_error) => fn_start_empty(&format!("unreadable state ({read_error:#})")),
+    }
 }
 
 pub fn write_state(path: &Path, state: &SyncState) -> Result<()> {
@@ -307,15 +315,21 @@ mod tests {
     fn remote_slug_keeps_safe_characters_and_encodes_the_rest() {
         assert_eq!(
             remote_slug("git@github.com:owner/repo"),
-            "git_40github.com_3aowner_2frepo"
-        );
-        assert_eq!(
-            remote_slug(".hidden"),
-            "_2ehidden",
-            "a leading dot is encoded"
+            "git_40github_2ecom_3aowner_2frepo"
         );
         assert_eq!(remote_slug("a_b"), "a_5fb", "an underscore is encoded");
-        assert_eq!(remote_slug(".."), "_2e.", "never the parent directory");
+        assert_eq!(remote_slug(".."), "_2e_2e", "never the parent directory");
+        assert_eq!(
+            remote_slug(""),
+            EMPTY_REMOTE_SLUG,
+            "the empty remote still has a name"
+        );
+        assert!(
+            ["a.b", "x/.y", "..", ".hidden", "v1.2"]
+                .iter()
+                .all(|remote| !remote_slug(remote).contains('.')),
+            "a slug has no dot, so it cannot equal a sibling file such as <slug>.state"
+        );
     }
 
     #[test]
@@ -363,7 +377,7 @@ mod tests {
 
     #[test]
     fn remote_slug_never_maps_two_remotes_to_one_slug() {
-        let lookalikes: &[&str] = &["a/b", "a_2fb", "a-b", "a.b", "a_b"];
+        let lookalikes: &[&str] = &["a/b", "a_2fb", "a-b", "a.b", "a_b", "", "_"];
         let slugs: std::collections::BTreeSet<String> = lookalikes
             .iter()
             .map(|remote| remote_slug(remote))
@@ -471,6 +485,34 @@ mod tests {
     }
 
     #[test]
+    fn no_clone_directory_equals_another_remotes_state_lock_or_queue_file() {
+        let lessons_home: &Path = Path::new("/lessons-home");
+        let owner = ClonePaths::new(lessons_home, "a");
+        let lookalike = ClonePaths::new(lessons_home, "a.state");
+        let lock_lookalike = ClonePaths::new(lessons_home, "a.lock");
+        let queue_lookalike = ClonePaths::new(lessons_home, "a.shared.conflicts.jsonl");
+        assert_ne!(lookalike.clone_dir(), owner.state_file());
+        assert_ne!(lock_lookalike.clone_dir(), owner.lock_file());
+        assert_ne!(
+            queue_lookalike.clone_dir(),
+            owner.live_queue(Domain::Shared)
+        );
+    }
+
+    #[test]
+    fn write_atomically_refuses_a_directory_in_the_files_place() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_path: PathBuf = temp_dir.path().join("work.jsonl");
+        fs::create_dir(&target_path).unwrap();
+        let write_error: String = format!(
+            "{:#}",
+            write_atomically(&target_path, "text\n").unwrap_err()
+        );
+        assert!(write_error.contains("rename"), "{write_error}");
+        assert!(target_path.is_dir(), "the directory is untouched");
+    }
+
+    #[test]
     fn write_atomically_creates_the_directory_and_replaces_the_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let target_path: PathBuf = temp_dir.path().join("sync").join("work.jsonl");
@@ -514,6 +556,16 @@ mod tests {
         assert_eq!(read_state(&state_path), SyncState::default(), "empty");
         fs::write(&state_path, "{ not json").unwrap();
         assert_eq!(read_state(&state_path), SyncState::default(), "corrupt");
+    }
+
+    #[test]
+    fn an_unreadable_state_path_reads_as_the_default() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_state(temp_dir.path()),
+            SyncState::default(),
+            "a directory is not a state file"
+        );
     }
 
     #[test]
