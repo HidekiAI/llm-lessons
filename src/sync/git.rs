@@ -18,6 +18,9 @@ const SYMREF_PREFIX: &str = "ref: refs/heads/";
 const SYMREF_SUFFIX: &str = "\tHEAD";
 /// The words git uses when a push loses a race: another machine pushed first, so fetching and merging again can win.
 const LOST_RACE_MARKERS: &[&str] = &["non-fast-forward", "fetch first"];
+/// The start of git's own line for a ref it refused to update; a server hook's refusal reads `[remote rejected]`
+/// instead.
+const REJECTED_MARKER: &str = "[rejected]";
 
 /// What a push came back with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,16 +50,24 @@ pub fn parse_default_branch(ls_remote_output: &str) -> Option<String> {
 pub fn classify_push(exit_ok: bool, stderr: &str) -> PushOutcome {
     // The exit code decides first, so a refusal that merely mentions the words (a hook's message, say) is not a lost
     // race. A lost race is retried a bounded number of times; anything unknown is a failure.
-    if exit_ok {
-        PushOutcome::Pushed
-    } else if LOST_RACE_MARKERS
-        .iter()
-        .any(|marker| stderr.contains(marker))
-    {
-        PushOutcome::LostRace
-    } else {
-        PushOutcome::Refused
+    // Only git's own `[rejected]` line counts, so a hook's `[remote rejected]` message that quotes the words does not.
+    let lost_race: bool = stderr.lines().any(|line| {
+        line.contains(REJECTED_MARKER)
+            && LOST_RACE_MARKERS.iter().any(|marker| line.contains(marker))
+    });
+    match (exit_ok, lost_race) {
+        (true, _) => PushOutcome::Pushed,
+        (false, true) => PushOutcome::LostRace,
+        (false, false) => PushOutcome::Refused,
     }
+}
+
+/// The URL schemes git accepts for ssh.
+const SSH_SCHEMES: &[&str] = &["ssh", "git+ssh", "ssh+git"];
+
+/// `C` in `C:\repo`: a Windows drive, not a host (no real host name is a single letter).
+fn is_drive_letter(text: &str) -> bool {
+    text.len() == 1 && text.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
 /// The host of an ssh remote: `user@host:path`, `host:path` or `ssh://[user@]host[:port]/path`. None for any other
@@ -66,12 +77,14 @@ pub fn ssh_host_of(remote: &str) -> Option<String> {
     // scp-like, and a local path has none. Limitation: an IPv6 literal such as `git@[::1]:repo` is not understood and
     // yields a wrong host, so its agent socket is not found; a key file still works.
     let authority: Option<&str> = match remote.split_once("://") {
-        Some(("ssh", after_scheme)) => after_scheme.split('/').next(),
+        Some((scheme, after_scheme)) if SSH_SCHEMES.contains(&scheme) => {
+            after_scheme.split('/').next()
+        }
         Some(_) => None,
         None => remote
             .split_once(':')
             .map(|(before_colon, _)| before_colon)
-            .filter(|before_colon| !before_colon.contains('/')),
+            .filter(|before_colon| !before_colon.contains('/') && !is_drive_letter(before_colon)),
     };
     authority
         .and_then(|with_user| with_user.rsplit('@').next())
@@ -111,6 +124,26 @@ pub fn ssh_command(key: &Path, identity_agent: Option<&str>) -> String {
         "ssh -F /dev/null -i {} -o IdentitiesOnly=yes -o BatchMode=yes{agent_option}",
         shell_quote(&key.to_string_lossy())
     )
+}
+
+/// `text` with the user and password of any `scheme://user:password@host` removed, so a remote that carries a token
+/// never reaches the journal or an error message.
+pub fn redact_credentials(text: &str) -> String {
+    text.split("://")
+        .enumerate()
+        .map(
+            |(part_index, part)| match (part_index, part.split_once('@')) {
+                (0, _) => part.to_string(),
+                // The credentials end at the first `@` that comes before any `/` (a path or a space may follow the
+                // host).
+                (_, Some((credentials, rest))) if !credentials.contains(['/', ' ']) => {
+                    rest.to_string()
+                }
+                _ => part.to_string(),
+            },
+        )
+        .collect::<Vec<String>>()
+        .join("://")
 }
 
 /// What a git command printed and whether it succeeded.
@@ -153,15 +186,26 @@ impl GitRunner {
     /// Runs `git <args>` in the working directory. A git that could not start is an error; one that ran and failed is
     /// an `exit_ok: false` output, so the caller decides what a failure means.
     pub fn run(&self, args: &[&str]) -> Result<GitOutput> {
-        journal!("git {} (in {})", args.join(" "), self.working_dir.display());
+        journal!(
+            "git {} (in {})",
+            redact_credentials(&args.join(" ")),
+            self.working_dir.display()
+        );
         let output: Output = Command::new("git")
             .args(args)
             .current_dir(&self.working_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_SSH_COMMAND", &self.ssh_command)
+            .env("GIT_ASKPASS", "") // an askpass helper would prompt; sync never does
             .envs(self.extra_env.iter().map(|(name, value)| (name, value)))
             .output()
-            .with_context(|| format!("git {}: could not start git", args.join(" ")))?;
+            .with_context(|| {
+                format!(
+                    "git {}: could not start git in {} (is git installed and on the PATH, and the directory present?)",
+                    redact_credentials(&args.join(" ")),
+                    self.working_dir.display()
+                )
+            })?;
         let git_output = GitOutput {
             exit_ok: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -169,9 +213,9 @@ impl GitRunner {
         };
         journal!(
             "git {}: exit_ok={} stderr={:?}",
-            args.join(" "),
+            redact_credentials(&args.join(" ")),
             git_output.exit_ok,
-            git_output.stderr.trim()
+            redact_credentials(git_output.stderr.trim())
         );
         Ok(git_output)
     }
@@ -184,8 +228,8 @@ impl GitRunner {
         } else {
             bail!(
                 "git {} failed: {}",
-                args.join(" "),
-                git_output.stderr.trim()
+                redact_credentials(&args.join(" ")),
+                redact_credentials(git_output.stderr.trim())
             )
         }
     }
@@ -194,13 +238,14 @@ impl GitRunner {
 /// The remote's default branch, or `SYNC_FALLBACK_BRANCH` when the remote is empty. Run from any directory: it asks
 /// the remote, not a clone, so it works before the clone exists.
 pub fn detect_default_branch(runner: &GitRunner, remote: &str) -> Result<String> {
-    let listing: String = runner.run_checked(&["ls-remote", "--symref", remote, "HEAD"])?;
+    let listing: String = runner.run_checked(&["ls-remote", "--symref", "--", remote, "HEAD"])?;
     Ok(parse_default_branch(&listing).unwrap_or_else(|| SYNC_FALLBACK_BRANCH.to_string()))
 }
 
 /// Makes the clone exist and be configured, whatever state it is in: `git init -b <branch>` when there is no
 /// repository yet (so the branch name never depends on `init.defaultBranch`), the remote URL, the ssh command, and
-/// commit signing off (a signing key may need a prompt or an agent a background process lacks). Safe to repeat.
+/// commit signing off (a signing key may need a prompt or an agent a background process lacks). Safe to repeat, but
+/// not safe to run twice at once: the caller holds the clone lock (plan step S4c).
 pub fn ensure_clone(
     runner: &GitRunner,
     clone_dir: &Path,
@@ -210,12 +255,15 @@ pub fn ensure_clone(
 ) -> Result<()> {
     std::fs::create_dir_all(clone_dir)
         .with_context(|| format!("create {}", clone_dir.display()))?;
-    if !clone_dir.join(".git").exists() {
+    // `.git` existing is not enough: an empty or corrupt `.git` makes git walk up to a parent repository, and the
+    // configuration below would land there. Only a git directory named `.git` right here counts.
+    let is_own_repository: bool = runner.run(&["rev-parse", "--git-dir"])?.stdout.trim() == ".git";
+    if !is_own_repository {
         runner.run_checked(&["init", "-q", "-b", branch])?;
     }
     let remote_known: bool = runner.run(&["remote", "get-url", REMOTE_NAME])?.exit_ok;
     let remote_verb: &str = if remote_known { "set-url" } else { "add" };
-    runner.run_checked(&["remote", remote_verb, REMOTE_NAME, remote])?;
+    runner.run_checked(&["remote", remote_verb, "--", REMOTE_NAME, remote])?;
     runner.run_checked(&["config", "core.sshCommand", ssh_command])?;
     runner.run_checked(&["config", "commit.gpgsign", "false"])?;
     Ok(())
@@ -559,13 +607,134 @@ mod tests {
         let seen: String = runner
             .run_checked(&[
                 "-c",
-                "alias.showenv=!echo \"$GIT_TERMINAL_PROMPT|$GIT_SSH_COMMAND\"",
+                "alias.showenv=!echo \"$GIT_TERMINAL_PROMPT|$GIT_SSH_COMMAND|${GIT_ASKPASS-unset}|\"",
                 "showenv",
             ])
             .unwrap();
         assert_eq!(
             seen,
-            format!("0|{}\n", ssh_command(Path::new(SOME_KEY), None))
+            format!("0|{}||\n", ssh_command(Path::new(SOME_KEY), None))
+        );
+    }
+
+    #[test]
+    fn redact_credentials_removes_a_user_and_token_from_urls_only() {
+        assert_eq!(
+            redact_credentials(
+                "fatal: unable to access 'https://me:tok3n@host.example/o/r.git/': 401"
+            ),
+            "fatal: unable to access 'https://host.example/o/r.git/': 401"
+        );
+        assert_eq!(
+            redact_credentials("git remote add -- origin ssh://git@host.example/o/r.git"),
+            "git remote add -- origin ssh://host.example/o/r.git"
+        );
+        assert_eq!(
+            redact_credentials("remote add origin git@github.com:o/r.git"),
+            "remote add origin git@github.com:o/r.git",
+            "an scp-like remote has no scheme, so there is nothing to strip"
+        );
+        assert_eq!(
+            redact_credentials("see https://host.example/path?mail=a@b.example"),
+            "see https://host.example/path?mail=a@b.example",
+            "an @ after the first slash is not a credential"
+        );
+        assert_eq!(redact_credentials(""), "");
+    }
+
+    #[test]
+    fn a_hooks_refusal_that_quotes_the_words_is_not_a_lost_race() {
+        let hook_refusal: &str = "remote: nothing to do with non-fast-forward or fetch first\n \
+             ! [remote rejected] HEAD -> main (pre-receive hook declined)";
+        assert_eq!(classify_push(false, hook_refusal), PushOutcome::Refused);
+        assert_eq!(
+            classify_push(false, " ! [rejected]        HEAD -> main (fetch first)"),
+            PushOutcome::LostRace,
+            "git's own rejected line still is one"
+        );
+    }
+
+    #[test]
+    fn ssh_host_of_accepts_git_ssh_schemes_and_refuses_a_windows_drive() {
+        assert_eq!(
+            ssh_host_of("git+ssh://git@h.example/o/r.git"),
+            Some("h.example".to_string())
+        );
+        assert_eq!(
+            ssh_host_of("ssh+git://h.example/o/r.git"),
+            Some("h.example".to_string())
+        );
+        assert_eq!(
+            ssh_host_of("C:\\repos\\r.git"),
+            None,
+            "a drive letter is not a host"
+        );
+        assert_eq!(ssh_host_of("c:/repos/r.git"), None);
+    }
+
+    #[test]
+    fn a_remote_that_starts_with_a_dash_is_never_read_as_an_option() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_remote_path, global_config) = bare_remote(temp_dir.path(), "trunk");
+        let runner = isolated_runner(temp_dir.path(), &global_config);
+        let failure: String = format!(
+            "{:#}",
+            detect_default_branch(&runner, "--upload-pack=touch pwned").unwrap_err()
+        );
+        assert!(
+            !failure.contains("unknown option") && !failure.contains("usage:"),
+            "{failure}"
+        );
+        assert!(!temp_dir.path().join("pwned").exists());
+    }
+
+    #[test]
+    fn an_unreachable_remote_is_an_error_not_the_fallback_branch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_remote_path, global_config) = bare_remote(temp_dir.path(), "trunk");
+        let runner = isolated_runner(temp_dir.path(), &global_config);
+        let missing_remote: PathBuf = temp_dir.path().join("no-such-remote.git");
+        assert!(detect_default_branch(&runner, &missing_remote.to_string_lossy()).is_err());
+    }
+
+    /// A clone directory with an empty `.git` inside a parent repository must get its own repository, and the parent's
+    /// configuration must stay untouched.
+    #[test]
+    fn ensure_clone_never_configures_a_parent_repository() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (remote_path, global_config) = bare_remote(temp_dir.path(), "trunk");
+        let parent_dir: PathBuf = temp_dir.path().join("parent");
+        let clone_dir: PathBuf = parent_dir.join("clone");
+        let parent_runner = runner_in(
+            &isolated_runner(temp_dir.path(), &global_config),
+            &parent_dir,
+        );
+        fs::create_dir_all(&clone_dir).unwrap();
+        parent_runner.run_checked(&["init", "-q"]).unwrap();
+        fs::create_dir(clone_dir.join(".git")).unwrap(); // empty: git does not recognise it
+        let clone_runner = runner_in(&parent_runner, &clone_dir);
+        ensure_clone(
+            &clone_runner,
+            &clone_dir,
+            &remote_path.to_string_lossy(),
+            "trunk",
+            "ssh",
+        )
+        .unwrap();
+        assert!(
+            !parent_runner
+                .run(&["config", "--get", "remote.origin.url"])
+                .unwrap()
+                .exit_ok,
+            "the parent repository got a remote"
+        );
+        assert_eq!(
+            clone_runner
+                .run_checked(&["rev-parse", "--git-dir"])
+                .unwrap()
+                .trim(),
+            ".git",
+            "the clone is a repository of its own"
         );
     }
 
