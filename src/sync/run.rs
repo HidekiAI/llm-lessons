@@ -249,7 +249,8 @@ fn attempt(cycle: &Cycle, attempt_number: u32) -> Result<Option<String>> {
         ])?;
     }
     let head: Option<String> = verified_commit(&cycle.runner, "HEAD")?;
-    // Also a commit left by a crashed cycle: nothing new to commit, but the remote does not have it yet.
+    // Also a commit left by a crashed cycle on an unborn remote (with a remote tip the checkout above discarded it):
+    // nothing new to commit, but the remote does not have it yet.
     let needs_push: bool = head.is_some() && head != tip;
     (cycle.on_step)(SyncStep::BeforePush)?;
     if !needs_push {
@@ -323,8 +324,9 @@ fn merge_domain(
     let (base_queue, theirs_queue): (Vec<Conflict>, Vec<Conflict>) =
         (fn_queue_at(base_commit)?, fn_queue_at(tip)?);
     let live_queue_path: PathBuf = cycle.paths.live_queue(domain);
-    let live_queue: Vec<Conflict> = from_jsonl(&read_text_or_empty(&live_queue_path)?, group_key)
-        .with_context(|| format!("{}", live_queue_path.display()))?;
+    let live_queue: Vec<Conflict> =
+        from_jsonl(&read_text_or_empty(&live_queue_path)?, group_key)
+            .with_context(|| format!("parse live queue {}", live_queue_path.display()))?;
     let database_path: PathBuf = domain.file_path(cycle.job.lessons_home);
     let mut mut_conn = open(&database_path, OpenMode::Existing).with_context(|| {
         format!(
@@ -491,6 +493,8 @@ pub fn sync_configured(
                     println!("{shown_remote}: synced");
                     CycleOutcome::Synced
                 }
+                // `sync_clone` reports a failed cycle as `Err`, so this arm is not reached today; it is listed so a new variant of
+                // the outcome cannot be printed as "synced".
                 Ok(CycleOutcome::Failed) => {
                     eprintln!("lessons sync: {shown_remote}: the cycle failed");
                     CycleOutcome::Failed
