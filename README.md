@@ -117,7 +117,7 @@ Sync them through a git repo (GitHub, GitLab, any host) with `lessons sync`. The
 > [!CAUTION]
 > Keep any repo that holds **work** lessons **private**: your employer's rules on its data apply, and anything pushed stays in the history, and in forks and archives, even after you delete it. `shared` and `personal` are your call: if you have nothing to hide, a public repo lets others learn from your lessons. A repo's visibility is set in its Settings, under Danger Zone. While a synced repo is public, every `lessons` command prints a warning.
 
-**Before you start**, create 1, 2 or 3 repos dedicated to the lessons DBs (private unless you chose otherwise above). A gist does not work for this: only its owner can push, it cannot have collaborators, and a secret gist is readable by anyone who has its URL.
+**Before you start**, create 1, 2 or 3 repos dedicated to the lessons DBs (private unless you chose otherwise above).
 
 **Scenario A: separate work and personal accounts.** Create the repo(s) with your personal account and add your work account as a collaborator (Settings > Collaborators), so both can push. Either one repo for all three DBs, or a work-only repo plus one for `personal` and `shared`; with a work-only repo, sync also checks that no other key on the machine can read it. Then, on each machine:
 
@@ -146,8 +146,6 @@ How the merge works:
 
 When `work` shares a repo with `personal` or `shared`, sync notes once per sync that work data is readable by everyone with access to that repo.
 
-Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dropbox). A sync client can copy a `.db` mid-write, or apart from its `-wal` file, which can corrupt it, and on a conflict it silently keeps one copy.
-
 ### Why does git store JSON lines, and never the `.db` itself?
 
 An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One new lesson can rewrite bytes in several pages, so git sees an opaque blob. It cannot show a readable diff, git cannot merge two machines' versions (one side has to be picked), and a commit can store a whole new copy, so the history can grow by the size of the database each time.
@@ -155,6 +153,18 @@ An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One ne
 So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commits that text. The merge itself never runs in git: `lessons sync` merges in-process, field by field, three ways (against the version both machines last agreed on), then commits the result on top of the repo's latest commit, so every push is a plain fast-forward and there are no merge commits. The local `.db` is rebuilt from the merged result.
 
 What pays off is syncing often (`update = "live"`): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
+
+### Why a git repo, and not a gist or a cloud drive?
+
+Because only a git repo merges and can be shared with your other accounts. A cloud drive overwrites; a gist is owner-only.
+
+Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dropbox). A cloud drive syncs whole files. Two machines change the same `.db`. On a conflict the drive silently keeps one copy, so the other machine's lessons are gone. It can also copy a `.db` in the middle of a write, or apart from its `-wal` file, which can corrupt it.
+
+A gist is a git repo, but only its owner can push. It cannot have collaborators. A secret gist is readable by anyone who has its URL.
+
+With a git repo, `lessons sync` merges the JSON lines per lesson and per field. A real conflict only happens when two machines change the same field of the same lesson. Then nothing is dropped: `lessons resolve` asks you.
+
+The repo stays private because work lessons may belong to your employer, and anything pushed stays in the history.
 
 ## Contributing
 
