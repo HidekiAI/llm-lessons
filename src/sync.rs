@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::store::Lesson;
 
 mod files;
+mod git;
 
 /// Added to `tags` by a combine in `lessons resolve`, so `lessons list --tag needs-reword` finds the lesson.
 pub const NEEDS_REWORD_TAG: &str = "needs-reword";
