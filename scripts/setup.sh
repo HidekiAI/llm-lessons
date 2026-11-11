@@ -165,8 +165,6 @@ normalized_remote() {
     printf '\n'
 }
 
-# Prints `key`'s value from the [sync.<domain>] section of `config_path` (the text between the
-# first and last double quote), or nothing when the file, the section or the key is missing.
 # Prints the lines of [sync.<domain>] in `config_path`, header first, CR line endings removed; nothing
 # when it is missing. A header still matches with surrounding spaces or a trailing # comment.
 sync_section_lines() {
@@ -182,13 +180,15 @@ sync_section_lines() {
         in_section { print }' "$config_path"
 }
 
+# Prints `key`'s value from the [sync.<domain>] section of `config_path`, or nothing when the file, the section
+# or the key is missing.
 existing_sync_value() {
     local config_path="$1" domain_name="$2" key_name="$3"
     # Reads a "basic" string (only \\ and \" decoded; any other escape prints nothing) or a 'literal'
     # one; whatever follows the value, such as a comment, is ignored. Anything else prints nothing.
     # It reads to the end instead of `exit`: closing the pipe early could fail the writer under pipefail.
     sync_section_lines "$config_path" "$domain_name" | awk -v key="$key_name" -v squote="'" '
-        !value_done && NR > 1 && match($0, "^[ \t]*" key "[ \t]*=[ \t]*") {
+        !value_done && NR > 1 && match($0, "^[ \t]*" key "[ \t]*=[ \t]*") { # NR 1 is the header line
             rest = substr($0, RLENGTH + 1)
             if (match(rest, "^" squote "[^" squote "]*" squote)) { print substr(rest, 2, RLENGTH - 2); value_done = 1; next }
             if (!match(rest, /^"([^"\\]|\\.)*"/)) { value_done = 1; next }
