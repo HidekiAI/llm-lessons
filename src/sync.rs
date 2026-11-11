@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Lesson;
 
+mod cycle;
 mod files;
 mod git;
 
@@ -67,7 +68,7 @@ pub struct Conflict {
 /// A queue group's key: the lesson id and the field.
 pub type GroupKey = (String, MergedField);
 
-fn group_key(group: &Conflict) -> GroupKey {
+pub(super) fn group_key(group: &Conflict) -> GroupKey {
     (group.id.clone(), group.field)
 }
 
