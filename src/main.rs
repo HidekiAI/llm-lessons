@@ -104,7 +104,8 @@ enum Command {
     },
     /// Sync the lessons with the git repository each [sync.<domain>] names; needs git on the PATH
     Sync {
-        /// Only this domain (work, personal or shared); default: every configured domain
+        /// Only this domain (work, personal or shared); default: every configured domain. Deletes propagate only on a
+        /// run that covers every domain of a remote
         #[arg(long)]
         domain: Option<Domain>,
     },

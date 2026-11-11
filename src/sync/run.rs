@@ -53,7 +53,9 @@ pub struct CloneJob<'job> {
     pub ssh_command: String,
     pub domains: &'job [Domain],
     /// True when `domains` is every domain the clone carries. The single remembered BASE describes the whole clone, so
-    /// a run of only some domains must not advance it: the others would then look deleted on the next full run.
+    /// a run of only some domains must not advance it: the others would then look deleted on the next full run. The
+    /// cost: until a run covers the whole clone, BASE stays old, so a local delete does not propagate yet and the row
+    /// returns from THEIRS (nothing is lost).
     pub whole_clone: bool,
     /// Extra environment for every git call; tests point git at their own config.
     pub git_env: &'job [(String, String)],
@@ -360,9 +362,10 @@ fn merge_domain(
 /// The live queue file: written atomically while there are conflicts, removed when there are none.
 fn write_live_queue(path: &Path, queue: &[Conflict]) -> Result<()> {
     let queue_text: String = to_jsonl(queue, group_key)?;
-    match queue_text.is_empty() {
-        true => remove_if_present(path),
-        false => write_atomically(path, &queue_text),
+    if queue_text.is_empty() {
+        remove_if_present(path)
+    } else {
+        write_atomically(path, &queue_text)
     }
 }
 
@@ -1435,7 +1438,7 @@ mod tests {
             Machine::new(temp_dir.path(), "left"),
             Machine::new(temp_dir.path(), "right"),
         );
-        let personal_conn = |machine: &Machine| -> Connection {
+        let fn_personal_conn = |machine: &Machine| -> Connection {
             drop(open(&Domain::Personal.file_path(&machine.home), OpenMode::Create).unwrap());
             open(
                 &Domain::Personal.file_path(&machine.home),
@@ -1443,7 +1446,7 @@ mod tests {
             )
             .unwrap()
         };
-        let sync_domains = |machine: &Machine, domains: &[Domain], whole_clone: bool| {
+        let fn_sync_domains = |machine: &Machine, domains: &[Domain], whole_clone: bool| {
             let job = CloneJob {
                 domains,
                 whole_clone,
@@ -1451,8 +1454,8 @@ mod tests {
             };
             sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap()
         };
-        let (left_personal, right_personal) = (personal_conn(&left), personal_conn(&right));
-        sync_domains(&right, BOTH, true);
+        let (left_personal, right_personal) = (fn_personal_conn(&left), fn_personal_conn(&right));
+        fn_sync_domains(&right, BOTH, true);
         let new_row_id: String = insert(
             &left_personal,
             &NewLesson {
@@ -1462,9 +1465,9 @@ mod tests {
             },
         )
         .unwrap();
-        sync_domains(&left, BOTH, true);
-        sync_domains(&right, ONLY_SHARED, false);
-        sync_domains(&right, BOTH, true);
+        fn_sync_domains(&left, BOTH, true);
+        fn_sync_domains(&right, ONLY_SHARED, false);
+        fn_sync_domains(&right, BOTH, true);
         assert!(
             find_by_id(&right_personal, &new_row_id).unwrap().is_some(),
             "the right machine receives the row"

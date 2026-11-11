@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Domain;
 use crate::journal;
+use crate::sync::git::redact_credentials;
 
 /// The directory under `$LESSONS_HOME` that holds every clone and the files beside them.
 pub const SYNC_DIR_NAME: &str = "sync";
@@ -104,7 +105,7 @@ impl ClonePaths {
     pub fn new(lessons_home: &Path, normalized_remote: &str) -> ClonePaths {
         ClonePaths {
             sync_dir: lessons_home.join(SYNC_DIR_NAME),
-            slug: remote_slug(normalized_remote),
+            slug: remote_slug(&redact_credentials(normalized_remote)), // the slug names a directory that the journal prints
         }
     }
 
@@ -387,6 +388,19 @@ mod tests {
             .map(|remote| remote_slug(remote))
             .collect();
         assert_eq!(slugs.len(), lookalikes.len(), "{slugs:?}");
+    }
+
+    #[test]
+    fn clone_paths_never_carry_a_credential_of_the_remote() {
+        let paths = ClonePaths::new(
+            Path::new("/lessons-home"),
+            "https://user:secret-token@github.com/owner/repo",
+        );
+        assert!(
+            !paths.clone_dir().to_string_lossy().contains("secret"),
+            "{:?}",
+            paths.clone_dir()
+        );
     }
 
     /// The pin test for the on-disk layout: these names are a contract with clones made by earlier versions.
