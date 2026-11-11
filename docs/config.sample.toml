@@ -5,7 +5,7 @@
 # Domains `lessons search` uses when --in is omitted.
 default_search = ["work", "personal", "shared"]
 
-# Domains the Claude Code prompt hook may read. personal is left out on purpose.
+# Domains the prompt hook may read. personal is left out on purpose.
 [hook]
 domains = ["work", "shared"]
 max_results = 5

@@ -1,8 +1,8 @@
 //! Journal-grade logging to stderr, off by default.
 //!
 //! Each step that touches a DB file reports what it did (path, version, counts, decision), so a
-//! run can be retraced from stderr alone. It is off by default because the Claude Code hook's
-//! output is read by Claude Code; it is turned on with `--verbose` or a non-empty `LESSONS_LOG`.
+//! run can be retraced from stderr alone. It is off by default because the prompt hook's
+//! output is read back by the agent; it is turned on with `--verbose` or a non-empty `LESSONS_LOG`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

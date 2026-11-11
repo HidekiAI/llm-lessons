@@ -209,7 +209,7 @@ fn expand_tilde(path: &Path, home_dir: Option<&Path>) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HookConfig {
-    /// Domains the Claude Code hook may read.
+    /// Domains the prompt hook may read.
     pub domains: Vec<Domain>,
     pub max_results: usize,
 }

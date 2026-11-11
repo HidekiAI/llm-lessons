@@ -104,7 +104,7 @@ enum Command {
     },
     /// Serve search_lessons and record_lesson to an MCP client over stdio
     Mcp,
-    /// Entry points for Claude Code hooks; they never block a prompt
+    /// Entry points for the prompt hook; they never block a prompt
     Hook {
         #[command(subcommand)]
         event: HookEvent,
@@ -228,8 +228,8 @@ impl FieldArgs {
 fn main() -> Result<()> {
     let cli: Cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        // clap exits 2 on a usage error, and Claude Code reads exit 2 from a hook as "block the
-        // prompt": a mistyped hook command in settings.json would block every prompt. Report it
+        // clap exits 2 on a usage error, and the agent reads exit 2 from the prompt hook as "block
+        // the prompt": a mistyped hook command in the agent's settings would block every prompt. Report it
         // and let the prompt through instead.
         // The subcommand is the first argument that is not a flag (`lessons --verbose hook ...`).
         Err(parse_error)
@@ -291,7 +291,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// Runs a Claude Code hook. It never fails: every error goes to stderr and the exit code stays 0,
+/// Runs the prompt hook. It never fails: every error goes to stderr and the exit code stays 0,
 /// because exit code 2 would block the user's prompt.
 fn run_hook(hook_event: HookEvent, fn_lessons_home: impl Fn() -> Result<PathBuf>) {
     let hook_result: Result<String> = match hook_event {

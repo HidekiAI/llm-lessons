@@ -1,7 +1,7 @@
-//! `lessons hook user-prompt-submit`: the Claude Code hook that surfaces past lessons for a prompt.
+//! `lessons hook user-prompt-submit`: the prompt hook that surfaces past lessons for a prompt.
 //!
 //! It must never get in the way of the prompt. Any failure is reported on stderr and the process
-//! still exits 0, because exit code 2 would block the prompt. Hits go to stdout, which Claude Code
+//! still exits 0, because exit code 2 would block the prompt. Hits go to stdout, which the agent
 //! adds to the conversation as context; no hits means no output at all.
 
 use std::io::Read;
@@ -18,8 +18,8 @@ use crate::{config, db, journal, query, store};
 
 const HEADER: &str = "Relevant past lessons (from lessons db):";
 
-/// Claude Code replaces hook output over 10,000 characters with a file path and a preview, which
-/// Claude is not asked to read; stay well under it, dropping whole lessons rather than cutting one.
+/// The agent replaces hook output over 10,000 characters with a file path and a preview, which
+/// the model is not asked to read; stay well under it, dropping whole lessons rather than cutting one.
 const MAX_OUTPUT_CHARS: usize = 8_000;
 
 /// A pasted one-line error can be huge; each printed field keeps this many characters.
@@ -29,7 +29,7 @@ const MAX_LINE_CHARS: usize = 300;
 /// repo can still be boosted into the top results when its plain score ranks it lower.
 const BOOST_POOL_FACTOR: usize = 4;
 
-/// The fields this hook reads. Unknown keys are ignored on purpose: Claude Code adds fields to
+/// The fields this hook reads. Unknown keys are ignored on purpose: the agent adds fields to
 /// the hook payload over time, and a new one must not break every prompt.
 #[derive(Debug, Deserialize)]
 struct HookInput {
@@ -109,7 +109,7 @@ fn boost_current_repo(
     mut_boosted
 }
 
-/// Compact plain text for Claude: one block per lesson, first lines only, the failed tries kept
+/// Compact plain text for the agent: one block per lesson, first lines only, the failed tries kept
 /// because they are what saves a repeat of the same dead end.
 fn render(hits: &[SearchHit]) -> String {
     let fn_first_line = |text: &str| -> String {
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn output_stays_under_the_claude_code_limit_and_long_lines_are_cut() {
+    fn output_stays_under_the_hook_output_limit_and_long_lines_are_cut() {
         let temp_dir = tempfile::tempdir().unwrap();
         let conn = open(&Domain::Shared.file_path(temp_dir.path()), OpenMode::Create).unwrap();
         let huge_line: String = format!("registry {}", "x".repeat(HUGE_FIELD_CHARS));
