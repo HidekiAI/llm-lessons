@@ -1,4 +1,6 @@
 # llm-lessons
+Your coding assistant fixed a similar pattern of bugs last week. Today it walks straight into it again: the rules you drilled into it and the mistakes it already made vanished with the last session. `lessons` gives it a memory that outlives the context window. Every problem goes into a small local database with its root cause, the fix, and the attempts that failed, so the next session, on any agent (opencode, Claude Code, anything that runs a shell command or speaks MCP) and any model, looks there before it debugs. Lessons sync across your machines through a git repo you own, so what you learn at work and at home stays learned.
+
 Lessons learned from each|every sessions based on trials, errors, failures, and building postmortem style database, so that LLMs can query the lessons db to make sure mistakes|err are not repeated
 
 `lessons` is a small CLI that records each problem: what went wrong, why, what fixed it, and what was tried that did NOT work. A human or an LLM can then search it before debugging the same thing again. The failed attempts are kept on purpose: they are what saves a repeat of the same dead end.
