@@ -202,7 +202,8 @@ fn normalize_remote(remote: &str) -> String {
                 });
             let host_lowercase: String = host_part.to_lowercase();
             // The credentials of an http(s) URL are not part of which repository it is, and this form is printed and
-            // used in a directory name. An ssh user is a login name and stays; an ssh password (git ignores it) does not.
+            // used in a directory name. An ssh user is a login name and stays; an ssh password (git ignores it)
+            // does not.
             let fn_ssh_login_at_host = || -> String {
                 userinfo
                     .and_then(|userinfo_text| userinfo_text.split(':').next())
@@ -212,8 +213,8 @@ fn normalize_remote(remote: &str) -> String {
                     })
             };
             match (scheme.eq_ignore_ascii_case("ssh"), host_part.contains(':')) {
-                // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp
-                // form.
+                // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the
+                // scp form.
                 (true, false) => format!("{}:{path}", fn_ssh_login_at_host()),
                 (true, true) => format!("ssh://{}/{path}", fn_ssh_login_at_host()),
                 (false, _) => format!("{}://{host_lowercase}/{path}", scheme.to_lowercase()),
