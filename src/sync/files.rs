@@ -231,9 +231,9 @@ pub struct SyncState {
     pub consecutive_failures: u32,
 }
 
-/// The state file, or the default when it is missing, empty, corrupt or unreadable. The default has no `last_synced_commit`,
-/// which the cycle treats as an empty BASE: a union that deletes nothing. Losing the state costs a re-merge, never a
-/// lesson, so a bad state file is logged and replaced rather than stopping sync.
+/// The state file, or the default when it is missing, empty, corrupt or unreadable. The default has no
+/// `last_synced_commit`, which the cycle treats as an empty BASE: a union that deletes nothing. Losing the state costs
+/// a re-merge, never a lesson, so a bad state file is logged and replaced rather than stopping sync.
 pub fn read_state(path: &Path) -> SyncState {
     // A bad state file costs a re-merge from an empty BASE, never a lesson, so it is logged and replaced.
     read_text_or_empty(path)
@@ -271,6 +271,9 @@ mod tests {
     const SOME_COMMIT: &str = "3f2a9c1e8d7b6a5f4e3d2c1b0a9f8e7d6c5b4a39";
     const SOME_PULL_SECS: u64 = 1_762_000_000;
     const SOME_FAILURES: u32 = 3;
+    /// The published FNV-1a 64-bit test vectors (Fowler, Noll and Vo), so a change to the hash is caught.
+    const FNV1A_64_OF_A: u64 = 0xaf63_dc4c_8601_ec8c;
+    const FNV1A_64_OF_FOOBAR: u64 = 0x8594_4171_f739_67e8;
     /// What a hashed slug adds to its head: `-` and the 16 hex digits of the hash.
     const HASH_SUFFIX_BYTES: usize = 17;
 
@@ -326,8 +329,8 @@ mod tests {
     #[test]
     fn fnv1a_64_matches_the_published_test_vectors() {
         assert_eq!(fnv1a_64(b""), FNV_OFFSET_BASIS);
-        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(fnv1a_64(b"a"), FNV1A_64_OF_A);
+        assert_eq!(fnv1a_64(b"foobar"), FNV1A_64_OF_FOOBAR);
     }
 
     #[test]
@@ -360,7 +363,7 @@ mod tests {
 
     #[test]
     fn remote_slug_never_maps_two_remotes_to_one_slug() {
-        let lookalikes: [&str; 5] = ["a/b", "a_2fb", "a-b", "a.b", "a_b"];
+        let lookalikes: &[&str] = &["a/b", "a_2fb", "a-b", "a.b", "a_b"];
         let slugs: std::collections::BTreeSet<String> = lookalikes
             .iter()
             .map(|remote| remote_slug(remote))
