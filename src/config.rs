@@ -169,11 +169,18 @@ fn normalize_remote(remote: &str) -> String {
     let host_normalized: String = match trimmed_remote.split_once("://") {
         Some((scheme, after_scheme)) => {
             let (authority, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
-            format!(
-                "{}://{}/{path}",
-                scheme.to_lowercase(),
-                fn_lowercase_host(authority)
-            )
+            // `ssh://user@host/path` with no port is the same repo as scp-like `user@host:path`, so both get the scp form.
+            let is_portless_ssh: bool =
+                scheme.eq_ignore_ascii_case("ssh") && !authority.contains(':');
+            if is_portless_ssh {
+                format!("{}:{path}", fn_lowercase_host(authority))
+            } else {
+                format!(
+                    "{}://{}/{path}",
+                    scheme.to_lowercase(),
+                    fn_lowercase_host(authority)
+                )
+            }
         }
         // scp-like `git@host:path`: a ':' before any '/'. Anything else (a local path) is left as is.
         None => match trimmed_remote.split_once(':') {
@@ -264,6 +271,8 @@ pub fn load(lessons_home: &Path) -> Result<Config> {
             let expanded_config: Config =
                 with_expanded_keys(parsed_config, dirs::home_dir().as_deref());
             // Checked at load, so a bad [sync] setup fails every command at once, not only a later sync.
+            validate_sync_entries(&expanded_config.sync)
+                .with_context(|| format!("invalid [sync] in {}", config_path.display()))?;
             clone_specs(&expanded_config.sync)
                 .with_context(|| format!("invalid [sync] in {}", config_path.display()))?;
             Ok(expanded_config)
@@ -279,6 +288,31 @@ pub fn load(lessons_home: &Path) -> Result<Config> {
             Err(read_error).with_context(|| format!("cannot read {}", config_path.display()))
         }
     }
+}
+
+/// Rejects values that would misbehave later: a relative `ssh_key` (it depends on the working directory, and two
+/// spellings of one key would look like different keys) and a zero `pull_every_minutes` (a pull on every read).
+fn validate_sync_entries(sync_section: &SyncSection) -> Result<()> {
+    sync_section
+        .configured()
+        .into_iter()
+        .try_for_each(|(domain, sync_config)| {
+            match (
+                sync_config.ssh_key.is_absolute(),
+                sync_config.pull_every_minutes,
+            ) {
+                (false, _) => anyhow::bail!(
+                    "[sync.{}] ssh_key {} must be an absolute path, or start with ~/ where a home directory exists",
+                    domain.as_str(),
+                    sync_config.ssh_key.display()
+                ),
+                (true, 0) => anyhow::bail!(
+                    "[sync.{}] pull_every_minutes must be at least 1",
+                    domain.as_str()
+                ),
+                (true, _) => Ok(()),
+            }
+        })
 }
 
 /// The config with every `ssh_key` tilde-expanded, so later comparisons and ssh see real paths.
@@ -433,20 +467,21 @@ mod tests {
     #[test]
     fn sync_sections_refuse_unknown_keys_domains_and_modes_and_need_a_remote() {
         assert!(
-            load_text("[sync.work]\nremote = \"r\"\nssh_key = \"k\"\nremtoe = \"typo\"\n").is_err()
-        );
-        assert!(load_text("[sync.home]\nremote = \"r\"\nssh_key = \"k\"\n").is_err());
-        assert!(
-            load_text("[sync.work]\nremote = \"r\"\nssh_key = \"k\"\nupdate = \"ondemand\"\n")
+            load_text("[sync.work]\nremote = \"r\"\nssh_key = \"/k\"\nremtoe = \"typo\"\n")
                 .is_err()
         );
-        assert!(load_text("[sync.work]\nssh_key = \"k\"\n").is_err());
+        assert!(load_text("[sync.home]\nremote = \"r\"\nssh_key = \"/k\"\n").is_err());
+        assert!(
+            load_text("[sync.work]\nremote = \"r\"\nssh_key = \"/k\"\nupdate = \"ondemand\"\n")
+                .is_err()
+        );
+        assert!(load_text("[sync.work]\nssh_key = \"/k\"\n").is_err());
     }
 
     #[test]
     fn update_defaults_to_live_and_on_demand_parses() {
         let config: Config = load_text(
-            "[sync.work]\nremote = \"r\"\nssh_key = \"k\"\n\n[sync.shared]\nremote = \"s\"\nssh_key = \"k\"\nupdate = \"on-demand\"\n",
+            "[sync.work]\nremote = \"r\"\nssh_key = \"/k\"\n\n[sync.shared]\nremote = \"s\"\nssh_key = \"/k\"\nupdate = \"on-demand\"\n",
         )
         .unwrap();
         let work_sync: &SyncConfig = config.sync.work.as_ref().unwrap();
@@ -465,7 +500,11 @@ mod tests {
             ("git@github.com:Owner/Repo/", "git@github.com:Owner/Repo"),
             (
                 "ssh://git@GitHub.com/Owner/Repo.git",
-                "ssh://git@github.com/Owner/Repo",
+                "git@github.com:Owner/Repo",
+            ),
+            (
+                "ssh://git@GitHub.com:2222/Owner/Repo.git",
+                "ssh://git@github.com:2222/Owner/Repo",
             ),
             (
                 "HTTPS://GitHub.com/Owner/Repo.git/",
@@ -486,6 +525,39 @@ mod tests {
                     "for {written_remote:?}"
                 );
             });
+    }
+
+    #[test]
+    fn an_ssh_url_and_the_scp_form_of_one_repo_share_a_clone() {
+        let sync_section = SyncSection {
+            work: None,
+            personal: Some(sync_entry(
+                "ssh://git@github.com/owner/repo.git",
+                "/keys/one",
+            )),
+            shared: Some(sync_entry("git@github.com:owner/repo.git", "/keys/one")),
+        };
+        assert_eq!(clone_specs(&sync_section).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_relative_ssh_key_and_a_zero_pull_interval_are_refused() {
+        let relative_key_error: String = format!(
+            "{:#}",
+            load_text(
+                "[sync.work]\nremote = \"git@github.com:owner/repo.git\"\nssh_key = \"keys/work\"\n"
+            )
+            .unwrap_err()
+        );
+        assert!(
+            relative_key_error.contains("absolute path"),
+            "{relative_key_error}"
+        );
+        let zero_pull_error: String = format!(
+            "{:#}",
+            load_text("[sync.work]\nremote = \"git@github.com:owner/repo.git\"\nssh_key = \"/k\"\npull_every_minutes = 0\n").unwrap_err()
+        );
+        assert!(zero_pull_error.contains("at least 1"), "{zero_pull_error}");
     }
 
     #[test]
