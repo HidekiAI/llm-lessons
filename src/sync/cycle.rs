@@ -2,8 +2,11 @@
 //! retry rule, which commit is remembered, and which domains a run covers. Every function here is pure; the cycle that
 //! calls them, with the lock, the database transaction and git, is S4c-2.
 
+use std::process::ExitCode;
+
 use anyhow::{Result, bail};
 
+use super::files::{SyncState, lessons_file_name, queue_file_name, to_jsonl};
 use super::git::PushOutcome;
 use super::{Conflict, GroupKey, group_key, merge_lessons, merge_queue, settle_queue};
 use crate::db::Domain;
@@ -143,6 +146,102 @@ pub fn domains_to_sync(clone_domains: &[Domain], requested: Option<Domain>) -> R
             .filter(|names| !names.is_empty())
             .unwrap_or_else(|| "none".to_string())
         ),
+    }
+}
+
+/// BASE (or THEIRS) as text, and whether the commit it came from could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseText {
+    pub text: String,
+    /// True when the commit itself was unreadable: the cycle logs it with the commit id and goes on from an empty BASE.
+    pub unreadable_commit: bool,
+}
+
+/// The text a file at a past commit stands for. Only a readable file has content: a file missing at a good commit is a
+/// domain's first sync, and an unreadable commit is a union from an empty BASE; neither is ever an error.
+pub fn base_from_shown(shown: Shown) -> BaseText {
+    // An unreadable commit must be flagged, not hidden, so the cycle can log it; the text is empty either way.
+    let unreadable_commit: bool = matches!(shown, Shown::UnreadableCommit);
+    let text: String = match shown {
+        Shown::Content(text) => text,
+        Shown::MissingFile | Shown::UnreadableCommit => String::new(),
+    };
+    BaseText {
+        text,
+        unreadable_commit,
+    }
+}
+
+/// One file of the clone: its name inside the clone, and its text, or `None` when it must not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneFile {
+    pub name: String,
+    pub contents: Option<String>,
+}
+
+/// The files one domain commits: `<domain>.jsonl` always (sorted by id, empty when there are no lessons), and
+/// `<domain>.conflicts.jsonl` only while the queue is non-empty, so a resolved queue removes the committed copy.
+pub fn planned_clone_files(domain: Domain, plan: &DomainPlan) -> Result<Vec<CloneFile>> {
+    // An empty queue is None, not an empty file: the repository then holds no trace of a queue that no longer exists.
+    let lessons_text: String = to_jsonl(&plan.merged, |lesson| lesson.id.clone())?;
+    let queue_jsonl: String = to_jsonl(&plan.queue, group_key)?;
+    let queue_text: Option<String> = (!queue_jsonl.is_empty()).then_some(queue_jsonl);
+    Ok(vec![
+        CloneFile {
+            name: lessons_file_name(domain),
+            contents: Some(lessons_text),
+        },
+        CloneFile {
+            name: queue_file_name(domain),
+            contents: queue_text,
+        },
+    ])
+}
+
+/// How one cycle ended, for the state file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CycleResult {
+    /// The cycle completed; `last_synced` is what `new_last_synced` decided.
+    Succeeded {
+        last_synced: Option<String>,
+    },
+    Failed,
+}
+
+/// The state file after a cycle: a success resets the failures and records the pull time and the new BASE commit; a
+/// failure counts one more and changes nothing else, so the next cycle merges against the same BASE.
+pub fn state_after_cycle(state: SyncState, result: CycleResult, now_secs: u64) -> SyncState {
+    // A success names every field, so a field added later fails to compile here and forces a decision; a failure
+    // changes one field and keeps the rest.
+    match result {
+        CycleResult::Succeeded { last_synced } => SyncState {
+            last_synced_commit: last_synced,
+            last_pull_unix_secs: Some(now_secs),
+            consecutive_failures: 0,
+        },
+        CycleResult::Failed => SyncState {
+            consecutive_failures: state.consecutive_failures.saturating_add(1),
+            ..state
+        },
+    }
+}
+
+/// How `lessons sync` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleOutcome {
+    Synced,
+    /// Another sync of this clone holds the lock: nothing to do, and not a failure.
+    LockHeld,
+    Failed,
+}
+
+/// The exit code of `lessons sync`: a finished sync and a held lock are both success, because a background sync that
+/// finds another one running has nothing to report; only a failed cycle is a failure.
+pub fn exit_for(outcome: CycleOutcome) -> ExitCode {
+    // The held lock is a success on purpose: a script or a hook that starts a sync must not see an error for it.
+    match outcome {
+        CycleOutcome::Synced | CycleOutcome::LockHeld => ExitCode::SUCCESS,
+        CycleOutcome::Failed => ExitCode::FAILURE,
     }
 }
 
@@ -438,6 +537,169 @@ mod tests {
         assert!(plan.queue.is_empty());
         assert_eq!(plan.unqueued.len(), 1);
         assert_eq!(plan.merged[0].superseded_by.as_deref(), Some("01KOURS"));
+    }
+
+    #[test]
+    fn base_from_shown_is_empty_unless_the_file_has_content_and_flags_only_an_unreadable_commit() {
+        assert_eq!(
+            base_from_shown(Shown::Content("{}\n".to_string())),
+            BaseText {
+                text: "{}\n".to_string(),
+                unreadable_commit: false
+            }
+        );
+        assert_eq!(
+            base_from_shown(Shown::MissingFile),
+            BaseText {
+                text: String::new(),
+                unreadable_commit: false
+            },
+            "a domain's first sync is normal"
+        );
+        assert_eq!(
+            base_from_shown(Shown::UnreadableCommit),
+            BaseText {
+                text: String::new(),
+                unreadable_commit: true
+            }
+        );
+    }
+
+    fn plan_with(merged: Vec<Lesson>, queue: Vec<Conflict>) -> DomainPlan {
+        DomainPlan {
+            merged,
+            queue,
+            cleared: Vec::new(),
+            unqueued: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_clone_files_are_sorted_and_a_resolved_queue_is_removed() {
+        let plan = plan_with(
+            vec![
+                lesson_row(ID_B, EARLY, "two"),
+                lesson_row(ID_A, EARLY, "one"),
+            ],
+            vec![
+                conflict_group(ID_B, &[("x", EARLY), ("y", MIDDLE)]),
+                conflict_group(ID_A, &[("p", EARLY), ("q", LATE)]),
+            ],
+        );
+        let files = planned_clone_files(Domain::Work, &plan).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work.jsonl", "work.conflicts.jsonl"]
+        );
+        let lesson_ids: Vec<String> = crate::sync::files::from_jsonl(
+            files[0].contents.as_deref().unwrap(),
+            |row: &Lesson| row.id.clone(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+        assert_eq!(
+            lesson_ids,
+            vec![ID_A, ID_B],
+            "sorted by id whatever the input order"
+        );
+        let queue_ids: Vec<String> = files[1]
+            .contents
+            .as_deref()
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Conflict>(line).unwrap().id)
+            .collect();
+        assert_eq!(queue_ids, vec![ID_A, ID_B], "the queue is sorted too");
+
+        let resolved =
+            planned_clone_files(Domain::Work, &plan_with(plan.merged.clone(), Vec::new())).unwrap();
+        assert_eq!(
+            resolved[1],
+            CloneFile {
+                name: "work.conflicts.jsonl".to_string(),
+                contents: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_domain_without_lessons_still_gets_an_empty_lessons_file() {
+        let files =
+            planned_clone_files(Domain::Shared, &plan_with(Vec::new(), Vec::new())).unwrap();
+        assert_eq!(
+            files[0],
+            CloneFile {
+                name: "shared.jsonl".to_string(),
+                contents: Some(String::new())
+            }
+        );
+        assert_eq!(files[1].contents, None);
+    }
+
+    #[test]
+    fn state_after_cycle_resets_on_success_and_counts_on_failure() {
+        const SOME_NOW: u64 = 1_762_000_000;
+        const EARLIER: u64 = 1_761_000_000;
+        const SOME_FAILURES: u32 = 4;
+        let before = SyncState {
+            last_synced_commit: Some("old".to_string()),
+            last_pull_unix_secs: Some(EARLIER),
+            consecutive_failures: SOME_FAILURES,
+        };
+        assert_eq!(
+            state_after_cycle(
+                before.clone(),
+                CycleResult::Succeeded {
+                    last_synced: Some("new".to_string())
+                },
+                SOME_NOW
+            ),
+            SyncState {
+                last_synced_commit: Some("new".to_string()),
+                last_pull_unix_secs: Some(SOME_NOW),
+                consecutive_failures: 0
+            }
+        );
+        assert_eq!(
+            state_after_cycle(before.clone(), CycleResult::Failed, SOME_NOW),
+            SyncState {
+                consecutive_failures: SOME_FAILURES + 1,
+                ..before.clone()
+            },
+            "a failure keeps the BASE commit and the last pull time"
+        );
+        let saturated = SyncState {
+            consecutive_failures: u32::MAX,
+            ..before
+        };
+        assert_eq!(
+            state_after_cycle(saturated, CycleResult::Failed, SOME_NOW).consecutive_failures,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn only_a_failed_cycle_exits_with_failure() {
+        let fn_code = |outcome: CycleOutcome| format!("{:?}", exit_for(outcome));
+        assert_eq!(
+            fn_code(CycleOutcome::Synced),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            fn_code(CycleOutcome::LockHeld),
+            format!("{:?}", ExitCode::SUCCESS),
+            "a held lock is not an error"
+        );
+        assert_eq!(
+            fn_code(CycleOutcome::Failed),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+        assert_ne!(fn_code(CycleOutcome::Failed), fn_code(CycleOutcome::Synced));
     }
 
     #[test]
