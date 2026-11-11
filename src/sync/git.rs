@@ -65,7 +65,8 @@ pub fn classify_push(exit_ok: bool, stderr: &str) -> PushOutcome {
 /// The URL schemes git accepts for ssh.
 const SSH_SCHEMES: &[&str] = &["ssh", "git+ssh", "ssh+git"];
 
-/// `C` in `C:\repo`: a Windows drive, not a host (no real host name is a single letter).
+/// `C` in `C:\repo`: a Windows drive, not a host. So an ssh alias named with a single letter (`a:path`) is read as a
+/// path and gets no key or agent setup; name the host with its real host name, as the config sample asks.
 fn is_drive_letter(text: &str) -> bool {
     text.len() == 1 && text.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
@@ -127,21 +128,24 @@ pub fn ssh_command(key: &Path, identity_agent: Option<&str>) -> String {
 }
 
 /// `text` with the user and password of any `scheme://user:password@host` removed, so a remote that carries a token
-/// never reaches the journal or an error message.
+/// never reaches the journal or an error message. The authority ends at the first `/`, `?`, `#` or whitespace, and
+/// everything up to its LAST `@` is the credentials, so a password that holds an `@` is removed whole. A password
+/// that holds an unencoded `/` or space is not a valid URL (git wants those percent-encoded) and is not recognised.
 pub fn redact_credentials(text: &str) -> String {
     text.split("://")
         .enumerate()
-        .map(
-            |(part_index, part)| match (part_index, part.split_once('@')) {
-                (0, _) => part.to_string(),
-                // The credentials end at the first `@` that comes before any `/` (a path or a space may follow the
-                // host).
-                (_, Some((credentials, rest))) if !credentials.contains(['/', ' ']) => {
-                    rest.to_string()
-                }
-                _ => part.to_string(),
-            },
-        )
+        .map(|(part_index, part)| {
+            let authority_end: usize = part
+                .find(|character: char| {
+                    matches!(character, '/' | '?' | '#') || character.is_whitespace()
+                })
+                .unwrap_or(part.len());
+            let (authority, rest) = part.split_at(authority_end);
+            match (part_index, authority.rsplit_once('@')) {
+                (0, _) | (_, None) => part.to_string(),
+                (_, Some((_credentials, host))) => format!("{host}{rest}"),
+            }
+        })
         .collect::<Vec<String>>()
         .join("://")
 }
@@ -197,6 +201,10 @@ impl GitRunner {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_SSH_COMMAND", &self.ssh_command)
             .env("GIT_ASKPASS", "") // an askpass helper would prompt; sync never does
+            // classify_push reads git's English messages, so a localized git must not translate them.
+            .env("LC_ALL", "C")
+            .env_remove("GIT_DIR") // a hook-launched process could point git at another repository
+            .env_remove("GIT_WORK_TREE")
             .envs(self.extra_env.iter().map(|(name, value)| (name, value)))
             .output()
             .with_context(|| {
@@ -607,13 +615,13 @@ mod tests {
         let seen: String = runner
             .run_checked(&[
                 "-c",
-                "alias.showenv=!echo \"$GIT_TERMINAL_PROMPT|$GIT_SSH_COMMAND|${GIT_ASKPASS-unset}|\"",
+                "alias.showenv=!echo \"$GIT_TERMINAL_PROMPT|$GIT_SSH_COMMAND|${GIT_ASKPASS-unset}|$LC_ALL\"",
                 "showenv",
             ])
             .unwrap();
         assert_eq!(
             seen,
-            format!("0|{}||\n", ssh_command(Path::new(SOME_KEY), None))
+            format!("0|{}||C\n", ssh_command(Path::new(SOME_KEY), None))
         );
     }
 
@@ -640,6 +648,25 @@ mod tests {
             "an @ after the first slash is not a credential"
         );
         assert_eq!(redact_credentials(""), "");
+        assert_eq!(
+            redact_credentials("https://a:p@ss@h.example/x"),
+            "https://h.example/x",
+            "a password that holds an @ is removed whole"
+        );
+        assert_eq!(
+            redact_credentials("https://a:p%2Fw%20x%40y@h.example/x"),
+            "https://h.example/x",
+            "a percent-encoded password, which is what git expects"
+        );
+        assert_eq!(
+            redact_credentials("https://h.example?mail=a@b.example"),
+            "https://h.example?mail=a@b.example",
+            "an @ after a ? is not a credential, and the host stays"
+        );
+        assert_eq!(
+            redact_credentials("one https://a:b@h1.example/x two ssh://c@h2.example/y"),
+            "one https://h1.example/x two ssh://h2.example/y"
+        );
     }
 
     #[test]
@@ -670,6 +697,11 @@ mod tests {
             "a drive letter is not a host"
         );
         assert_eq!(ssh_host_of("c:/repos/r.git"), None);
+        assert_eq!(
+            ssh_host_of("a:path"),
+            None,
+            "a one-letter host is taken for a drive: documented limit"
+        );
     }
 
     #[test]
