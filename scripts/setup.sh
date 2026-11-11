@@ -167,38 +167,50 @@ normalized_remote() {
 
 # Prints `key`'s value from the [sync.<domain>] section of `config_path` (the text between the
 # first and last double quote), or nothing when the file, the section or the key is missing.
+# Prints the lines of [sync.<domain>] in `config_path`, header first, CR line endings removed; nothing
+# when it is missing. A header still matches with surrounding spaces or a trailing # comment.
+sync_section_lines() {
+    local config_path="$1" domain_name="$2"
+    [[ -f "$config_path" ]] || return 0
+    awk -v section="[sync.$domain_name]" '
+        { sub(/\r$/, "") }
+        /^[ \t]*\[/ {
+            header = $0
+            sub(/[ \t]*#.*$/, "", header); sub(/^[ \t]+/, "", header); sub(/[ \t]+$/, "", header)
+            in_section = (header == section)
+        }
+        in_section { print }' "$config_path"
+}
+
 existing_sync_value() {
     local config_path="$1" domain_name="$2" key_name="$3"
-    [[ -f "$config_path" ]] || return 0
     # Reads a "basic" string (only \\ and \" decoded; any other escape prints nothing) or a 'literal'
     # one; whatever follows the value, such as a comment, is ignored. Anything else prints nothing.
-    awk -v section="[sync.$domain_name]" -v key="$key_name" -v squote="'" '
-        function fn_trimmed(text) { sub(/^[ \t]+/, "", text); sub(/[ \t]+$/, "", text); return text }
-        fn_trimmed($0) == section { in_section = 1; next }
-        /^[ \t]*\[/ { in_section = 0 }
-        in_section && match($0, "^[ \t]*" key "[ \t]*=[ \t]*") {
+    # It reads to the end instead of `exit`: closing the pipe early could fail the writer under pipefail.
+    sync_section_lines "$config_path" "$domain_name" | awk -v key="$key_name" -v squote="'" '
+        !value_done && NR > 1 && match($0, "^[ \t]*" key "[ \t]*=[ \t]*") {
             rest = substr($0, RLENGTH + 1)
-            if (match(rest, "^" squote "[^" squote "]*" squote)) { print substr(rest, 2, RLENGTH - 2); exit }
-            if (!match(rest, /^"([^"\\]|\\.)*"/)) exit
+            if (match(rest, "^" squote "[^" squote "]*" squote)) { print substr(rest, 2, RLENGTH - 2); value_done = 1; next }
+            if (!match(rest, /^"([^"\\]|\\.)*"/)) { value_done = 1; next }
             decoded = ""
             for (char_pos = 2; char_pos < RLENGTH; char_pos++) {
                 current_char = substr(rest, char_pos, 1)
                 if (current_char == "\\") {
                     char_pos++
                     current_char = substr(rest, char_pos, 1)
-                    if (current_char != "\\" && current_char != "\"") exit
+                    if (current_char != "\\" && current_char != "\"") { value_done = 1; next }
                 }
                 decoded = decoded current_char
             }
             print decoded
-            exit
-        }' "$config_path"
+            value_done = 1
+        }'
 }
 
 # True when `config_path` has a [sync.<domain>] header, even one whose values cannot be read.
 has_sync_section() {
     local config_path="$1" domain_name="$2"
-    [[ -f "$config_path" ]] && grep -qxF "[sync.$domain_name]" "$config_path"
+    [[ -n "$(sync_section_lines "$config_path" "$domain_name")" ]]
 }
 
 # True for a whole number of minutes, 1 or more, short enough for a bash and a u64 integer.
@@ -305,16 +317,18 @@ decide_sync_sections() {
 # one is shown, never edited). An existing file is backed up first; its path is printed on stdout
 # ("none" when there was no file). Under --dry-run it only logs what it would write.
 append_sync_sections() {
-    local config_path="$1" sections_text="$2" backup_path="none" section_name
+    local config_path="$1" sections_text="$2" backup_path="none" section_name section_domain
     local new_text="" current_section="" section_line kept_or_added=""
     while IFS= read -r section_line; do
         case "$section_line" in
             '[sync.'*']')
                 section_name="$section_line"
-                if [[ -f "$config_path" ]] && grep -qxF "$section_name" "$config_path"; then
+                section_domain="${section_name#\[sync.}" # [sync.work] -> work
+                section_domain="${section_domain%\]}"
+                if has_sync_section "$config_path" "$section_domain"; then
                     kept_or_added="kept"
                     log_step "sync: $config_path already has $section_name; it is left as it is:"
-                    sed -n "/^$(printf '%s' "$section_name" | sed 's/[][.]/\\&/g')\$/,/^\[/p" "$config_path" | sed '$ { /^\[/d; }' | tee -a "$LOG_FILE" >&2
+                    sync_section_lines "$config_path" "$section_domain" | tee -a "$LOG_FILE" >&2
                 else
                     kept_or_added="added"
                 fi
@@ -584,7 +598,7 @@ run_sync_self_test() {
     fn_refused() { # expected error text, then setup.sh arguments; "refused" only for exit 2 with that text
         local expected_error="$1" exit_code=0 error_text
         shift
-        error_text="$(XDG_STATE_HOME="$test_root/refused-state" LESSONS_HOME="$test_root/refused-home" \
+        error_text="$(HOME="$test_root/refused-home" XDG_STATE_HOME="$test_root/refused-state" LESSONS_HOME="$test_root/refused-home" \
             bash "${BASH_SOURCE[0]}" --domains work --dry-run "$@" 2>&1 >/dev/null </dev/null)" || exit_code=$?
         [[ "$exit_code" -eq "$EXIT_USAGE" && "$error_text" == *"$expected_error"* ]] && printf 'refused' || printf 'ran'
     }
@@ -602,6 +616,14 @@ run_sync_self_test() {
     check_equal "existing values: any spacing, comments ignored, literal and basic strings decoded, other escapes unread" \
         'git@github.com:o/tight|C:\lit|git@github.com:o/r|C:\keys\a"b||' \
         "$(existing_sync_value "$test_root/values.toml" work remote)|$(existing_sync_value "$test_root/values.toml" work ssh_key)|$(existing_sync_value "$test_root/values.toml" shared remote)|$(existing_sync_value "$test_root/values.toml" shared ssh_key)|$(existing_sync_value "$test_root/values.toml" personal ssh_key)|$(existing_sync_value "$test_root/values.toml" personal remote)"
+
+    printf '[sync.workx]\nremote = "x"\n[sync.work]   \nremote = "spaced"\nremote = "duplicate"\n  [sync.shared] # note\nremote = "commented"\r\n[sync.personal]\r\nremote = "crlf"\r\n' > "$test_root/headers.toml"
+    fn_section_state() { # domain; prints "<found|missing>:<remote>"
+        has_sync_section "$test_root/headers.toml" "$1" && printf 'found' || printf 'missing'
+        printf ':%s' "$(existing_sync_value "$test_root/headers.toml" "$1" remote)"
+    }
+    check_equal "headers match with trailing spaces, a comment or CRLF, and never by prefix" \
+        "found:spaced found:commented found:crlf" "$(fn_section_state work) $(fn_section_state shared) $(fn_section_state personal)"
 
     if [[ -x "$lessons_binary" ]]; then
         mkdir -p "$test_root/restored"
