@@ -25,6 +25,8 @@ readonly EXIT_FAILURE=1
 readonly KNOWN_UPDATE_MODES="live on-demand"
 readonly DEFAULT_UPDATE_MODE="live"
 readonly DEFAULT_PULL_EVERY_MINUTES=10
+# 18 digits always fit a bash integer (signed 64-bit) and the config's u64.
+readonly MAX_MINUTES_DIGITS=18
 # The usage text is the comment block at the top of this file, lines 2 to 11.
 readonly USAGE_FIRST_LINE=2
 readonly USAGE_LAST_LINE=11
@@ -116,39 +118,50 @@ sync_section_text() {
         "$domain_name" "$(toml_string "$remote_url")" "$(toml_string "$ssh_key")" "$(toml_string "$update_mode")" "$pull_minutes"
 }
 
+lower_text() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# `user@host` or `host`, with only the host part lower-cased: a user name is case-sensitive.
+lower_host() {
+    local authority="$1"
+    case "$authority" in
+        *@*) printf '%s@%s' "${authority%@*}" "$(lower_text "${authority##*@}")" ;;
+        *) lower_text "$authority" ;;
+    esac
+}
+
+trim_trailing_slashes() {
+    local trimmed_text="$1"
+    while [[ "$trimmed_text" == */ ]]; do trimmed_text="${trimmed_text%/}"; done
+    printf '%s' "$trimmed_text"
+}
+
 # A remote in the form the lessons config compares remotes in (src/config.rs normalize_remote):
 # host lower-cased, a trailing / and .git removed, a portless ssh:// URL written in the scp form.
 normalized_remote() {
-    local remote_url="$1" scheme_part after_scheme authority path_part user_part host_part
+    local remote_url="$1" scheme_part after_scheme authority path_part
     remote_url="${remote_url#"${remote_url%%[![:space:]]*}"}" # trim leading space
     remote_url="${remote_url%"${remote_url##*[![:space:]]}"}" # trim trailing space
-    fn_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-    fn_lower_host() { # user@host or host: only the host part is case-insensitive
-        case "$1" in
-            *@*) user_part="${1%@*}"; host_part="${1##*@}"; printf '%s@%s' "$user_part" "$(fn_lower "$host_part")" ;;
-            *) fn_lower "$1" ;;
-        esac
-    }
     case "$remote_url" in
         *://*)
-            scheme_part="$(fn_lower "${remote_url%%://*}")"
+            scheme_part="$(lower_text "${remote_url%%://*}")"
             after_scheme="${remote_url#*://}"
             authority="${after_scheme%%/*}"
             path_part="${after_scheme#"$authority"}"
             path_part="${path_part#/}"
             if [[ "$scheme_part" == ssh && "$authority" != *:* ]]; then
-                remote_url="$(fn_lower_host "$authority"):$path_part"
+                remote_url="$(lower_host "$authority"):$path_part"
             else
-                remote_url="$scheme_part://$(fn_lower_host "$authority")/$path_part"
+                remote_url="$scheme_part://$(lower_host "$authority")/$path_part"
             fi
             ;;
         *:*) # scp-like user@host:path when no / comes before the first :, else a local path, left as it is
-            [[ "${remote_url%%:*}" == */* ]] || remote_url="$(fn_lower_host "${remote_url%%:*}"):${remote_url#*:}"
+            [[ "${remote_url%%:*}" == */* ]] || remote_url="$(lower_host "${remote_url%%:*}"):${remote_url#*:}"
             ;;
     esac
-    fn_trim_slashes() { local trimmed_text="$1"; while [[ "$trimmed_text" == */ ]]; do trimmed_text="${trimmed_text%/}"; done; printf '%s' "$trimmed_text"; }
-    remote_url="$(fn_trim_slashes "$remote_url")"
-    fn_trim_slashes "${remote_url%.git}"
+    remote_url="$(trim_trailing_slashes "$remote_url")"
+    trim_trailing_slashes "${remote_url%.git}"
     printf '\n'
 }
 
@@ -157,17 +170,47 @@ normalized_remote() {
 existing_sync_value() {
     local config_path="$1" domain_name="$2" key_name="$3"
     [[ -f "$config_path" ]] || return 0
-    awk -v section="[sync.$domain_name]" -v key="$key_name" '
-        $0 == section { in_section = 1; next }
-        /^\[/ { in_section = 0 }
-        in_section && $1 == key && $2 == "=" {
-            value = $0; sub(/^[^"]*"/, "", value); sub(/"[^"]*$/, "", value); print value; exit
+    # Reads a "basic" string (only \\ and \" decoded; any other escape prints nothing) or a 'literal'
+    # one; whatever follows the value, such as a comment, is ignored. Anything else prints nothing.
+    awk -v section="[sync.$domain_name]" -v key="$key_name" -v squote="'" '
+        function fn_trimmed(text) { sub(/^[ \t]+/, "", text); sub(/[ \t]+$/, "", text); return text }
+        fn_trimmed($0) == section { in_section = 1; next }
+        /^[ \t]*\[/ { in_section = 0 }
+        in_section && match($0, "^[ \t]*" key "[ \t]*=[ \t]*") {
+            rest = substr($0, RLENGTH + 1)
+            if (match(rest, "^" squote "[^" squote "]*" squote)) { print substr(rest, 2, RLENGTH - 2); exit }
+            if (!match(rest, /^"([^"\\]|\\.)*"/)) exit
+            decoded = ""
+            for (char_pos = 2; char_pos < RLENGTH; char_pos++) {
+                current_char = substr(rest, char_pos, 1)
+                if (current_char == "\\") {
+                    char_pos++
+                    current_char = substr(rest, char_pos, 1)
+                    if (current_char != "\\" && current_char != "\"") exit
+                }
+                decoded = decoded current_char
+            }
+            print decoded
+            exit
         }' "$config_path"
 }
 
-# True for a whole number of minutes, 1 or more.
+# True when `config_path` has a [sync.<domain>] header, even one whose values cannot be read.
+has_sync_section() {
+    local config_path="$1" domain_name="$2"
+    [[ -f "$config_path" ]] && grep -qxF "[sync.$domain_name]" "$config_path"
+}
+
+# True for a whole number of minutes, 1 or more, short enough for a bash and a u64 integer.
 is_valid_minutes() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+    [[ "$1" =~ ^[1-9][0-9]*$ && ${#1} -le $MAX_MINUTES_DIGITS ]]
+}
+
+is_known_update_mode() {
+    case " $KNOWN_UPDATE_MODES " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # Checks the sync flags before anything runs, so a bad combination has no side effects.
@@ -177,14 +220,12 @@ validate_sync_flags() {
         printf 'setup: --remote needs --ssh-key\n' >&2
         return 1
     fi
-    if [[ -n "$flag_mode" ]]; then
-        case " $KNOWN_UPDATE_MODES " in
-            *" $flag_mode "*) ;;
-            *) printf 'setup: unknown --update "%s"; expected one of: %s\n' "$flag_mode" "$KNOWN_UPDATE_MODES" >&2; return 1 ;;
-        esac
+    if [[ -n "$flag_mode" ]] && ! is_known_update_mode "$flag_mode"; then
+        printf 'setup: unknown --update "%s"; expected one of: %s\n' "$flag_mode" "$KNOWN_UPDATE_MODES" >&2
+        return 1
     fi
     if [[ -n "$flag_minutes" ]] && ! is_valid_minutes "$flag_minutes"; then
-        printf 'setup: --pull-every-minutes must be a whole number of 1 or more, not "%s"\n' "$flag_minutes" >&2
+        printf 'setup: --pull-every-minutes must be a whole number of 1 or more (at most %s digits), not "%s"\n' "$MAX_MINUTES_DIGITS" "$flag_minutes" >&2
         return 1
     fi
 }
@@ -201,12 +242,14 @@ decide_sync_sections() {
     local -a seen_remotes=() seen_keys=()
     local ssh_dir="${LESSONS_SETUP_SSH_DIR:-$HOME/.ssh}"
     for domain_name in "$@"; do
-        existing_remote="$(existing_sync_value "$config_path" "$domain_name" remote)"
-        if [[ -n "$existing_remote" ]]; then
-            log_step "sync: $config_path already has [sync.$domain_name] for $existing_remote; it is kept as it is"
-            seen_remotes+=("$(normalized_remote "$existing_remote")")
-            seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
-            previous_remote="$existing_remote"
+        if has_sync_section "$config_path" "$domain_name"; then
+            existing_remote="$(existing_sync_value "$config_path" "$domain_name" remote)"
+            log_step "sync: $config_path already has [sync.$domain_name] for ${existing_remote:-a remote this script cannot read}; it is kept as it is"
+            if [[ -n "$existing_remote" ]]; then # an unreadable remote lends nothing: a later domain is asked for its key
+                seen_remotes+=("$(normalized_remote "$existing_remote")")
+                seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
+                previous_remote="$existing_remote"
+            fi
             continue
         fi
         if [[ -n "$flag_remote" ]]; then
@@ -239,16 +282,17 @@ decide_sync_sections() {
             update_mode="${flag_mode:-$DEFAULT_UPDATE_MODE}"
             pull_minutes="${flag_minutes:-$DEFAULT_PULL_EVERY_MINUTES}"
         else
+            # Asked again until valid; at end of input `ask` gives the default, which is valid, so this ends.
             update_mode="$(ask "Update mode for $domain_name ($KNOWN_UPDATE_MODES)" "${flag_mode:-$DEFAULT_UPDATE_MODE}")"
+            until is_known_update_mode "$update_mode"; do
+                printf 'setup: unknown update mode "%s"; expected one of: %s\n' "$update_mode" "$KNOWN_UPDATE_MODES" >&2
+                update_mode="$(ask "Update mode for $domain_name ($KNOWN_UPDATE_MODES)" "${flag_mode:-$DEFAULT_UPDATE_MODE}")"
+            done
             pull_minutes="$(ask "Pull at most every N minutes for $domain_name" "${flag_minutes:-$DEFAULT_PULL_EVERY_MINUTES}")"
-        fi
-        case " $KNOWN_UPDATE_MODES " in
-            *" $update_mode "*) ;;
-            *) printf 'setup: unknown update mode "%s"; expected one of: %s\n' "$update_mode" "$KNOWN_UPDATE_MODES" >&2; return 1 ;;
-        esac
-        if ! is_valid_minutes "$pull_minutes"; then
-            printf 'setup: pull every N minutes must be a whole number of 1 or more, not "%s"\n' "$pull_minutes" >&2
-            return 1
+            until is_valid_minutes "$pull_minutes"; do
+                printf 'setup: pull every N minutes must be a whole number of 1 or more (at most %s digits), not "%s"\n' "$MAX_MINUTES_DIGITS" "$pull_minutes" >&2
+                pull_minutes="$(ask "Pull at most every N minutes for $domain_name" "${flag_minutes:-$DEFAULT_PULL_EVERY_MINUTES}")"
+            done
         fi
         seen_remotes+=("$(normalized_remote "$remote_url")")
         seen_keys+=("$ssh_key")
@@ -536,19 +580,28 @@ run_sync_self_test() {
     check_equal "--dry-run writes no config" "no file" \
         "$([[ -e "$test_root/dry-run/config.toml" ]] && echo file || echo 'no file')"
 
-    fn_refused() { # setup.sh arguments; prints the exit code, or "ran" when it got past validation
-        local exit_code=0
-        bash "${BASH_SOURCE[0]}" --domains work --dry-run "$@" >/dev/null 2>&1 </dev/null || exit_code=$?
-        [[ "$exit_code" -eq "$EXIT_USAGE" ]] && printf 'refused' || printf 'ran'
+    mkdir -p "$test_root/refused-state" "$test_root/refused-home"
+    fn_refused() { # expected error text, then setup.sh arguments; "refused" only for exit 2 with that text
+        local expected_error="$1" exit_code=0 error_text
+        shift
+        error_text="$(XDG_STATE_HOME="$test_root/refused-state" LESSONS_HOME="$test_root/refused-home" \
+            bash "${BASH_SOURCE[0]}" --domains work --dry-run "$@" 2>&1 >/dev/null </dev/null)" || exit_code=$?
+        [[ "$exit_code" -eq "$EXIT_USAGE" && "$error_text" == *"$expected_error"* ]] && printf 'refused' || printf 'ran'
     }
-    check_equal "bad sync flags are refused before any step runs" "refused refused refused refused" \
-        "$(fn_refused --remote "$SYNC_TEST_REMOTE") $(fn_refused --remote "$SYNC_TEST_REMOTE" --ssh-key /k --update hourly) $(fn_refused --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes 0) $(fn_refused --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes ten)"
+    check_equal "bad sync flags are refused before any step runs" "refused refused refused refused refused" \
+        "$(fn_refused 'needs --ssh-key' --remote "$SYNC_TEST_REMOTE") $(fn_refused 'unknown --update' --remote "$SYNC_TEST_REMOTE" --ssh-key /k --update hourly) $(fn_refused 'whole number' --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes 0) $(fn_refused 'whole number' --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes ten) $(fn_refused 'whole number' --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes 9999999999999999999)"
 
-    mkdir -p "$test_root/bad-minutes"
-    prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' 0 | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
-        configure_sync "$lessons_binary" "$test_root/bad-minutes" "" "" "" "" work 2>&1 >/dev/null || true)"
-    check_equal "a typed 0 minutes is refused by the script and nothing is written" "1 no file" \
-        "$(grep -c 'must be a whole number' <<< "$prompt_text") $([[ -e "$test_root/bad-minutes/config.toml" ]] && echo file || echo 'no file')"
+    mkdir -p "$test_root/bad-answers"
+    prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main hourly on-demand 0 7 | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
+        configure_sync "$lessons_binary" "$test_root/bad-answers" "" "" "" "" work 2>&1 >/dev/null || true)"
+    check_equal "a bad typed mode or minutes is asked again" "1 1 1 1" \
+        "$(grep -c 'unknown update mode "hourly"' <<< "$prompt_text") $(grep -c 'not "0"' <<< "$prompt_text") $(grep -cxF 'update = "on-demand"' "$test_root/bad-answers/config.toml" 2>/dev/null) $(grep -cxF 'pull_every_minutes = 7' "$test_root/bad-answers/config.toml" 2>/dev/null)"
+
+    printf '%s\n' '[sync.work]' 'remote="git@github.com:o/tight"' "ssh_key = 'C:\\lit'  # 'note'" '[sync.shared]' \
+        'remote = "git@github.com:o/r" # "note"' 'ssh_key = "C:\\keys\\a\"b"' '[sync.personal]' 'ssh_key = "a\tb"' > "$test_root/values.toml"
+    check_equal "existing values: any spacing, comments ignored, literal and basic strings decoded, other escapes unread" \
+        'git@github.com:o/tight|C:\lit|git@github.com:o/r|C:\keys\a"b||' \
+        "$(existing_sync_value "$test_root/values.toml" work remote)|$(existing_sync_value "$test_root/values.toml" work ssh_key)|$(existing_sync_value "$test_root/values.toml" shared remote)|$(existing_sync_value "$test_root/values.toml" shared ssh_key)|$(existing_sync_value "$test_root/values.toml" personal ssh_key)|$(existing_sync_value "$test_root/values.toml" personal remote)"
 
     if [[ -x "$lessons_binary" ]]; then
         mkdir -p "$test_root/restored"
