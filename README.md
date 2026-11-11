@@ -1,5 +1,11 @@
 # llm-lessons
+> "...my sympathy got the better of my judgment, and I said: 'Isn't it a shame that with the tremendous amount of work you have done you haven't been able to get any results?' Edison turned on me like a flash, and with a smile replied: 'Results! Why, man, I have gotten a lot of results! I know several thousand things that won't work.'"
+>
+> Walter S. Mallory, quoted in Frank Lewis Dyer and Thomas Commerford Martin, *Edison: His Life and Inventions*, Vol. 2, Ch. 24 "Edison's Method in Inventing," pp. 615 to 616 (New York: Harper & Brothers, 1910). Full text: [Project Gutenberg #820](https://www.gutenberg.org/ebooks/820).
+
 Your coding assistant fixed a similar pattern of bugs last week. Today it walks straight into it again: the rules you drilled into it and the mistakes it already made vanished with the last session. `lessons` gives it a memory that outlives the context window. Every problem goes into a small local database with its root cause, the fix, and the attempts that failed, so the next session, on any agent (opencode, Claude Code, anything that runs a shell command or speaks MCP) and any model, looks there during the planning stage, before implementation. Lessons sync across your machines through a git repo you own, so what you learn at work and at home stays learned.
+
+It is only as good as what you feed it: record what each session learned, and every post-mortem, in the same session, every time. An empty or stale database teaches nothing.
 
 Lessons learned from each|every sessions based on trials, errors, failures, and building postmortem style database, so that LLMs can query the lessons db to make sure mistakes|err are not repeated
 
