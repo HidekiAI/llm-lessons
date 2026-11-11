@@ -404,6 +404,53 @@ validate_config() {
     return 1
 }
 
+# Names the platform from `uname -s`, `uname -r` and $WSL_DISTRO_NAME: "unix" (Linux, macOS), "wsl2", "wsl1" or "windows"
+# (Git Bash, MSYS, Cygwin). Only unix and wsl2 are supported: on Windows `lessons` is built and run inside WSL2, as a
+# Linux program; a native Windows build is not supported yet.
+platform_kind() {
+    local kernel_name="$1" kernel_release="$2" wsl_distro="$3"
+    case "$kernel_name" in
+        MINGW* | MSYS* | CYGWIN*) printf 'windows\n' ;;
+        *)
+            # WSL1 always reports a Microsoft kernel that does not say WSL2. A WSL distro with any other kernel is a WSL2
+            # running a custom kernel.
+            case "$kernel_release" in
+                *WSL2*) printf 'wsl2\n' ;;
+                *[Mm]icrosoft*) printf 'wsl1\n' ;;
+                *)
+                    case "$wsl_distro" in
+                        '') printf 'unix\n' ;;
+                        *) printf 'wsl2\n' ;;
+                    esac
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# Refuses a platform `lessons` is not built for, and warns when the data would sit on the Windows drive from WSL2.
+check_platform() {
+    local kernel_name="$1" kernel_release="$2" wsl_distro="$3" lessons_home="$4" kind
+    kind="$(platform_kind "$kernel_name" "$kernel_release" "$wsl_distro")"
+    case "$kind" in
+        windows)
+            printf 'setup: native Windows is not supported; install WSL2 and run this script inside it.\n' >&2
+            return 1
+            ;;
+        wsl1)
+            printf 'setup: this is WSL1; lessons needs WSL2 (run `wsl --set-version <distro> 2` from Windows).\n' >&2
+            return 1
+            ;;
+        wsl2)
+            case "$lessons_home" in
+                /mnt/[a-z]/*) log_step "WARNING: $lessons_home is on the Windows drive; keep LESSONS_HOME inside the Linux filesystem (file modes and SQLite locking are unreliable there)" ;;
+                *) ;;
+            esac
+            ;;
+        *) ;;
+    esac
+}
+
 # Prints each word of the comma list `csv_text` on its own line, failing on a word that is not
 # in `known_words`. `list_name` only labels the error.
 validated_list() {
@@ -466,6 +513,7 @@ run_setup() {
     local domains_csv="$1" agents_csv="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6" skip_sync="$7"
     local domain_name agent_name
     local -a domain_names=() agent_names=()
+    check_platform "$(uname -s)" "$(uname -r)" "${WSL_DISTRO_NAME:-}" "${LESSONS_HOME:-$HOME/.lessons}" || exit "$EXIT_USAGE"
     # Validate first, in the current shell: inside the process substitutions below a failure would
     # be invisible to set -e.
     validated_list domain "$domains_csv" "$KNOWN_DOMAINS" >/dev/null || exit "$EXIT_USAGE"
@@ -665,6 +713,18 @@ run_self_test() {
         "$(agent_register_command opencode /bin/lessons | tr '\n' ' ' | sed 's/ $//')"
     check_equal "claude registers for the user" "claude mcp add --scope user lessons -- /bin/lessons mcp" \
         "$(agent_register_command claude /bin/lessons | tr '\n' ' ' | sed 's/ $//')"
+    check_equal "platform: Linux and macOS are unix" "unix unix" \
+        "$(platform_kind Linux 6.1.0-18-amd64 '') $(platform_kind Darwin 25.1.0 '')"
+    check_equal "platform: WSL2 by its kernel or a custom kernel in a WSL distro; a Microsoft kernel without WSL2 is WSL1" "wsl2 wsl2 wsl1 wsl1" \
+        "$(platform_kind Linux 5.15.153.1-microsoft-standard-WSL2 '') $(platform_kind Linux 6.6.0-custom Debian) $(platform_kind Linux 4.4.0-19041-Microsoft Debian) $(platform_kind Linux 4.4.0-19041-Microsoft '')"
+    check_equal "platform: a distro name that mentions Microsoft or WSL2 does not change the verdict" "wsl2 wsl2 unix" \
+        "$(platform_kind Linux 6.6.0-custom Microsoft-Debian) $(platform_kind Linux 6.6.0-custom WSL2-Ubuntu) $(platform_kind Linux 6.1.0 '')"
+    check_equal "platform: Git Bash, MSYS and Cygwin are native Windows" "windows windows windows" \
+        "$(platform_kind MINGW64_NT-10.0-22631 3.5.4 '') $(platform_kind MSYS_NT-10.0 3.5.4 '') $(platform_kind CYGWIN_NT-10.0 3.5.4 '')"
+    check_equal "platform: Windows and WSL1 are refused with a pointer to WSL2, WSL2 and Unix pass" "refused refused ok ok" \
+        "$(check_platform MINGW64_NT '' '' /x >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Linux 4.4.0-Microsoft Debian /x >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Darwin 25.1.0 '' /Users/u/.lessons >/dev/null 2>&1 && echo ok || echo refused)"
+    check_equal "platform: a WSL2 LESSONS_HOME on the Windows drive is warned about" "1 0" \
+        "$(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c/Users/u/.lessons 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons 2>&1 | grep -c 'Windows drive')"
     run_sync_self_test
     if [[ "$failures" -eq 0 ]]; then
         printf 'setup self-test: all checks passed\n'
