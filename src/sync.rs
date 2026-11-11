@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Lesson;
 
+mod access;
 mod cycle;
 mod files;
 mod git;
