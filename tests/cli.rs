@@ -30,12 +30,14 @@ fn run_lessons_with_stdin(lessons_home: &Path, args: &[&str], stdin_text: &str) 
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn lessons");
+    // A command that exits without reading its stdin (a mistyped hook command) closes the pipe: a broken-pipe error is
+    // the command's answer, not a test failure, and it only shows up when the child wins the race.
     mut_child
         .stdin
         .take()
         .expect("stdin")
         .write_all(stdin_text.as_bytes())
-        .expect("write stdin");
+        .ok();
     mut_child.wait_with_output().expect("wait for lessons")
 }
 
