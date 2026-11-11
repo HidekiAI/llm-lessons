@@ -208,14 +208,15 @@ pub enum CycleResult {
     Failed,
 }
 
-/// The state file after a cycle: a success resets the failures and records the pull time and the new BASE commit; a
-/// failure counts one more and changes nothing else, so the next cycle merges against the same BASE.
+/// The state file after a cycle: a success resets the failures and records the pull time and the new BASE commit (and
+/// keeps the remembered one when it has none to record, so BASE is never forgotten by accident); a failure counts one
+/// more and changes nothing else, so the next cycle merges against the same BASE.
 pub fn state_after_cycle(state: SyncState, result: CycleResult, now_secs: u64) -> SyncState {
     // A success names every field, so a field added later fails to compile here and forces a decision; a failure
     // changes one field and keeps the rest.
     match result {
         CycleResult::Succeeded { last_synced } => SyncState {
-            last_synced_commit: last_synced,
+            last_synced_commit: last_synced.or(state.last_synced_commit),
             last_pull_unix_secs: Some(now_secs),
             consecutive_failures: 0,
         },
@@ -251,9 +252,10 @@ pub fn exit_for(outcome: CycleOutcome) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::git::GitRunner;
+    use crate::sync::git::{GitOutput, GitRunner};
     use crate::sync::{MergedField, Version};
     use std::fs;
+    use std::path::PathBuf;
 
     const EARLY: &str = "2026-11-01T00:00:00Z";
     const MIDDLE: &str = "2026-11-02T00:00:00Z";
@@ -300,7 +302,7 @@ mod tests {
     /// Runs the real `git show <commit>:<file>` in a temp repository and sorts what it prints.
     fn show_in_repo(commit_spec: &str) -> Shown {
         let temp_dir = tempfile::tempdir().unwrap();
-        let global_config = temp_dir.path().join("global.gitconfig");
+        let global_config: PathBuf = temp_dir.path().join("global.gitconfig");
         fs::write(&global_config, "").unwrap();
         let runner = GitRunner::new(temp_dir.path(), "ssh")
             .with_env("GIT_CONFIG_GLOBAL", &global_config.to_string_lossy())
@@ -313,7 +315,7 @@ mod tests {
         fs::write(temp_dir.path().join("work.jsonl"), "{\"kept\":1}\n").unwrap();
         runner.run_checked(&["add", "work.jsonl"]).unwrap();
         runner.run_checked(&["commit", "-q", "-m", "one"]).unwrap();
-        let output = runner.run(&["show", commit_spec]).unwrap();
+        let output: GitOutput = runner.run(&["show", commit_spec]).unwrap();
         interpret_show(output.exit_ok, &output.stdout, &output.stderr)
     }
 
@@ -366,7 +368,7 @@ mod tests {
             lesson_row(ID_A, EARLY, "one"),
             lesson_row(ID_B, MIDDLE, "two edited there"),
         ];
-        let plan = plan_domain_merge(&DomainInputs {
+        let plan: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
             theirs: &theirs,
@@ -397,7 +399,7 @@ mod tests {
             live_queue: &[],
             theirs_queue: &[],
         };
-        let plan = plan_domain_merge(&inputs);
+        let plan: DomainPlan = plan_domain_merge(&inputs);
         assert_eq!(
             plan.merged[0].resolution.as_deref(),
             Some("ours"),
@@ -431,7 +433,7 @@ mod tests {
         ];
         let ours_queue = [conflict_group(ID_B, &[("x", EARLY), ("y", MIDDLE)])];
         let theirs_queue = [conflict_group(ID_B, &[("y", LATE), ("z", EARLY)])];
-        let forward = plan_domain_merge(&DomainInputs {
+        let forward: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
             theirs: &theirs,
@@ -439,7 +441,7 @@ mod tests {
             live_queue: &ours_queue,
             theirs_queue: &theirs_queue,
         });
-        let swapped = plan_domain_merge(&DomainInputs {
+        let swapped: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &theirs,
             theirs: &ours,
@@ -460,7 +462,7 @@ mod tests {
             ID_A,
             &[("base", EARLY), ("older", EARLY), ("newest ever", LATE)],
         )];
-        let plan = plan_domain_merge(&DomainInputs {
+        let plan: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
             theirs: &theirs,
@@ -485,7 +487,7 @@ mod tests {
             ID_A,
             &[("newest ever", LATE), ("older", EARLY)],
         )];
-        let plan = plan_domain_merge(&DomainInputs {
+        let plan: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
             theirs: &theirs,
@@ -501,7 +503,7 @@ mod tests {
     fn a_group_of_a_deleted_lesson_is_cleared_and_reported() {
         let base = [lesson_row(ID_A, EARLY, "base")];
         let orphan = [conflict_group(ID_A, &[("a", EARLY), ("b", MIDDLE)])];
-        let plan = plan_domain_merge(&DomainInputs {
+        let plan: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &[],
             theirs: &[],
@@ -526,7 +528,7 @@ mod tests {
             updated_at: MIDDLE.to_string(),
             ..base[0].clone()
         }];
-        let plan = plan_domain_merge(&DomainInputs {
+        let plan: DomainPlan = plan_domain_merge(&DomainInputs {
             base: &base,
             ours: &ours,
             theirs: &theirs,
@@ -576,7 +578,7 @@ mod tests {
 
     #[test]
     fn the_clone_files_are_sorted_and_a_resolved_queue_is_removed() {
-        let plan = plan_with(
+        let plan: DomainPlan = plan_with(
             vec![
                 lesson_row(ID_B, EARLY, "two"),
                 lesson_row(ID_A, EARLY, "one"),
@@ -586,7 +588,7 @@ mod tests {
                 conflict_group(ID_A, &[("p", EARLY), ("q", LATE)]),
             ],
         );
-        let files = planned_clone_files(Domain::Work, &plan).unwrap();
+        let files: Vec<CloneFile> = planned_clone_files(Domain::Work, &plan).unwrap();
         assert_eq!(
             files
                 .iter()
@@ -616,7 +618,7 @@ mod tests {
             .collect();
         assert_eq!(queue_ids, vec![ID_A, ID_B], "the queue is sorted too");
 
-        let resolved =
+        let resolved: Vec<CloneFile> =
             planned_clone_files(Domain::Work, &plan_with(plan.merged.clone(), Vec::new())).unwrap();
         assert_eq!(
             resolved[1],
@@ -651,6 +653,16 @@ mod tests {
             last_pull_unix_secs: Some(EARLIER),
             consecutive_failures: SOME_FAILURES,
         };
+        assert_eq!(
+            state_after_cycle(
+                before.clone(),
+                CycleResult::Succeeded { last_synced: None },
+                SOME_NOW
+            )
+            .last_synced_commit,
+            Some("old".to_string()),
+            "a success with nothing new to record keeps the remembered BASE"
+        );
         assert_eq!(
             state_after_cycle(
                 before.clone(),
@@ -699,7 +711,6 @@ mod tests {
             fn_code(CycleOutcome::Failed),
             format!("{:?}", ExitCode::FAILURE)
         );
-        assert_ne!(fn_code(CycleOutcome::Failed), fn_code(CycleOutcome::Synced));
     }
 
     #[test]

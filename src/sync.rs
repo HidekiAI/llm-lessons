@@ -22,6 +22,8 @@ pub const NEEDS_REWORD_TAG: &str = "needs-reword";
 
 /// A lesson field merged on its own. `id`, `created_at`, `updated_at` and `hits` are not in it: they have their own
 /// rules. The serde names are the `field` values in `<domain>.conflicts.jsonl` and match the `Lesson` field names.
+/// The declaration order is the sort order of a queue group's key (`id`, then field), so it decides the order of the
+/// committed `<domain>.conflicts.jsonl`: append new fields at the end and never reorder (a test pins it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergedField {
@@ -532,6 +534,19 @@ mod tests {
             base: None,
             versions,
         }
+    }
+
+    /// The derived order is the declaration order, and a queue group's sort key uses it: a reordered enum would reorder
+    /// every committed `<domain>.conflicts.jsonl`, so `MERGED_FIELDS` must stay in declaration order.
+    #[test]
+    fn merged_fields_are_listed_in_declaration_order() {
+        assert!(MERGED_FIELDS.is_sorted(), "{MERGED_FIELDS:?}");
+        assert_eq!(MERGED_FIELDS.first(), Some(&MergedField::Title));
+        assert_eq!(
+            MERGED_FIELDS.last(),
+            Some(&MergedField::SupersededBy),
+            "new fields are appended at the end"
+        );
     }
 
     /// The pin test for the wire tokens: the `field` values on disk in `<domain>.conflicts.jsonl`.
