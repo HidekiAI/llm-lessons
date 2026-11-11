@@ -1,4 +1,5 @@
-//! The pure merge behind `lessons sync` (plan step S2): BASE (the lessons at the last synced commit), OURS (the local DB)
+//! The pure merge behind `lessons sync` (plan step S2): BASE (the lessons at the last synced commit), OURS (the local
+//! DB)
 //! and THEIRS (the fetched tip) become one set of rows plus a conflict queue. Nothing here touches git, the DB or a
 //! clock. Every rule depends on the unordered pair (ours, theirs) plus BASE, never on which side is "ours", so every
 //! machine computes the same rows and the same queue.
@@ -189,7 +190,8 @@ fn merge_field(
     // Values are compared, never timestamps: an older edit still beats an unchanged copy.
     let ours_value: Option<&str> = field_value(ours, field);
     let theirs_value: Option<&str> = field_value(theirs, field);
-    let base_value: Option<Option<&str>> = base.map(|base_row| field_value(base_row, field)); // None: no base row at all
+    // None: no base row at all.
+    let base_value: Option<Option<&str>> = base.map(|base_row| field_value(base_row, field));
     let fn_conflict = || -> (Option<String>, Option<Conflict>) {
         let fn_version_of = |value: Option<&str>, row: &Lesson| Version {
             value: value.map(String::from),
@@ -476,7 +478,8 @@ pub fn settle_queue(merged: Vec<Lesson>, queue: Vec<Conflict>, conflicted: &[Gro
 }
 
 // Unit tests only: every function here is pure, with no shared state, clock or I/O, so no race or back-to-back case
-// applies at this layer. The idempotency a back-to-back sync needs is pinned by `merging_a_result_again_changes_nothing`;
+// applies at this layer. The idempotency a back-to-back sync needs is pinned by
+// `merging_a_result_again_changes_nothing`;
 // the races (two machines, push rejected, crash points) are E2E rows of later steps.
 #[cfg(test)]
 #[expect(
@@ -907,7 +910,8 @@ mod tests {
         );
     }
 
-    /// merge(base, x, y) == merge(base, y, x), over inputs that differ on every side (a symmetric input proves nothing).
+    /// merge(base, x, y) == merge(base, y, x), over inputs that differ on every side (a symmetric input proves
+    /// nothing).
     #[test]
     fn merge_is_symmetric() {
         let base_row = sample_lesson(LESSON_ID, EARLY);
