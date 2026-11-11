@@ -124,7 +124,7 @@ scripts/setup.sh --domains personal,shared    # a home machine
 scripts/setup.sh --domains work,personal,shared
 ```
 
-In a terminal, `setup.sh` then asks, per domain, for the repo URL (Enter skips syncing that domain; the previous answer is offered again, so one repo can serve all three), the SSH key for it (from the keys in `~/.ssh`; domains sharing a repo share its key), `live` (sync after each change) or `on-demand` (sync when reading), and `pull_every_minutes` (default 10). Sync commits use your global git name and email. It writes the answers to `~/.lessons/config.toml`, your private copy (never commit it), creating it if needed and otherwise only adding the missing `[sync.<domain>]` sections. To write the file by hand instead, start from [`docs/config.sample.toml`](docs/config.sample.toml).
+In a terminal, `setup.sh` then asks, per domain, for the repo URL (Enter skips syncing that domain; the previous answer is offered again, so one repo can serve all three), the SSH key for it (from the keys in `~/.ssh`; domains sharing a repo share its key), the remote with its real host name (`git@github.com:...`, not a `~/.ssh/config` alias, which sync does not read), `live` (sync after each change) or `on-demand` (sync when reading), and `pull_every_minutes` (default 10). Sync commits use your global git name and email. It writes the answers to `~/.lessons/config.toml`, your private copy (never commit it), creating it if needed and otherwise only adding the missing `[sync.<domain>]` sections. To write the file by hand instead, start from [`docs/config.sample.toml`](docs/config.sample.toml).
 
 After that, `lessons sync` runs by itself in the background as `update` says, or by hand. `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
