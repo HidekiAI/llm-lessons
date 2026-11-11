@@ -18,8 +18,7 @@ grep() { command grep --color=never "$@"; }
 # --test must touch nothing of the user's, and log_step appends to a log under XDG_STATE_HOME: point it at a temp dir.
 if [[ "${1:-}" == --test ]]; then
     test_state_dir="$(mktemp -d "${TMPDIR:-/tmp}/lessons-setup-state.XXXXXX")"
-    # shellcheck disable=SC2064 # expand test_state_dir now: it is gone when the trap runs
-    trap "rm -rf '$test_state_dir'" EXIT
+    trap 'rm -rf "$test_state_dir"' EXIT # single quotes: expanded when the trap runs, so no quote in the path can break it
     export XDG_STATE_HOME="$test_state_dir"
 fi
 
