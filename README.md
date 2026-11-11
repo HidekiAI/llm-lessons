@@ -150,12 +150,11 @@ Do not point `LESSONS_HOME` at a cloud-drive folder (OneDrive, Google Drive, Dro
 
 ### Why does git store JSON lines, and never the `.db` itself?
 
-An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One new lesson can rewrite bytes in several pages, so git sees an opaque blob. It cannot show a readable diff, it cannot merge two machines' versions (one side simply wins), and every commit stores a whole new copy, so the history grows by the size of the database each time.
+An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One new lesson can rewrite bytes in several pages, so git sees an opaque blob. It cannot show a readable diff, git cannot merge two machines' versions (one side has to be picked), and a commit can store a whole new copy, so the history can grow by the size of the database each time.
 
 So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commits that text. The merge itself never runs in git: `lessons sync` merges in-process, field by field, three ways (against the version both machines last agreed on), then commits the result on top of the repo's latest commit, so every push is a plain fast-forward and there are no merge commits. The local `.db` is rebuilt from the merged result.
 
 What pays off is syncing often (`update = "live"`): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
-
 
 ## Contributing
 

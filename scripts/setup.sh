@@ -116,16 +116,99 @@ sync_section_text() {
         "$domain_name" "$(toml_string "$remote_url")" "$(toml_string "$ssh_key")" "$(toml_string "$update_mode")" "$pull_minutes"
 }
 
-# Decides the [sync] sections for `domain_names`, from flags or, in a terminal, from answers, and
-# prints them. Domains given the same remote get the same key, because one clone has one key.
-# Arguments: remote, key, mode, minutes (empty when not given as flags), then the domains.
-decide_sync_sections() {
+# A remote in the form the lessons config compares remotes in (src/config.rs normalize_remote):
+# host lower-cased, a trailing / and .git removed, a portless ssh:// URL written in the scp form.
+normalized_remote() {
+    local remote_url="$1" scheme_part after_scheme authority path_part user_part host_part
+    remote_url="${remote_url#"${remote_url%%[![:space:]]*}"}" # trim leading space
+    remote_url="${remote_url%"${remote_url##*[![:space:]]}"}" # trim trailing space
+    fn_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+    fn_lower_host() { # user@host or host: only the host part is case-insensitive
+        case "$1" in
+            *@*) user_part="${1%@*}"; host_part="${1##*@}"; printf '%s@%s' "$user_part" "$(fn_lower "$host_part")" ;;
+            *) fn_lower "$1" ;;
+        esac
+    }
+    case "$remote_url" in
+        *://*)
+            scheme_part="$(fn_lower "${remote_url%%://*}")"
+            after_scheme="${remote_url#*://}"
+            authority="${after_scheme%%/*}"
+            path_part="${after_scheme#"$authority"}"
+            path_part="${path_part#/}"
+            if [[ "$scheme_part" == ssh && "$authority" != *:* ]]; then
+                remote_url="$(fn_lower_host "$authority"):$path_part"
+            else
+                remote_url="$scheme_part://$(fn_lower_host "$authority")/$path_part"
+            fi
+            ;;
+        *:*) # scp-like user@host:path when no / comes before the first :, else a local path, left as it is
+            [[ "${remote_url%%:*}" == */* ]] || remote_url="$(fn_lower_host "${remote_url%%:*}"):${remote_url#*:}"
+            ;;
+    esac
+    fn_trim_slashes() { local trimmed_text="$1"; while [[ "$trimmed_text" == */ ]]; do trimmed_text="${trimmed_text%/}"; done; printf '%s' "$trimmed_text"; }
+    remote_url="$(fn_trim_slashes "$remote_url")"
+    fn_trim_slashes "${remote_url%.git}"
+    printf '\n'
+}
+
+# Prints `key`'s value from the [sync.<domain>] section of `config_path` (the text between the
+# first and last double quote), or nothing when the file, the section or the key is missing.
+existing_sync_value() {
+    local config_path="$1" domain_name="$2" key_name="$3"
+    [[ -f "$config_path" ]] || return 0
+    awk -v section="[sync.$domain_name]" -v key="$key_name" '
+        $0 == section { in_section = 1; next }
+        /^\[/ { in_section = 0 }
+        in_section && $1 == key && $2 == "=" {
+            value = $0; sub(/^[^"]*"/, "", value); sub(/"[^"]*$/, "", value); print value; exit
+        }' "$config_path"
+}
+
+# True for a whole number of minutes, 1 or more.
+is_valid_minutes() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+# Checks the sync flags before anything runs, so a bad combination has no side effects.
+validate_sync_flags() {
     local flag_remote="$1" flag_key="$2" flag_mode="$3" flag_minutes="$4"
-    shift 4
-    local domain_name remote_url ssh_key update_mode pull_minutes previous_remote="" remote_index
+    if [[ -n "$flag_remote" && -z "$flag_key" ]]; then
+        printf 'setup: --remote needs --ssh-key\n' >&2
+        return 1
+    fi
+    if [[ -n "$flag_mode" ]]; then
+        case " $KNOWN_UPDATE_MODES " in
+            *" $flag_mode "*) ;;
+            *) printf 'setup: unknown --update "%s"; expected one of: %s\n' "$flag_mode" "$KNOWN_UPDATE_MODES" >&2; return 1 ;;
+        esac
+    fi
+    if [[ -n "$flag_minutes" ]] && ! is_valid_minutes "$flag_minutes"; then
+        printf 'setup: --pull-every-minutes must be a whole number of 1 or more, not "%s"\n' "$flag_minutes" >&2
+        return 1
+    fi
+}
+
+# Decides the [sync] sections for `domain_names`, from flags or, in a terminal, from answers, and
+# prints them. Domains given the same remote get the same key, because one clone has one key. A
+# domain that already has a section in `config_path` is skipped without a question, and its remote
+# and key are remembered, so a later domain on that remote gets the same key.
+# Arguments: config path, remote, key, mode, minutes (empty when not given as flags), then the domains.
+decide_sync_sections() {
+    local config_path="$1" flag_remote="$2" flag_key="$3" flag_mode="$4" flag_minutes="$5"
+    shift 5
+    local domain_name remote_url ssh_key update_mode pull_minutes previous_remote="" remote_index existing_remote
     local -a seen_remotes=() seen_keys=()
     local ssh_dir="${LESSONS_SETUP_SSH_DIR:-$HOME/.ssh}"
     for domain_name in "$@"; do
+        existing_remote="$(existing_sync_value "$config_path" "$domain_name" remote)"
+        if [[ -n "$existing_remote" ]]; then
+            log_step "sync: $config_path already has [sync.$domain_name] for $existing_remote; it is kept as it is"
+            seen_remotes+=("$(normalized_remote "$existing_remote")")
+            seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
+            previous_remote="$existing_remote"
+            continue
+        fi
         if [[ -n "$flag_remote" ]]; then
             remote_url="$flag_remote"
         elif can_prompt; then
@@ -143,7 +226,7 @@ decide_sync_sections() {
         fi
         ssh_key=""
         for remote_index in ${seen_remotes[@]+"${!seen_remotes[@]}"}; do
-            [[ "${seen_remotes[$remote_index]}" == "$remote_url" ]] && ssh_key="${seen_keys[$remote_index]}"
+            [[ "${seen_remotes[$remote_index]}" == "$(normalized_remote "$remote_url")" ]] && ssh_key="${seen_keys[$remote_index]}"
         done
         if [[ -z "$ssh_key" ]]; then
             if [[ -n "$flag_key" ]]; then
@@ -163,7 +246,11 @@ decide_sync_sections() {
             *" $update_mode "*) ;;
             *) printf 'setup: unknown update mode "%s"; expected one of: %s\n' "$update_mode" "$KNOWN_UPDATE_MODES" >&2; return 1 ;;
         esac
-        seen_remotes+=("$remote_url")
+        if ! is_valid_minutes "$pull_minutes"; then
+            printf 'setup: pull every N minutes must be a whole number of 1 or more, not "%s"\n' "$pull_minutes" >&2
+            return 1
+        fi
+        seen_remotes+=("$(normalized_remote "$remote_url")")
         seen_keys+=("$ssh_key")
         previous_remote="$remote_url"
         sync_section_text "$domain_name" "$remote_url" "$ssh_key" "$update_mode" "$pull_minutes"
@@ -174,7 +261,7 @@ decide_sync_sections() {
 # one is shown, never edited). An existing file is backed up first; its path is printed on stdout
 # ("none" when there was no file). Under --dry-run it only logs what it would write.
 append_sync_sections() {
-    local config_path="$1" sections_text="$2" backup_path="none" section_name kept_or_added
+    local config_path="$1" sections_text="$2" backup_path="none" section_name
     local new_text="" current_section="" section_line kept_or_added=""
     while IFS= read -r section_line; do
         case "$section_line" in
@@ -183,7 +270,7 @@ append_sync_sections() {
                 if [[ -f "$config_path" ]] && grep -qxF "$section_name" "$config_path"; then
                     kept_or_added="kept"
                     log_step "sync: $config_path already has $section_name; it is left as it is:"
-                    sed -n "/^$(printf '%s' "$section_name" | sed 's/[][.]/\\&/g')\$/,/^\[/p" "$config_path" | sed '$ { /^\[/d; }' >&2
+                    sed -n "/^$(printf '%s' "$section_name" | sed 's/[][.]/\\&/g')\$/,/^\[/p" "$config_path" | sed '$ { /^\[/d; }' | tee -a "$LOG_FILE" >&2
                 else
                     kept_or_added="added"
                 fi
@@ -227,11 +314,8 @@ configure_sync() {
         log_step "sync: not a terminal and no --remote given; sync left unconfigured (see docs/config.sample.toml)"
         return 0
     fi
-    if [[ -n "$flag_remote" && -z "$flag_key" ]]; then
-        printf 'setup: --remote needs --ssh-key\n' >&2
-        return 1
-    fi
-    sections_text="$(decide_sync_sections "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" "$@")" || return 1
+    validate_sync_flags "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" || return 1
+    sections_text="$(decide_sync_sections "$config_path" "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" "$@")" || return 1
     if [[ -z "$sections_text" ]]; then
         log_step "sync: no domain to sync"
         return 0
@@ -335,6 +419,11 @@ run_setup() {
         exit "$EXIT_USAGE"
     fi
 
+    # Bad sync flags are refused before anything is installed or created.
+    if [[ "$skip_sync" != true ]]; then
+        validate_sync_flags "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" || exit "$EXIT_USAGE"
+    fi
+
     log_step "setup: repo $REPO_ROOT, domains ${domain_names[*]}, agents ${agent_names[*]:-none}, log $LOG_FILE"
     if ! command -v cargo >/dev/null 2>&1; then
         # A dry run only shows the steps, so it goes on without cargo.
@@ -420,7 +509,55 @@ run_sync_self_test() {
     check_equal "no terminal and no --remote: nothing is asked or written" "no file" \
         "$([[ -e "$test_root/no-tty/config.toml" ]] && echo file || echo 'no file')"
 
+    check_equal "remotes normalize like src/config.rs" \
+        "git@github.com:Owner/Repo git@github.com:o/r https://github.com/o/r ./a/b:c" \
+        "$(normalized_remote ' git@GitHub.com:Owner/Repo.git/ ') $(normalized_remote 'ssh://git@GITHUB.com/o/r.git') $(normalized_remote 'HTTPS://GitHub.COM/o/r//') $(normalized_remote './a/b:c')"
+
+    mkdir -p "$test_root/same-remote"
+    printf '[sync.work]\nremote = "git@github.com:owner/lessons-repo"\nssh_key = "/keys/kept"\n' > "$test_root/same-remote/config.toml"
+    prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
+        configure_sync "$lessons_binary" "$test_root/same-remote" "" "" "" "" work shared 2>&1 >/dev/null || true)"
+    check_equal "an existing section is not asked again and lends its key to the same remote" "0 2" \
+        "$(grep -c 'URL for work\|SSH key for' <<< "$prompt_text") $(grep -cxF 'ssh_key = "/keys/kept"' "$test_root/same-remote/config.toml")"
+
+    mkdir -p "$test_root/by-number/ssh"
+    touch "$test_root/by-number/ssh/id_first" "$test_root/by-number/ssh/id_first.pub" "$test_root/by-number/ssh/id_second.pub"
+    printf '%s\n' "$SYNC_TEST_REMOTE" 2 '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/by-number/ssh" \
+        configure_sync "$lessons_binary" "$test_root/by-number" "" "" "" "" work >/dev/null 2>&1 || true
+    check_equal "a key chosen by number; an agent-only key keeps its .pub path" "1" \
+        "$(grep -cxF "ssh_key = \"$test_root/by-number/ssh/id_second.pub\"" "$test_root/by-number/config.toml" 2>/dev/null)"
+
+    check_equal "TOML strings escape backslashes and quotes" '"C:\\keys\\a\"b"' "$(toml_string 'C:\keys\a"b')"
+
+    mkdir -p "$test_root/dry-run"
+    dry_run=true
+    fn_configure "$test_root/dry-run" "$SYNC_TEST_REMOTE" /keys/main "" "" work </dev/null >/dev/null
+    dry_run=false
+    check_equal "--dry-run writes no config" "no file" \
+        "$([[ -e "$test_root/dry-run/config.toml" ]] && echo file || echo 'no file')"
+
+    fn_refused() { # setup.sh arguments; prints the exit code, or "ran" when it got past validation
+        local exit_code=0
+        bash "${BASH_SOURCE[0]}" --domains work --dry-run "$@" >/dev/null 2>&1 </dev/null || exit_code=$?
+        [[ "$exit_code" -eq "$EXIT_USAGE" ]] && printf 'refused' || printf 'ran'
+    }
+    check_equal "bad sync flags are refused before any step runs" "refused refused refused refused" \
+        "$(fn_refused --remote "$SYNC_TEST_REMOTE") $(fn_refused --remote "$SYNC_TEST_REMOTE" --ssh-key /k --update hourly) $(fn_refused --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes 0) $(fn_refused --remote "$SYNC_TEST_REMOTE" --ssh-key /k --pull-every-minutes ten)"
+
+    mkdir -p "$test_root/bad-minutes"
+    prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' 0 | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
+        configure_sync "$lessons_binary" "$test_root/bad-minutes" "" "" "" "" work 2>&1 >/dev/null || true)"
+    check_equal "a typed 0 minutes is refused by the script and nothing is written" "1 no file" \
+        "$(grep -c 'must be a whole number' <<< "$prompt_text") $([[ -e "$test_root/bad-minutes/config.toml" ]] && echo file || echo 'no file')"
+
     if [[ -x "$lessons_binary" ]]; then
+        mkdir -p "$test_root/restored"
+        printf 'default_search = ["work"]\n' > "$test_root/restored/config.toml"
+        cp -p "$test_root/restored/config.toml" "$test_root/restored/original.toml"
+        printf '\n[sync.work]\nremtoe = "typo"\n' >> "$test_root/restored/config.toml"
+        validate_config "$lessons_binary" "$test_root/restored" "$test_root/restored/config.toml" "$test_root/restored/original.toml" 2>/dev/null || true
+        check_equal "a failed validation restores the backup" "default_search = [\"work\"]" "$(cat "$test_root/restored/config.toml")"
+
         mkdir -p "$test_root/invalid"
         printf '[sync.work]\nremote = "git@github.com:owner/r.git"\nssh_key = "/keys/main"\nremtoe = "typo"\n' > "$test_root/invalid/config.toml"
         check_equal "a misspelled key fails validation and a new file is removed" "refused no file" \
