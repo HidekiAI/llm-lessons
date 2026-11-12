@@ -3,6 +3,7 @@
 //! top of the fetched remote tip, so there is no `git pull` and no `git merge` here. The decisions it takes are the
 //! pure functions of `cycle.rs`; this file is the order of the steps and the effects.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,8 +23,8 @@ use super::files::{
     read_state, read_text_or_empty, to_jsonl, write_atomically, write_state,
 };
 use super::git::{
-    GitRunner, PushOutcome, classify_push, detect_default_branch, ensure_clone,
-    parse_identity_agent, redact_credentials, ssh_command, ssh_host_of,
+    GitRunner, PushOutcome, classify_push, detect_default_branch, ensure_clone, identity_agent_of,
+    redact_credentials, ssh_command,
 };
 use super::{Conflict, group_key};
 use crate::config::{CloneSpec, SyncSection, clone_specs, sync_warnings};
@@ -453,45 +454,31 @@ fn write_clone_files(cycle: &Cycle, domain: Domain, plan: &DomainPlan) -> Result
         })
 }
 
-/// The ssh agent socket the user's own ssh configuration names for the host of `remote`, from `ssh -G <host>`; none for
-/// a remote that is not ssh, or when ssh cannot say. Needed because `-F /dev/null` drops that configuration, and a key
-/// that only an agent holds (a `.pub` file for a 1Password key) could not sign without it.
-pub(super) fn identity_agent_of(remote: &str) -> Option<String> {
-    let host: String = ssh_host_of(remote)?;
-    let described = std::process::Command::new("ssh")
-        .args(["-G", "--", &host])
-        .output();
-    match described {
-        Ok(output) if output.status.success() => {
-            parse_identity_agent(&String::from_utf8_lossy(&output.stdout))
-        }
-        Ok(_) | Err(_) => {
-            journal!(
-                "sync: `ssh -G {host}` said nothing usable, the key is offered without an agent"
-            );
-            None
-        }
-    }
-}
-
 /// The R6 inputs for `clone`, or none: only a clone that carries `work` alone has a remote of its own (R11); when `work`
 /// shares its remote with another domain the guard is skipped and the other domains' keys are the same key. Every
 /// other clone's key that differs from the work key is probed, named by the domains it serves.
 fn work_guard_of(clone: &CloneSpec, clones: &[CloneSpec]) -> Option<WorkGuard> {
+    // One entry per distinct other key, named by every domain it serves, so a key shared by two clones is probed once.
+    let distinct_other_keys: BTreeSet<&PathBuf> = clones
+        .iter()
+        .map(|other_clone| &other_clone.ssh_key)
+        .filter(|other_key| **other_key != clone.ssh_key)
+        .collect();
     (clone.domains == [Domain::Work]).then(|| WorkGuard {
         work_key: clone.ssh_key.clone(),
-        other_keys: clones
-            .iter()
-            .filter(|other_clone| other_clone.ssh_key != clone.ssh_key)
-            .map(|other_clone| {
+        other_keys: distinct_other_keys
+            .into_iter()
+            .map(|other_key| {
                 (
-                    other_clone
-                        .domains
+                    clones
                         .iter()
-                        .map(|domain| domain.as_str())
+                        .filter(|other_clone| other_clone.ssh_key == *other_key)
+                        .flat_map(|other_clone| {
+                            other_clone.domains.iter().map(|domain| domain.as_str())
+                        })
                         .collect::<Vec<&str>>()
                         .join("+"),
-                    other_clone.ssh_key.clone(),
+                    other_key.clone(),
                 )
             })
             .collect(),
@@ -1598,6 +1585,7 @@ mod tests {
             "the stale staged file never reaches the remote"
         );
     }
+
     // S5b cycle rows (the `access_` prefix is what `cargo test access` matches): the guard runs under the lock, before
     // anything is fetched, and a refusal is never remembered.
     /// The work key and the one other key of `work_guard_for_tests`.
@@ -1635,9 +1623,9 @@ mod tests {
         let machine = Machine::new(temp_dir.path(), "only");
         machine.add("first");
         let calls = Cell::new(0);
-        let probe = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &calls);
+        let fn_probe = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &calls);
         let job = CloneJob {
-            probe: &probe,
+            probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
             ..machine.job(&remote)
         };
@@ -1675,9 +1663,9 @@ mod tests {
         let machine = Machine::new(temp_dir.path(), "only");
         machine.add("first");
         let calls = Cell::new(0);
-        let probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
+        let fn_probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
         let job = CloneJob {
-            probe: &probe,
+            probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
             ..machine.job(&remote)
         };
@@ -1699,9 +1687,9 @@ mod tests {
         let machine = Machine::new(temp_dir.path(), "only");
         machine.add("first");
         let calls = Cell::new(0);
-        let probe = probe_answering(ProbeClass::AuthDenied, ProbeClass::Readable, &calls);
+        let fn_probe = probe_answering(ProbeClass::AuthDenied, ProbeClass::Readable, &calls);
         let job = CloneJob {
-            probe: &probe,
+            probe: &fn_probe,
             work_guard: None,
             ..machine.job(&remote)
         };
@@ -1727,9 +1715,9 @@ mod tests {
             .unwrap();
         held.lock().unwrap();
         let calls = Cell::new(0);
-        let probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
+        let fn_probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
         let job = CloneJob {
-            probe: &probe,
+            probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
             ..machine.job(&remote)
         };
@@ -1778,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn access_a_probe_that_runs_again_every_cycle_never_stamps_a_local_remote() {
+    fn access_a_local_remote_is_never_probed_anonymously_or_stamped() {
         let temp_dir = tempfile::tempdir().unwrap();
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
@@ -1790,6 +1778,7 @@ mod tests {
             "no https form, so nothing was probed or recorded"
         );
     }
+
     #[test]
     fn access_the_cycle_records_the_visibility_once_and_does_not_probe_again_until_due() {
         // An https remote git is told to read from the local bare repository, so the anonymous URL is derivable and no
@@ -1813,7 +1802,7 @@ mod tests {
             ])
             .collect();
         let anonymous_calls = Cell::new(0);
-        let probe = |request: &ProbeRequest| match request {
+        let fn_probe = |request: &ProbeRequest| match request {
             ProbeRequest::Anonymous { url } if url == HTTPS_REMOTE => {
                 anonymous_calls.set(anonymous_calls.get() + 1);
                 ProbeClass::Readable
@@ -1824,7 +1813,7 @@ mod tests {
         };
         let job = CloneJob {
             normalized_remote: HTTPS_REMOTE,
-            probe: &probe,
+            probe: &fn_probe,
             git_env: &rewritten_env,
             ..machine.job(HTTPS_REMOTE)
         };
@@ -1843,6 +1832,53 @@ mod tests {
             anonymous_calls.get(),
             1,
             "the second cycle is inside the recheck interval, so no probe"
+        );
+    }
+    fn clone_spec(remote: &str, key: &str, domains: Vec<Domain>) -> CloneSpec {
+        CloneSpec {
+            remote: remote.to_string(),
+            normalized_remote: remote.to_string(),
+            ssh_key: PathBuf::from(key),
+            domains,
+        }
+    }
+
+    #[test]
+    fn access_work_alone_on_its_remote_gets_a_guard_naming_each_other_distinct_key_once() {
+        let work_clone = clone_spec("git@h:o/work.git", "/k/work", vec![Domain::Work]);
+        let home_clone = clone_spec("git@h:o/home.git", "/k/home", vec![Domain::Personal]);
+        let shared_clone = clone_spec("git@h:o/shared.git", "/k/home", vec![Domain::Shared]);
+        let same_key_clone = clone_spec("git@h:o/same.git", "/k/work", vec![Domain::Shared]);
+        let guard = work_guard_of(
+            &work_clone,
+            &[work_clone.clone(), home_clone, shared_clone, same_key_clone],
+        )
+        .unwrap();
+        assert_eq!(guard.work_key, PathBuf::from("/k/work"));
+        assert_eq!(
+            guard.other_keys,
+            vec![("personal+shared".to_string(), PathBuf::from("/k/home"))],
+            "the work key is not probed against itself and a shared other key is probed once"
+        );
+    }
+
+    #[test]
+    fn access_work_sharing_its_remote_or_absent_has_no_guard() {
+        let shared_work = clone_spec(
+            "git@h:o/all.git",
+            "/k/work",
+            vec![Domain::Work, Domain::Shared],
+        );
+        let home_clone = clone_spec("git@h:o/home.git", "/k/home", vec![Domain::Personal]);
+        assert_eq!(
+            work_guard_of(&shared_work, &[shared_work.clone(), home_clone.clone()]),
+            None,
+            "R11: a remote shared with another domain skips the guard"
+        );
+        assert_eq!(
+            work_guard_of(&home_clone, &[shared_work, home_clone.clone()]),
+            None,
+            "only a work clone is guarded"
         );
     }
 }

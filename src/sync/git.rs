@@ -289,6 +289,27 @@ pub fn ensure_clone(
 // Unit tests for the pure parsers and E2E tests against temp bare repos (local paths, no network, no ssh). Race: a lost
 // push race is produced for real by two clones pushing to one bare repo, in both orders; nothing depends on timing.
 // Back-to-back: `ensure_clone` twice is pinned. Each test points git at its own empty global config, so the tester's
+/// The ssh agent socket the user's own ssh configuration names for the host of `remote`, from `ssh -G <host>`; none for
+/// a remote that is not ssh, or when ssh cannot say. Needed because `-F /dev/null` drops that configuration, and a key
+/// that only an agent holds (a `.pub` file for a 1Password key) could not sign without it.
+pub fn identity_agent_of(remote: &str) -> Option<String> {
+    let host: String = ssh_host_of(remote)?;
+    let described = std::process::Command::new("ssh")
+        .args(["-G", "--", &host])
+        .output();
+    match described {
+        Ok(output) if output.status.success() => {
+            parse_identity_agent(&String::from_utf8_lossy(&output.stdout))
+        }
+        Ok(_) | Err(_) => {
+            journal!(
+                "sync: `ssh -G {host}` said nothing usable, the key is offered without an agent"
+            );
+            None
+        }
+    }
+}
+
 // `init.defaultBranch` and signing settings cannot change the result.
 #[cfg(test)]
 mod tests {
