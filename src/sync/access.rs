@@ -241,20 +241,20 @@ pub struct ProbeCommand {
 /// The ssh command of a key probe: the key alone, verbose so `classify_probe` can read how far authentication got, and a
 /// connect timeout so a black-holed host fails the probe.
 fn ssh_probe_command(key: &Path, identity_agent: Option<&str>) -> String {
-    // TODO(human): begin block 1/5
+    // TODO(human): begin block 1/6
     // Only the key given is offered (`-F /dev/null` in ssh_command drops the user's ssh config); `-v` lets classify_probe
     // read how far authentication got; ConnectTimeout makes a black-holed host fail the probe.
     // format!(
     //     "{} -v -o ConnectTimeout={PROBE_TIMEOUT_SECS}",
     //     ssh_command(key, identity_agent)
     // )
-    // TODO(human): end block 1/5
+    // TODO(human): end block 1/6
 }
 
 /// The environment of an anonymous probe: no askpass, no global, system or XDG git config, no home directory (so no
 /// netrc), and git's low-speed limits so a stalled transfer ends.
 fn anonymous_probe_env() -> Vec<(String, String)> {
-    // TODO(human): begin block 2/5
+    // TODO(human): begin block 2/6
     // No stored login can make a private repository look public: no askpass, no global, system or XDG git config (an
     // `insteadOf` there could turn this into an authenticated read) and no HOME (a netrc). Git's low-speed limits end a stalled
     // transfer.
@@ -274,89 +274,65 @@ fn anonymous_probe_env() -> Vec<(String, String)> {
     // .iter()
     // .map(|(name, value)| (name.to_string(), value.to_string()))
     // .collect()
-    // TODO(human): end block 2/5
+    // TODO(human): end block 2/6
+}
+
+/// The key probe: `remote` read with `key` alone, through `ssh_probe_command`.
+fn key_probe_command(remote: &str, key: &Path, identity_agent: Option<&str>) -> ProbeCommand {
+    // TODO(human): begin block 3/6
+    // The key probe keeps the user's environment: only the ssh command isolates it, and nothing is removed.
+    // ProbeCommand {
+    //     ssh_command: ssh_probe_command(key, identity_agent),
+    //     env: Vec::new(),
+    //     env_remove: Vec::new(),
+    //     git_args: ["ls-remote", "--", remote, "HEAD"]
+    //         .map(String::from)
+    //         .to_vec(),
+    // }
+    // TODO(human): end block 3/6
+}
+
+/// The anonymous probe: `url` read with no identity, no credential helper, no redirect and no config injected through
+/// the environment (an `insteadOf` or a proxy there must not reach it).
+fn anonymous_probe_command(url: &str) -> ProbeCommand {
+    // TODO(human): begin block 4/6
+    // The anonymous probe is isolated three ways: its environment (anonymous_probe_env), the variables it must not inherit
+    // (config injected through GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS) and git's own switches (no credential helper, no
+    // redirect: a renamed repository stays unknown, the safe direction).
+    // ProbeCommand {
+    //     ssh_command: "ssh".to_string(), // never run: the URL is https
+    //     env: anonymous_probe_env(),
+    //     env_remove: ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]
+    //         .map(String::from)
+    //         .to_vec(),
+    //     git_args: [
+    //         "-c",
+    //         "credential.helper=",
+    //         "-c",
+    //         "http.followRedirects=false",
+    //         "ls-remote",
+    //         "--",
+    //         url,
+    //         "HEAD",
+    //     ]
+    //     .map(String::from)
+    //     .to_vec(),
+    // }
+    // TODO(human): end block 4/6
 }
 
 /// The command of one probe, built without running anything so its isolation and its timeouts can be tested.
 /// `identity_agent` is the agent socket the user's ssh configuration names for the host, if any.
 pub fn probe_command_of(request: &ProbeRequest, identity_agent: Option<&str>) -> ProbeCommand {
-    // TODO(human): begin block 3/5
-    // The key probe keeps the user's environment. The anonymous probe is isolated and also drops config injected through
-    // GIT_CONFIG_COUNT and GIT_CONFIG_PARAMETERS, credential helpers and redirects.
-    // was: let fn_ssh_probing = |key: &Path| {
-    // was:     format!(
-    // was:         "{} -v -o ConnectTimeout={PROBE_TIMEOUT_SECS}",
-    // was:         ssh_command(key, identity_agent)
-    // was:     )
-    // was: };
-    // was: let fn_owned =
-    // was:     |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
-    // was: match request {
-    // was:     ProbeRequest::WithKey { remote, key } => ProbeCommand {
-    // was:         ssh_command: fn_ssh_probing(key),
-    // was:         env: Vec::new(),
-    // was:         git_args: fn_owned(&["ls-remote", "--", remote, "HEAD"]),
-    // was:     },
-    // was:     ProbeRequest::Anonymous { url } => ProbeCommand {
-    // was:         ssh_command: "ssh".to_string(), // never run: the URL is https
-    // was:         env: [
-    // was:             ("GIT_ASKPASS", ""),
-    // was:             ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    // was:             ("GIT_CONFIG_NOSYSTEM", "1"),
-    // was:             ("HOME", "/dev/null"),
-    // was:             (
-    // was:                 "GIT_HTTP_LOW_SPEED_LIMIT",
-    // was:                 &PROBE_LOW_SPEED_BYTES_PER_SEC.to_string(),
-    // was:             ),
-    // was:             ("GIT_HTTP_LOW_SPEED_TIME", &PROBE_TIMEOUT_SECS.to_string()),
-    // was:         ]
-    // was:         .iter()
-    // was:         .map(|(name, value)| (name.to_string(), value.to_string()))
-    // was:         .collect(),
-    // was:         git_args: fn_owned(&[
-    // was:             "-c",
-    // was:             "credential.helper=",
-    // was:             "-c",
-    // was:             "http.followRedirects=false",
-    // was:             "ls-remote",
-    // was:             "--",
-    // was:             url,
-    // was:             "HEAD",
-    // was:         ]),
-    // was:     },
-    // was: }
-    // let fn_owned =
-    //     |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
-    // match request {
-    //     ProbeRequest::WithKey { remote, key } => ProbeCommand {
-    //         ssh_command: ssh_probe_command(key, identity_agent),
-    //         env: Vec::new(),
-    //         env_remove: Vec::new(),
-    //         git_args: fn_owned(&["ls-remote", "--", remote, "HEAD"]),
-    //     },
-    //     ProbeRequest::Anonymous { url } => ProbeCommand {
-    //         ssh_command: "ssh".to_string(), // never run: the URL is https
-    //         env: anonymous_probe_env(),
-    //         // Config injected through the environment (an `insteadOf`, a proxy) must not reach this probe either.
-    //         env_remove: fn_owned(&["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]),
-    //         git_args: fn_owned(&[
-    //             "-c",
-    //             "credential.helper=",
-    //             "-c",
-    //             "http.followRedirects=false",
-    //             "ls-remote",
-    //             "--",
-    //             url,
-    //             "HEAD",
-    //         ]),
-    //     },
-    // }
-    // TODO(human): end block 3/5
+    match request {
+        ProbeRequest::WithKey { remote, key } => key_probe_command(remote, key, identity_agent),
+        ProbeRequest::Anonymous { url } => anonymous_probe_command(url),
+    }
 }
 
 /// A git runner for `command`: its ssh command and environment set, the variables it must not inherit removed.
 fn runner_for(command: &ProbeCommand) -> GitRunner {
-    // TODO(human): begin block 4/5
+    // TODO(human): begin block 5/6
     // The runner carries the command's ssh command and environment, then drops the variables the probe must not inherit.
     // let runner_with_env: GitRunner = command.env.iter().fold(
     //     GitRunner::new(&std::env::temp_dir(), &command.ssh_command),
@@ -368,13 +344,13 @@ fn runner_for(command: &ProbeCommand) -> GitRunner {
     //     .fold(runner_with_env, |runner_so_far, name| {
     //         runner_so_far.without_env(name)
     //     })
-    // TODO(human): end block 4/5
+    // TODO(human): end block 5/6
 }
 
 /// The real probe: `git ls-remote` as the request says, its exit status and stderr read by `classify_probe`. Exercised
 /// by hand against every configured host (S5), never by the tests.
 pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
-    // TODO(human): begin block 5/5
+    // TODO(human): begin block 6/6
     // Every outcome becomes a class: a git that cannot start, or that outlives PROBE_DEADLINE_SECS, is Inconclusive and
     // never a pass. Running the command is exercised by hand against every configured host.
     // was: let agent: Option<String> = match request {
@@ -409,7 +385,7 @@ pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
     //         ProbeClass::Inconclusive
     //     }
     // }
-    // TODO(human): end block 5/5
+    // TODO(human): end block 6/6
 }
 
 /// The R6 decision for a `work` clone with its own remote: probe the work key, then every other key, and let
