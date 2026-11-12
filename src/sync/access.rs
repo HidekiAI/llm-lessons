@@ -177,6 +177,19 @@ mod tests {
     const HTTPS_ANONYMOUS_PRIVATE: &str =
         "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
 
+    /// An offered key and then a connection that dropped is no verdict: the host never said no.
+    const SSH_KEY_OFFERED_THEN_CONNECTION_RESET: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+         Connection reset by 192.0.2.1 port 22\n\
+         fatal: Could not read from remote repository.\n";
+    const SSH_KEY_ACCEPTED_THEN_UNRECOGNISED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+         debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
+         something no table has ever seen\n";
+
+    /// The server took the key and the session then failed for another reason: the key was not the problem.
+    const SSH_KEY_ACCEPTED_THEN_SESSION_FAILED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+         debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
+         git@github.com: Permission denied (publickey).\n";
+
     #[test]
     fn classify_probe_maps_each_stderr_family_to_its_class() {
         let cases: &[(bool, &str, ProbeClass)] = &[
@@ -274,11 +287,11 @@ mod tests {
         );
         assert!(matches!(
             decide_access(AuthDenied, &[]),
-            Refuse(reason) if reason.contains("work key")
+            Refuse(reason) if reason.contains("work key") && reason.contains("AuthDenied")
         ));
         assert!(matches!(
             decide_access(Inconclusive, &[("home", AuthDenied)]),
-            Refuse(reason) if reason.contains("work key")
+            Refuse(reason) if reason.contains("work key") && reason.contains("Inconclusive")
         ));
     }
 
@@ -320,14 +333,6 @@ mod tests {
         assert_eq!(Visibility::default(), Visibility::Unknown);
     }
 
-    /// An offered key and then a connection that dropped is no verdict: the host never said no.
-    const SSH_KEY_OFFERED_THEN_CONNECTION_RESET: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
-         Connection reset by 192.0.2.1 port 22\n\
-         fatal: Could not read from remote repository.\n";
-    const SSH_KEY_ACCEPTED_THEN_UNRECOGNISED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
-         debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
-         something no table has ever seen\n";
-
     #[test]
     fn an_offer_without_a_rejection_is_no_verdict() {
         assert_eq!(
@@ -336,11 +341,6 @@ mod tests {
             "a dropped connection after the offer must not read as the key being rejected"
         );
     }
-
-    /// The server took the key and the session then failed for another reason: the key was not the problem.
-    const SSH_KEY_ACCEPTED_THEN_SESSION_FAILED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
-         debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
-         git@github.com: Permission denied (publickey).\n";
 
     #[test]
     fn an_accepted_key_followed_by_a_failed_session_is_no_verdict() {
