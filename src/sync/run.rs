@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use super::access::{
+    AccessDecision, ProbeFn, WorkGuard, probe_remote, visibility_after_probe, work_guard_decision,
+};
 use super::cycle::{
     AfterPush, CycleOutcome, CycleResult, DomainInputs, DomainPlan, base_from_shown,
     combine_outcomes, domains_to_sync, interpret_show, new_last_synced, next_attempt,
@@ -59,6 +62,10 @@ pub struct CloneJob<'job> {
     pub whole_clone: bool,
     /// Extra environment for every git call; tests point git at their own config.
     pub git_env: &'job [(String, String)],
+    /// Runs the access probes; tests feed fake answers.
+    pub probe: ProbeFn<'job>,
+    /// The R6 inputs, set only for a clone that carries `work` with a remote of its own (R11).
+    pub work_guard: Option<WorkGuard>,
 }
 
 /// Syncs one clone. An `Err` is a failed cycle; a held lock is `Ok(LockHeld)`.
@@ -77,8 +84,14 @@ pub fn sync_clone(
             Ok(CycleOutcome::LockHeld)
         }
         Some(_held_lock) => {
-            let state_before: SyncState = read_state(&paths.state_file());
-            let cycle: Result<Option<String>> = run_cycle(job, &paths, &state_before, on_step);
+            let state_read: SyncState = read_state(&paths.state_file());
+            // The access guards run under the lock and before anything is fetched. A refusal fails the cycle (and
+            // counts as a failure) but is never remembered as a pass; the visibility step cannot fail.
+            let guarded: Result<SyncState> = check_access(job, state_read.clone(), now_secs);
+            let state_before: SyncState =
+                guarded.as_ref().map_or(state_read, |state| state.clone());
+            let cycle: Result<Option<String>> =
+                guarded.and_then(|state| run_cycle(job, &paths, &state, on_step));
             let recorded: CycleResult = match &cycle {
                 Ok(last_synced) => CycleResult::Succeeded {
                     // A partial run leaves BASE where it was; see `CloneJob::whole_clone`.
@@ -106,6 +119,18 @@ pub fn sync_clone(
             }
         }
     }
+}
+
+/// The access step of one cycle (plan step S5): the R6 guard for a clone with its own `work` remote, then the R13
+/// visibility probe. A refused guard is an error naming why; the returned state carries the visibility the probe found.
+fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> Result<SyncState> {
+    let guard_result: Result<()> = job.work_guard.as_ref().map_or(Ok(()), |guard| {
+        match work_guard_decision(job.remote, guard, job.probe) {
+            AccessDecision::Allow => Ok(()),
+            AccessDecision::Refuse(reason) => bail!("work is refused: {reason}"),
+        }
+    });
+    guard_result.map(|()| visibility_after_probe(state, job.remote, job.probe, now_secs))
 }
 
 /// Takes the clone lock without waiting: the lock is the open file, so the operating system frees it when the process
@@ -449,6 +474,30 @@ fn identity_agent_of(remote: &str) -> Option<String> {
     }
 }
 
+/// The R6 inputs for `clone`, or none: only a clone that carries `work` alone has a remote of its own (R11); when `work`
+/// shares its remote with another domain the guard is skipped and the other domains' keys are the same key. Every
+/// other clone's key that differs from the work key is probed, named by the domains it serves.
+fn work_guard_of(clone: &CloneSpec, clones: &[CloneSpec]) -> Option<WorkGuard> {
+    (clone.domains == [Domain::Work]).then(|| WorkGuard {
+        work_key: clone.ssh_key.clone(),
+        other_keys: clones
+            .iter()
+            .filter(|other_clone| other_clone.ssh_key != clone.ssh_key)
+            .map(|other_clone| {
+                (
+                    other_clone
+                        .domains
+                        .iter()
+                        .map(|domain| domain.as_str())
+                        .collect::<Vec<&str>>()
+                        .join("+"),
+                    other_clone.ssh_key.clone(),
+                )
+            })
+            .collect(),
+    })
+}
+
 /// Syncs every configured clone, or the ones carrying `requested`; a clone that fails does not stop the others, and
 /// each outcome is printed. Returns how the whole run ended.
 pub fn sync_configured(
@@ -493,6 +542,8 @@ pub fn sync_configured(
                         domains: &domains,
                         whole_clone: domains.len() == clone.domains.len(),
                         git_env,
+                        probe: &probe_remote,
+                        work_guard: work_guard_of(clone, &clones),
                     };
                     sync_clone(&job, &|_| Ok(()), now_secs)
                 });
@@ -538,6 +589,7 @@ mod tests {
     use super::*;
     use crate::db::{OpenMode, open};
     use crate::store::{Lesson, LessonPatch, NewLesson, all_lessons, find_by_id, insert, update};
+    use crate::sync::access::{ProbeClass, ProbeRequest, WorkGuard};
     use crate::sync::files::{ClonePaths, SyncState, from_jsonl, read_state, write_state};
     use crate::sync::git::{GitRunner, SYNC_FALLBACK_BRANCH};
 
@@ -640,6 +692,8 @@ mod tests {
                 domains: ONLY_SHARED,
                 whole_clone: true,
                 git_env: &self.git_env,
+                probe: &|_| ProbeClass::Inconclusive,
+                work_guard: None,
             }
         }
 
@@ -1542,6 +1596,195 @@ mod tests {
             remote_file(temp_dir.path(), &remote, stale_name),
             None,
             "the stale staged file never reaches the remote"
+        );
+    }
+    // S5b cycle rows (the `access_` prefix is what `cargo test access` matches): the guard runs under the lock, before
+    // anything is fetched, and a refusal is never remembered.
+    fn work_guard_for_tests() -> WorkGuard {
+        WorkGuard {
+            work_key: PathBuf::from("/k/work"),
+            other_keys: vec![("personal".to_string(), PathBuf::from("/k/home"))],
+        }
+    }
+
+    /// A probe that says `work_answer` for the work key, `home_answer` for the other key, and counts its calls.
+    fn probe_answering<'answers>(
+        work_answer: ProbeClass,
+        home_answer: ProbeClass,
+        calls: &'answers Cell<usize>,
+    ) -> impl Fn(&ProbeRequest) -> ProbeClass + 'answers {
+        move |request| {
+            calls.set(calls.get() + 1);
+            match request {
+                ProbeRequest::WithKey { key, .. } if key == &PathBuf::from("/k/work") => {
+                    work_answer
+                }
+                ProbeRequest::WithKey { .. } => home_answer,
+                ProbeRequest::Anonymous { .. } => ProbeClass::Inconclusive,
+            }
+        }
+    }
+
+    #[test]
+    fn access_a_refused_work_clone_fails_the_cycle_before_anything_is_fetched() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let calls = Cell::new(0);
+        let probe = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &calls);
+        let job = CloneJob {
+            probe: &probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(&remote)
+        };
+        let fetched = Cell::new(false);
+        let outcome = sync_clone(
+            &job,
+            &|_| {
+                fetched.set(true);
+                Ok(())
+            },
+            SOME_NOW,
+        );
+        let message = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            message.contains("personal"),
+            "the refusal names the key that can read: {message}"
+        );
+        assert!(!fetched.get(), "no cycle step ran");
+        assert_eq!(
+            remote_commit_count(temp_dir.path(), &remote),
+            0,
+            "nothing was pushed"
+        );
+        assert_eq!(
+            read_state(&machine.paths(&remote).state_file()).consecutive_failures,
+            1,
+            "the refusal counts as a failed cycle"
+        );
+    }
+
+    #[test]
+    fn access_an_allowed_work_clone_syncs_and_probes_each_key_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let calls = Cell::new(0);
+        let probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
+        let job = CloneJob {
+            probe: &probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(&remote)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "the work key and the one other key, nothing anonymous for a local path"
+        );
+    }
+
+    #[test]
+    fn access_a_clone_with_no_work_guard_probes_no_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let calls = Cell::new(0);
+        let probe = probe_answering(ProbeClass::AuthDenied, ProbeClass::Readable, &calls);
+        let job = CloneJob {
+            probe: &probe,
+            work_guard: None,
+            ..machine.job(&remote)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(calls.get(), 0, "a shared remote runs no R6 probe");
+    }
+
+    #[test]
+    fn access_no_probe_runs_while_the_lock_is_held() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        let lock_path: PathBuf = machine.paths(&remote).lock_file();
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        held.lock().unwrap();
+        let calls = Cell::new(0);
+        let probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
+        let job = CloneJob {
+            probe: &probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(&remote)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::LockHeld
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "the probes run under the lock, never while another sync holds it"
+        );
+    }
+
+    #[test]
+    fn access_a_refusal_is_not_remembered_as_a_pass() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let refused_calls = Cell::new(0);
+        let refusing = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &refused_calls);
+        let refused_job = CloneJob {
+            probe: &refusing,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(&remote)
+        };
+        assert!(sync_clone(&refused_job, &|_| Ok(()), SOME_NOW).is_err());
+        let allowed_calls = Cell::new(0);
+        let allowing =
+            probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &allowed_calls);
+        let allowed_job = CloneJob {
+            probe: &allowing,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(&remote)
+        };
+        assert_eq!(
+            sync_clone(&allowed_job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(
+            allowed_calls.get(),
+            2,
+            "the next cycle probed again instead of trusting the earlier refusal"
+        );
+    }
+
+    #[test]
+    fn access_a_probe_that_runs_again_every_cycle_never_stamps_a_local_remote() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        machine.sync(&remote);
+        let state = read_state(&machine.paths(&remote).state_file());
+        assert_eq!(
+            state.last_access_check_unix_secs, None,
+            "no https form, so nothing was probed or recorded"
         );
     }
 }

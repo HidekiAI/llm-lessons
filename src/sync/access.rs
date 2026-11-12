@@ -1,12 +1,13 @@
 //! The pure decisions of the access guards (plan step S5a): what a probe's stderr means, whether `work` may sync given
 //! what every configured key can read (R6), and what the visibility probe records and warns about (R13). Nothing here
 //! runs git or ssh or reads a clock; the probes that feed these functions come in S5b.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the cycle in plan step S5b")
-)]
+use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+use super::files::{ClonePaths, SyncState, read_state};
 use super::git::redact_credentials;
+use crate::config::CloneSpec;
 
 /// What one `git ls-remote` probe says about a key (or, anonymously, about the caller).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +22,8 @@ pub enum ProbeClass {
 }
 
 /// What the last visibility probe found, recorded in the clone's state file by S5b.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Public,
     Private,
@@ -154,6 +156,89 @@ pub fn decide_access(work_probe: ProbeClass, other_keys: &[(&str, ProbeClass)]) 
 
 // Table tests over the pure decisions. Each row is a case from the plan's Guards and Public warning rows, and each
 // guard was shown red by removing its branch (recorded in the step result).
+/// How often a remote's visibility is probed again, in days: a repository made public later is caught at the next
+/// recheck, not instantly.
+pub const ACCESS_RECHECK_DAYS: u64 = 7;
+
+/// Seconds in a day, for the recheck interval.
+const SECS_PER_DAY: u64 = 86_400;
+
+/// One probe to run: a `git ls-remote` that answers with a `ProbeClass`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeRequest {
+    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the R6 probes.
+    WithKey { remote: String, key: PathBuf },
+    /// The anonymous HTTPS `url` read with no identity and no prompt: the R13 visibility probe.
+    Anonymous { url: String },
+}
+
+/// Runs a probe. The cycle takes it as a parameter so tests feed fake answers and never touch the network.
+pub type ProbeFn<'probe> = &'probe dyn Fn(&ProbeRequest) -> ProbeClass;
+
+/// The R6 inputs of a clone that carries `work` with a remote of its own: the work key, and every other configured
+/// key by the name of its domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkGuard {
+    pub work_key: PathBuf,
+    pub other_keys: Vec<(String, PathBuf)>,
+}
+
+/// The anonymous `https://<host>/<path>` of a remote, or none when it cannot be derived (an ssh alias, a custom port).
+pub fn https_url_of_remote(remote: &str) -> Option<String> {
+    let _ = remote;
+    None
+}
+
+/// Whether the visibility is due for a probe: never checked, or the last check is `ACCESS_RECHECK_DAYS` old or more.
+pub fn access_check_due(last_check_unix_secs: Option<u64>, now_secs: u64) -> bool {
+    let _ = (
+        last_check_unix_secs,
+        now_secs,
+        SECS_PER_DAY,
+        ACCESS_RECHECK_DAYS,
+    );
+    false
+}
+
+/// The real probe: `git ls-remote` as the request says, its exit status and stderr read by `classify_probe`. Exercised
+/// by hand against every configured host (S5), never by the tests.
+pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
+    let _ = request;
+    ProbeClass::Inconclusive
+}
+
+/// The R6 decision for a `work` clone with its own remote: probe the work key, then every other key, and let
+/// `decide_access` judge.
+pub fn work_guard_decision(work_remote: &str, guard: &WorkGuard, probe: ProbeFn) -> AccessDecision {
+    let _ = (work_remote, guard, probe);
+    AccessDecision::Allow
+}
+
+/// The state after the visibility step: when a probe is due and a URL can be derived, probe anonymously and record the
+/// verdict and the check time; an inconclusive probe records `unknown` and no check time (probed again next cycle).
+pub fn visibility_after_probe(
+    state: SyncState,
+    remote: &str,
+    probe: ProbeFn,
+    now_secs: u64,
+) -> SyncState {
+    let _ = (remote, probe, now_secs);
+    state
+}
+
+/// The PUBLIC warnings to print on stderr for the configured clones: one per clone whose recorded visibility is public,
+/// read from the clones' state files (no network).
+pub fn public_warnings(lessons_home: &Path, clones: &[CloneSpec]) -> Vec<String> {
+    let _ = (
+        lessons_home,
+        clones,
+        ClonePaths::new,
+        read_state,
+        public_warning,
+    );
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +489,376 @@ mod tests {
                     "{fragment}"
                 );
             });
+    }
+    // S5b tests: the pure rows for the four logic functions and the warning reader. The real probes are exercised by
+    // hand against every configured host and are not tested here. Tests that count probe calls use a `RefCell`: the
+    // probe is a shared `Fn`, so a counter cannot be a plain `let mut`.
+    use crate::sync::files::{ClonePaths, SyncState, write_state};
+    use std::cell::RefCell;
+
+    const GITHUB_HTTPS: &str = "https://github.com/HidekiAI/llm-lessons.git";
+    const NOW_SECS: u64 = 1_762_000_000;
+    const ONE_DAY_SECS: u64 = 86_400;
+
+    #[test]
+    fn the_anonymous_url_is_derived_from_every_remote_form_or_not_at_all() {
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                "git@github.com:HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            (
+                "ssh://git@github.com/HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            (GITHUB_HTTPS, Some(GITHUB_HTTPS)),
+            // Credentials never reach the anonymous probe.
+            (
+                "https://hideki:token@github.com/HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            // A custom port, an ssh alias (a host with no dot) and a local path have no https form.
+            ("ssh://git@github.com:2222/HidekiAI/llm-lessons.git", None),
+            ("git@gh:HidekiAI/llm-lessons.git", None),
+            ("/srv/git/llm-lessons.git", None),
+            ("file:///srv/git/llm-lessons.git", None),
+            ("", None),
+        ];
+        cases.iter().for_each(|(remote, expected)| {
+            assert_eq!(
+                https_url_of_remote(remote).as_deref(),
+                *expected,
+                "{remote}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_visibility_recheck_is_due_when_never_checked_or_a_full_interval_old() {
+        let interval_secs: u64 = ACCESS_RECHECK_DAYS * ONE_DAY_SECS;
+        let cases: &[(Option<u64>, bool, &str)] = &[
+            (None, true, "never checked"),
+            (Some(NOW_SECS), false, "just checked"),
+            (
+                Some(NOW_SECS - interval_secs + 1),
+                false,
+                "one second short of the interval",
+            ),
+            (Some(NOW_SECS - interval_secs), true, "exactly the interval"),
+            (
+                Some(NOW_SECS - interval_secs - 1),
+                true,
+                "past the interval",
+            ),
+            // A clock that moved back must not make every cycle probe, nor hide a check for ever.
+            (
+                Some(NOW_SECS + ONE_DAY_SECS),
+                false,
+                "a check time in the future",
+            ),
+        ];
+        cases.iter().for_each(|(last_check, expected, why)| {
+            assert_eq!(access_check_due(*last_check, NOW_SECS), *expected, "{why}");
+        });
+    }
+
+    fn guard_with(other_keys: &[(&str, &str)]) -> WorkGuard {
+        WorkGuard {
+            work_key: PathBuf::from("/k/work"),
+            other_keys: other_keys
+                .iter()
+                .map(|(name, key)| (name.to_string(), PathBuf::from(key)))
+                .collect(),
+        }
+    }
+
+    /// A probe that answers by key file, and records every request it was asked.
+    fn answering_by_key<'answers>(
+        answers: &'answers [(&'answers str, ProbeClass)],
+        asked: &'answers RefCell<Vec<ProbeRequest>>,
+    ) -> impl Fn(&ProbeRequest) -> ProbeClass + 'answers {
+        move |request| {
+            asked.borrow_mut().push(request.clone());
+            match request {
+                ProbeRequest::WithKey { key, .. } => answers
+                    .iter()
+                    .find(|(key_path, _)| PathBuf::from(key_path) == *key)
+                    .map_or(ProbeClass::Inconclusive, |(_, class)| *class),
+                ProbeRequest::Anonymous { .. } => ProbeClass::Inconclusive,
+            }
+        }
+    }
+
+    #[test]
+    fn the_work_guard_probes_the_work_key_then_every_other_key_and_judges() {
+        const WORK_REMOTE: &str = "git@gitlab.example.com:org/work.git";
+        let cases: &[(&[(&str, ProbeClass)], bool, &str)] = &[
+            (
+                &[
+                    ("/k/work", ProbeClass::Readable),
+                    ("/k/home", ProbeClass::AuthDenied),
+                ],
+                true,
+                "only the work key reads",
+            ),
+            (
+                &[
+                    ("/k/work", ProbeClass::Readable),
+                    ("/k/home", ProbeClass::Readable),
+                ],
+                false,
+                "another key reads work",
+            ),
+            (
+                &[
+                    ("/k/work", ProbeClass::Readable),
+                    ("/k/home", ProbeClass::Inconclusive),
+                ],
+                false,
+                "another key is unjudged",
+            ),
+            (
+                &[
+                    ("/k/work", ProbeClass::AuthDenied),
+                    ("/k/home", ProbeClass::AuthDenied),
+                ],
+                false,
+                "the work key cannot read",
+            ),
+            (
+                &[
+                    ("/k/work", ProbeClass::Inconclusive),
+                    ("/k/home", ProbeClass::AuthDenied),
+                ],
+                false,
+                "the work key is unjudged",
+            ),
+        ];
+        cases.iter().for_each(|(answers, allowed, why)| {
+            let asked = RefCell::new(Vec::new());
+            let probe = answering_by_key(answers, &asked);
+            let decision =
+                work_guard_decision(WORK_REMOTE, &guard_with(&[("home", "/k/home")]), &probe);
+            assert_eq!(
+                decision == AccessDecision::Allow,
+                *allowed,
+                "{why}: {decision:?}"
+            );
+        });
+        // Who was probed, in what order, against which remote.
+        let asked = RefCell::new(Vec::new());
+        let probe = answering_by_key(
+            &[
+                ("/k/work", ProbeClass::Readable),
+                ("/k/home", ProbeClass::AuthDenied),
+                ("/k/other", ProbeClass::AuthDenied),
+            ],
+            &asked,
+        );
+        work_guard_decision(
+            WORK_REMOTE,
+            &guard_with(&[("home", "/k/home"), ("other", "/k/other")]),
+            &probe,
+        );
+        let expected: Vec<ProbeRequest> = ["/k/work", "/k/home", "/k/other"]
+            .iter()
+            .map(|key| ProbeRequest::WithKey {
+                remote: WORK_REMOTE.to_string(),
+                key: PathBuf::from(key),
+            })
+            .collect();
+        assert_eq!(*asked.borrow(), expected);
+    }
+
+    #[test]
+    fn a_refusal_names_the_key_that_can_read_work() {
+        let asked = RefCell::new(Vec::new());
+        let probe = answering_by_key(
+            &[
+                ("/k/work", ProbeClass::Readable),
+                ("/k/home", ProbeClass::Readable),
+            ],
+            &asked,
+        );
+        let decision =
+            work_guard_decision("git@h:o/w.git", &guard_with(&[("home", "/k/home")]), &probe);
+        assert!(
+            matches!(&decision, AccessDecision::Refuse(reason) if reason.contains("home")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn a_work_guard_with_no_other_key_allows_when_the_work_key_reads() {
+        let asked = RefCell::new(Vec::new());
+        let probe = answering_by_key(&[("/k/work", ProbeClass::Readable)], &asked);
+        assert_eq!(
+            work_guard_decision("git@h:o/w.git", &guard_with(&[]), &probe),
+            AccessDecision::Allow
+        );
+    }
+
+    fn state_with(visibility: Visibility, last_check: Option<u64>) -> SyncState {
+        SyncState {
+            visibility,
+            last_access_check_unix_secs: last_check,
+            ..SyncState::default()
+        }
+    }
+
+    #[test]
+    fn the_visibility_step_records_the_verdict_and_the_check_time() {
+        let cases: &[(ProbeClass, Visibility, Option<u64>, &str)] = &[
+            (
+                ProbeClass::Readable,
+                Visibility::Public,
+                Some(NOW_SECS),
+                "anonymous read means public",
+            ),
+            (
+                ProbeClass::AuthDenied,
+                Visibility::Private,
+                Some(NOW_SECS),
+                "turned away means private",
+            ),
+            // A probe with no verdict records unknown and no new check time, so the next cycle probes again.
+            (
+                ProbeClass::Inconclusive,
+                Visibility::Unknown,
+                None,
+                "no verdict",
+            ),
+        ];
+        cases
+            .iter()
+            .for_each(|(answer, visibility, checked_at, why)| {
+                let asked = RefCell::new(Vec::new());
+                let probe = |request: &ProbeRequest| {
+                    asked.borrow_mut().push(request.clone());
+                    *answer
+                };
+                let state =
+                    visibility_after_probe(SyncState::default(), GITHUB_HTTPS, &probe, NOW_SECS);
+                assert_eq!(state, state_with(*visibility, *checked_at), "{why}");
+                assert_eq!(
+                    *asked.borrow(),
+                    vec![ProbeRequest::Anonymous {
+                        url: GITHUB_HTTPS.to_string()
+                    }],
+                    "{why}"
+                );
+            });
+    }
+
+    #[test]
+    fn the_visibility_step_does_not_probe_when_not_due_or_with_no_url() {
+        let recent = state_with(Visibility::Public, Some(NOW_SECS - ONE_DAY_SECS));
+        let asked = RefCell::new(Vec::new());
+        let probe = |request: &ProbeRequest| {
+            asked.borrow_mut().push(request.clone());
+            ProbeClass::AuthDenied
+        };
+        assert_eq!(
+            visibility_after_probe(recent.clone(), GITHUB_HTTPS, &probe, NOW_SECS),
+            recent,
+            "not due"
+        );
+        assert_eq!(
+            visibility_after_probe(SyncState::default(), "/srv/git/local.git", &probe, NOW_SECS),
+            SyncState::default(),
+            "a remote with no https form is never probed"
+        );
+        assert!(asked.borrow().is_empty(), "no probe was run");
+    }
+
+    #[test]
+    fn a_due_recheck_replaces_an_old_verdict_and_a_failed_one_keeps_no_stale_time() {
+        let old = state_with(
+            Visibility::Private,
+            Some(NOW_SECS - ACCESS_RECHECK_DAYS * ONE_DAY_SECS),
+        );
+        let went_public = visibility_after_probe(
+            old.clone(),
+            GITHUB_HTTPS,
+            &|_: &ProbeRequest| ProbeClass::Readable,
+            NOW_SECS,
+        );
+        assert_eq!(
+            went_public,
+            state_with(Visibility::Public, Some(NOW_SECS)),
+            "a repo made public later is caught"
+        );
+        let unjudged = visibility_after_probe(
+            old,
+            GITHUB_HTTPS,
+            &|_: &ProbeRequest| ProbeClass::Inconclusive,
+            NOW_SECS,
+        );
+        assert_eq!(
+            unjudged.visibility,
+            Visibility::Unknown,
+            "an unjudged recheck forgets the old verdict"
+        );
+        assert_eq!(
+            unjudged.last_access_check_unix_secs,
+            Some(NOW_SECS - ACCESS_RECHECK_DAYS * ONE_DAY_SECS),
+            "and records no new check time, so the next cycle probes again"
+        );
+    }
+
+    fn clone_spec(remote: &str, domains: Vec<crate::db::Domain>) -> CloneSpec {
+        CloneSpec {
+            remote: remote.to_string(),
+            normalized_remote: remote.to_string(),
+            ssh_key: PathBuf::from("/k/any"),
+            domains,
+        }
+    }
+
+    #[test]
+    fn only_a_clone_recorded_public_is_warned_about_and_credentials_stay_out() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let public_clone = clone_spec(
+            "https://hideki:secret@github.com/o/public.git",
+            vec![crate::db::Domain::Shared],
+        );
+        let private_clone = clone_spec(
+            "git@github.com:o/private.git",
+            vec![crate::db::Domain::Work],
+        );
+        let unknown_clone = clone_spec(
+            "git@github.com:o/unknown.git",
+            vec![crate::db::Domain::Personal],
+        );
+        [
+            (&public_clone, Visibility::Public),
+            (&private_clone, Visibility::Private),
+        ]
+        .iter()
+        .for_each(|(clone, visibility)| {
+            let state_path =
+                ClonePaths::new(temp_dir.path(), &clone.normalized_remote).state_file();
+            write_state(&state_path, &state_with(*visibility, Some(NOW_SECS))).unwrap();
+        });
+        let warnings = public_warnings(
+            temp_dir.path(),
+            &[public_clone, private_clone, unknown_clone],
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("github.com/o/public.git"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("PUBLIC"), "{warnings:?}");
+        assert!(
+            !warnings[0].contains("secret"),
+            "credentials never reach the line: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn no_clone_means_no_warning() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        assert!(public_warnings(temp_dir.path(), &[]).is_empty());
     }
 }

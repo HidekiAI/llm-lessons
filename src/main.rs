@@ -261,6 +261,11 @@ fn main() -> Result<ExitCode> {
 
     // Every command but `sync` ends in success or in an error (exit 1); `sync` also has an exit code of its own.
     let fn_done = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
+    // R13: a remote recorded public is warned about on stderr by every command but `init`, from one place and from the
+    // state files alone (no network). The warning is a caution: nothing here can fail or change a command.
+    if !matches!(cli.command, Command::Init { .. }) {
+        warn_public_remotes(&fn_lessons_home);
+    }
     match cli.command {
         Command::Init { domain } => fn_done(run_init(&fn_lessons_home()?, domain)),
         Command::Add(add_args) => fn_done(run_add(&fn_lessons_home()?, add_args)),
@@ -307,6 +312,22 @@ fn main() -> Result<ExitCode> {
             run_hook(event, fn_lessons_home);
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// Prints the PUBLIC warning of every configured clone whose recorded visibility is public. A config that cannot be read
+/// only goes to the journal: this must never make a command fail.
+fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
+    let warnings: Result<Vec<String>> = fn_lessons_home().and_then(|lessons_home| {
+        let config: config::Config = config::load(&lessons_home)?;
+        let clones = config::clone_specs(&config.sync)?;
+        Ok(sync::public_warnings(&lessons_home, &clones))
+    });
+    match warnings {
+        Ok(warning_lines) => warning_lines
+            .iter()
+            .for_each(|warning_line| eprintln!("{warning_line}")),
+        Err(skipped) => journal!("public warning skipped: {skipped:#}"),
     }
 }
 

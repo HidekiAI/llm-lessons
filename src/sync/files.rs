@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::access::Visibility;
 use crate::db::Domain;
 use crate::journal;
 
@@ -236,6 +237,10 @@ pub struct SyncState {
     pub last_pull_unix_secs: Option<u64>,
     /// Failed cycles in a row, for the backoff; a successful cycle resets it.
     pub consecutive_failures: u32,
+    /// What the last visibility probe found for the remote (R13): `public` makes every command warn.
+    pub visibility: Visibility,
+    /// When the visibility was last probed conclusively, in seconds since the Unix epoch, for the recheck interval.
+    pub last_access_check_unix_secs: Option<u64>,
 }
 
 /// The state file, or the default when it is missing, empty, corrupt or unreadable. The default has no
@@ -577,6 +582,7 @@ mod tests {
             last_synced_commit: Some(SOME_COMMIT.to_string()),
             last_pull_unix_secs: Some(SOME_PULL_SECS),
             consecutive_failures: SOME_FAILURES,
+            ..SyncState::default()
         };
         write_state(&state_path, &state).unwrap();
         assert_eq!(read_state(&state_path), state, "round trip");

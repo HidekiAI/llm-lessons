@@ -15,6 +15,7 @@ mod files;
 mod git;
 mod run;
 
+pub use access::public_warnings;
 pub use cycle::exit_for;
 pub use git::redact_credentials;
 pub use run::sync_configured;

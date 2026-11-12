@@ -219,6 +219,8 @@ pub fn state_after_cycle(state: SyncState, result: CycleResult, now_secs: u64) -
             last_synced_commit: last_synced.or(state.last_synced_commit),
             last_pull_unix_secs: Some(now_secs),
             consecutive_failures: 0,
+            visibility: state.visibility,
+            last_access_check_unix_secs: state.last_access_check_unix_secs,
         },
         CycleResult::Failed => SyncState {
             consecutive_failures: state.consecutive_failures.saturating_add(1),
@@ -667,6 +669,7 @@ mod tests {
             last_synced_commit: Some("old".to_string()),
             last_pull_unix_secs: Some(EARLIER),
             consecutive_failures: SOME_FAILURES,
+            ..SyncState::default()
         };
         assert_eq!(
             state_after_cycle(
@@ -689,7 +692,8 @@ mod tests {
             SyncState {
                 last_synced_commit: Some("new".to_string()),
                 last_pull_unix_secs: Some(SOME_NOW),
-                consecutive_failures: 0
+                consecutive_failures: 0,
+                ..SyncState::default()
             }
         );
         assert_eq!(
