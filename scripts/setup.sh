@@ -30,6 +30,10 @@ readonly MCP_SERVER_NAME="lessons"
 readonly SKILL_NAME="lessons"
 # The skill this repo ships, copied into each agent's skills directory by install_skill.
 readonly SKILL_SOURCE="$REPO_ROOT/skills/$SKILL_NAME/SKILL.md"
+
+# The opencode plugin this repo ships: it runs the prompt hook before each message (opencode has no hook config of its own).
+readonly PLUGIN_NAME="lessons-hook.js"
+readonly PLUGIN_SOURCE="$REPO_ROOT/integrations/opencode/$PLUGIN_NAME"
 readonly EXIT_USAGE=2
 readonly EXIT_FAILURE=1
 readonly KNOWN_UPDATE_MODES="live on-demand"
@@ -557,18 +561,19 @@ skill_install_dir() {
 # The symlink check covers the skill directory and every directory above it up to HOME (or up to / when the target is
 # outside HOME). Not guarded: a link above HOME, and another process creating SKILL.md between this check and the copy.
 skill_install_decision() {
+    # The second argument is the file that marks "already installed" (the skill's SKILL.md unless a caller says otherwise).
     # A symlink anywhere between HOME and the skill directory points into some other repository, such as the owner's own
     # skills or dotfiles repo: writing there would put files in that repo, so it wins over everything. An existing
     # SKILL.md, even a dangling link, is never overwritten. Name the two facts, then one `case` over both, with a failing
     # default arm so a new combination cannot fall through silently.
-    local target_dir="$1" tree_kind=plain skill_file_kind walked_path home_root="${HOME:-/}"
+    local target_dir="$1" marker_file_name="${2:-SKILL.md}" tree_kind=plain skill_file_kind walked_path home_root="${HOME:-/}"
     home_root="${home_root%"${home_root##*[!/]}"}" # trailing slashes of HOME (one or many) would never equal what dirname prints
     walked_path="$target_dir"
     while [[ "$walked_path" != "$home_root" && "$walked_path" != / && "$walked_path" != . ]]; do
         [[ -L "$walked_path" ]] && tree_kind="link"
         walked_path="$(dirname "$walked_path")"
     done
-    skill_file_kind="$([[ -e "$target_dir/SKILL.md" || -L "$target_dir/SKILL.md" ]] && echo there || echo none)"
+    skill_file_kind="$([[ -e "$target_dir/$marker_file_name" || -L "$target_dir/$marker_file_name" ]] && echo there || echo none)"
     case "$tree_kind/$skill_file_kind" in
         link/*) printf '%s\n' skip-symlink ;;
         plain/there) printf '%s\n' skip-exists ;;
@@ -602,6 +607,45 @@ install_skill() {
             ;;
         skip-exists) log_step "skip skill for $agent_name: $target_dir/SKILL.md already exists, left as it is" ;;
         skip-symlink) log_step "skip skill for $agent_name: a symlink on $target_dir or a directory above it (up to HOME), left alone" ;;
+    esac
+}
+
+# Copies the opencode hook plugin into opencode's plugins directory, with the same guards as install_skill: never
+# overwrites, leaves a symlinked plugins directory (or any directory above it up to HOME) alone, and returns 0 for a
+# skip or a failed copy. Only opencode has this plugin; the other agent gets its hook from its own settings.
+install_hook_plugin() {
+    local agent_name="$1" plugins_dir decision
+    if [[ "$agent_name" != opencode ]]; then
+        return 0
+    fi
+    if ! command -v opencode >/dev/null 2>&1; then
+        log_step "skip hook plugin for opencode: not installed"
+        return 0
+    fi
+    case "${HOME:-}" in
+        /?*) ;;
+        *)
+            printf 'setup: HOME is empty or not an absolute path\n' >&2
+            return 1
+            ;;
+    esac
+    plugins_dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
+    case "$plugins_dir" in
+        /*) ;;
+        *)
+            printf 'setup: the plugins directory "%s" is not an absolute path; check XDG_CONFIG_HOME\n' "$plugins_dir" >&2
+            return 1
+            ;;
+    esac
+    decision="$(skill_install_decision "$plugins_dir" "$PLUGIN_NAME")" || return 1
+    case "$decision" in
+        install)
+            if ! run_step mkdir -p "$plugins_dir" || ! run_step cp -- "$PLUGIN_SOURCE" "$plugins_dir/$PLUGIN_NAME"; then
+                log_step "WARNING: installing the hook plugin failed; copy $PLUGIN_SOURCE to $plugins_dir by hand"
+            fi
+            ;;
+        skip-exists) log_step "skip hook plugin: $plugins_dir/$PLUGIN_NAME already exists, left as it is" ;;
+        skip-symlink) log_step "skip hook plugin: a symlink on $plugins_dir or a directory above it (up to HOME), left alone; link $PLUGIN_SOURCE there yourself" ;;
     esac
 }
 
@@ -653,6 +697,7 @@ run_setup() {
         for agent_name in ${agent_names[@]+"${agent_names[@]}"}; do
             # A skill that cannot be installed must not stop the rest of setup (set -e would, on a return of 1).
             install_skill "$agent_name" || log_step "WARNING: no skill installed for $agent_name"
+            install_hook_plugin "$agent_name" || log_step "WARNING: no hook plugin installed for $agent_name"
         done
     fi
     log_step "setup: done"
@@ -734,6 +779,30 @@ run_skill_self_test() {
             printf '%s %s' "$exit_code" "$(printf '%s\n' "$install_output" | grep -c 'WARNING: installing the skill')"
         )"
 
+    # install_hook_plugin end to end: fresh install is byte for byte, an existing file is kept, a symlinked plugins
+    # directory is left alone, claude gets nothing, and --dry-run writes nothing.
+    local home_plug="$test_root/h-plug" home_plug_link="$test_root/h-plug-link" home_plug_dry="$test_root/h-plug-dry" home_plug_claude="$test_root/h-plug-claude"
+    mkdir -p "$home_plug" "$home_plug_link/.config/opencode" "$home_plug_dry" "$home_plug_claude" "$test_root/other-repo-plugins"
+    (HOME="$home_plug" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_hook_plugin opencode) >/dev/null 2>&1 || true
+    check_equal "install_hook_plugin: a fresh HOME gets the shipped plugin, byte for byte" "same" \
+        "$(cmp -s "$PLUGIN_SOURCE" "$home_plug/.config/opencode/plugins/$PLUGIN_NAME" && echo same || echo different)"
+    printf 'edited by the user\n' >"$home_plug/.config/opencode/plugins/$PLUGIN_NAME"
+    (HOME="$home_plug" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_hook_plugin opencode) >/dev/null 2>&1 || true
+    check_equal "install_hook_plugin: a second run never overwrites an existing plugin (back-to-back)" "edited by the user" \
+        "$(cat "$home_plug/.config/opencode/plugins/$PLUGIN_NAME")"
+    ln -s "$test_root/other-repo-plugins" "$home_plug_link/.config/opencode/plugins"
+    (HOME="$home_plug_link" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_hook_plugin opencode) >/dev/null 2>&1 || true
+    check_equal "install_hook_plugin: a plugins directory that is a symlink into another repository is left untouched" "0" \
+        "$(find "$test_root/other-repo-plugins" -mindepth 1 | wc -l | tr -d ' ')"
+    (HOME="$home_plug_claude" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_hook_plugin claude) >/dev/null 2>&1 || true
+    check_equal "install_hook_plugin: claude has no plugin and gets nothing" "0" "$(find "$home_plug_claude" -mindepth 1 | wc -l | tr -d ' ')"
+    (HOME="$home_plug_dry" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" dry_run=true install_hook_plugin opencode) >/dev/null 2>&1 || true
+    local home_plug_none="$test_root/h-plug-none"
+    mkdir -p "$home_plug_none"
+    (HOME="$home_plug_none" XDG_CONFIG_HOME='' PATH="$bare_bin" install_hook_plugin opencode) >/dev/null 2>&1 || true
+    check_equal "install_hook_plugin: opencode not installed gets nothing" "0" "$(find "$home_plug_none" -mindepth 1 | wc -l | tr -d ' ')"
+    check_equal "install_hook_plugin: --dry-run writes nothing" "0" "$(find "$home_plug_dry" -mindepth 1 | wc -l | tr -d ' ')"
+
     # A symlink anywhere between HOME and the skill directory is skipped, not only the three nearest paths.
     local home_anc="$test_root/h-anc"
     mkdir -p "$home_anc" "$test_root/dotfiles-real/opencode/skills"
@@ -788,6 +857,11 @@ run_skill_self_test() {
         "$(printf '%s\n' "$with_skills" | grep -c 'run: cp -- .*skills/lessons/SKILL.md') $(printf '%s\n' "$without_skills" | grep -c 'skills/lessons')"
     check_equal "setup: a dry run of the whole script writes no skill file" "0" \
         "$(find "$test_root/h-run" -name SKILL.md | wc -l | tr -d ' ')"
+    local with_plugin without_plugin
+    with_plugin="$(HOME="$test_root/h-run" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" bash "${BASH_SOURCE[0]}" --domains work --agents opencode --no-sync --dry-run 2>&1 </dev/null || true)"
+    without_plugin="$(HOME="$test_root/h-run" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" bash "${BASH_SOURCE[0]}" --domains work --agents opencode --no-sync --no-skills --dry-run 2>&1 </dev/null || true)"
+    check_equal "setup: the opencode hook plugin is installed by default and --no-skills leaves it out" "1 0" \
+        "$(printf '%s\n' "$with_plugin" | grep -c 'run: cp -- .*lessons-hook\.js') $(printf '%s\n' "$without_plugin" | grep -c 'lessons-hook')"
 
     # The shipped file itself.
     check_equal "shipped skill: named lessons in its frontmatter" "name: lessons" "$(sed -n 2p "$SKILL_SOURCE")"
