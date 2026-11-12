@@ -25,6 +25,7 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
 
 /// A protocol-level failure, answered as a JSON-RPC error rather than as a tool result.
 struct RequestError {
@@ -161,7 +162,12 @@ fn handle_request(
     match method {
         "initialize" => initialize_result(params),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => config::load(lessons_home)
+            .map(|loaded_config| json!({ "tools": tool_definitions(&loaded_config.mcp.domains) }))
+            .map_err(|config_error| RequestError {
+                code: INTERNAL_ERROR,
+                message: format!("{config_error:#}"),
+            }),
         "tools/call" => call_tool(lessons_home, params),
         unknown_method => Err(RequestError {
             code: METHOD_NOT_FOUND,
@@ -192,9 +198,20 @@ fn initialize_result(params: Option<&Value>) -> Result<Value, RequestError> {
     }))
 }
 
-/// The two tools. Descriptions stay short: they are read into every agent session.
-fn tool_definitions() -> Value {
-    let domain_names: Vec<&str> = Domain::ALL.iter().map(|domain| domain.as_str()).collect();
+/// The two tools, offering only the domains enabled in `[mcp] domains` (a schema that lists a domain the
+/// server then refuses invites a call that cannot work), and no tool at all when none is enabled (an
+/// empty `enum` is not valid JSON Schema). Descriptions stay short: they are read into every agent session.
+fn tool_definitions(enabled_domains: &[Domain]) -> Value {
+    if enabled_domains.is_empty() {
+        return json!([]);
+    }
+    // A domain listed twice is offered once, in the order of its first mention: an `enum` must not repeat a value.
+    let domain_names: Vec<&str> = enabled_domains
+        .iter()
+        .enumerate()
+        .filter(|(position, domain)| !enabled_domains[..*position].contains(domain))
+        .map(|(_, domain)| domain.as_str())
+        .collect();
     json!([
         {
             "name": "search_lessons",
@@ -450,6 +467,131 @@ mod tests {
             replies,
             vec![json!({ "jsonrpc": "2.0", "id": "ping", "result": {} })]
         );
+    }
+
+    /// What `tools/list` offers as domains: the `enum` of `search_lessons`' `domains` items and of
+    /// `record_lesson`'s `domain`, as written in the two tool schemas.
+    fn offered_domains(lessons_home: &Path) -> (Vec<String>, Vec<String>) {
+        let replies: Vec<Value> = exchange(
+            lessons_home,
+            &[json!({ "jsonrpc": "2.0", "id": "list", "method": "tools/list" })],
+        );
+        let enum_names = |domain_enum: &Value| -> Vec<String> {
+            domain_enum
+                .as_array()
+                .expect("an enum array")
+                .iter()
+                .filter_map(|name| name.as_str().map(String::from))
+                .collect()
+        };
+        let tools: &Value = &replies[0]["result"]["tools"];
+        (
+            enum_names(&tools[0]["inputSchema"]["properties"]["domains"]["items"]["enum"]),
+            enum_names(&tools[1]["inputSchema"]["properties"]["domain"]["enum"]),
+        )
+    }
+
+    /// The schemas promise only what the server will accept: under the default `[mcp] domains` a
+    /// domain left out of the config (personal) is not offered, so an agent never asks for it and is
+    /// refused. Issue 3.
+    #[test]
+    fn tools_list_offers_only_the_domains_enabled_for_mcp() {
+        let lessons_home = work_laptop_home();
+        let wanted: Vec<String> = vec!["work".to_string(), "shared".to_string()];
+        assert_eq!(
+            offered_domains(lessons_home.path()),
+            (wanted.clone(), wanted)
+        );
+    }
+
+    #[test]
+    fn tools_list_follows_the_domains_the_config_enables() {
+        let cases: &[(&str, &[&str])] = &[
+            ("[mcp]\ndomains = [\"shared\"]\n", &["shared"]),
+            (
+                "[mcp]\ndomains = [\"personal\", \"shared\"]\n",
+                &["personal", "shared"],
+            ),
+            (
+                "[mcp]\ndomains = [\"work\", \"personal\", \"shared\"]\n",
+                &["work", "personal", "shared"],
+            ),
+        ];
+        cases.iter().for_each(|(config_text, expected_names)| {
+            let lessons_home = work_laptop_home();
+            std::fs::write(lessons_home.path().join("config.toml"), config_text).unwrap();
+            let wanted: Vec<String> = expected_names.iter().map(|name| name.to_string()).collect();
+            assert_eq!(
+                offered_domains(lessons_home.path()),
+                (wanted.clone(), wanted),
+                "{config_text:?}"
+            );
+        });
+    }
+
+    /// An `enum` must not repeat a value (JSON Schema), so a domain listed twice in the config is offered once,
+    /// in the order of its first mention.
+    #[test]
+    fn tools_list_offers_a_domain_listed_twice_once() {
+        let lessons_home = work_laptop_home();
+        std::fs::write(
+            lessons_home.path().join("config.toml"),
+            "[mcp]\ndomains = [\"shared\", \"work\", \"shared\"]\n",
+        )
+        .unwrap();
+        let wanted: Vec<String> = vec!["shared".to_string(), "work".to_string()];
+        assert_eq!(
+            offered_domains(lessons_home.path()),
+            (wanted.clone(), wanted)
+        );
+    }
+
+    /// A config that does not load is reported by `tools/list` itself, as every tool call already does,
+    /// instead of listing tools that would then fail.
+    #[test]
+    fn tools_list_reports_a_config_that_does_not_load() {
+        let lessons_home = work_laptop_home();
+        std::fs::write(
+            lessons_home.path().join("config.toml"),
+            "[mcp]\ndomains = \"shared\"\n",
+        )
+        .unwrap();
+        let replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[json!({ "jsonrpc": "2.0", "id": "list", "method": "tools/list" })],
+        );
+        assert!(replies[0].get("result").is_none(), "{}", replies[0]);
+        assert_eq!(
+            replies[0]["error"]["code"],
+            json!(INTERNAL_ERROR),
+            "{}",
+            replies[0]
+        );
+        assert!(
+            replies[0]["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("config.toml"),
+            "{}",
+            replies[0]
+        );
+    }
+
+    /// With no domain enabled neither tool can work, so none is advertised (an empty `enum` is not valid
+    /// JSON Schema either).
+    #[test]
+    fn tools_list_offers_no_tool_when_no_domain_is_enabled() {
+        let lessons_home = work_laptop_home();
+        std::fs::write(
+            lessons_home.path().join("config.toml"),
+            "[mcp]\ndomains = []\n",
+        )
+        .unwrap();
+        let replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[json!({ "jsonrpc": "2.0", "id": "list", "method": "tools/list" })],
+        );
+        assert_eq!(replies[0]["result"]["tools"], json!([]), "{}", replies[0]);
     }
 
     #[test]

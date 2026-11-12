@@ -85,7 +85,7 @@ On an unfamiliar error, run `lessons search '<error text>' --format json` before
 
 ### MCP server
 
-`lessons mcp` serves two tools over stdio to any MCP client: `search_lessons` and `record_lesson`. Two only, on purpose: every tool's schema is loaded into the agent's context. Both refuse domains not listed in `[mcp] domains`.
+`lessons mcp` serves two tools over stdio to any MCP client: `search_lessons` and `record_lesson`. Two only, on purpose: every tool's schema is loaded into the agent's context. Both refuse domains not listed in `[mcp] domains`, and their schemas offer only the listed ones, each once (no tool at all if the list is empty). A `config.toml` that does not load makes `tools/list` fail with a JSON-RPC error that carries the parse message.
 
 ```sh
 opencode mcp add --global lessons -- lessons mcp
