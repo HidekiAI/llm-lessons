@@ -98,9 +98,12 @@ ask_ssh_key() {
     done
     chosen_key="$(ask "SSH key for $domain_name (a number above, or a path)" "")"
     case "$chosen_key" in
-        '' ) printf 'setup: an SSH key is required to sync %s\n' "$domain_name" >&2; return 1 ;;
-        *[!0-9]* ) printf '%s\n' "$chosen_key" ;; # a path
-        * )
+        '')
+            printf 'setup: an SSH key is required to sync %s\n' "$domain_name" >&2
+            return 1
+            ;;
+        *[!0-9]*) printf '%s\n' "$chosen_key" ;; # a path
+        *)
             if [[ "$chosen_key" -ge 1 && "$chosen_key" -le "${#found_keys[@]}" ]]; then
                 printf '%s\n' "${found_keys[$((chosen_key - 1))]}"
             else
@@ -345,7 +348,7 @@ append_sync_sections() {
             '') ;;
             *) [[ -n "$current_section" && "$kept_or_added" == added ]] && new_text+="$section_line"$'\n' ;;
         esac
-    done <<< "$sections_text"
+    done <<<"$sections_text"
     if [[ -z "$new_text" ]]; then
         log_step "sync: nothing to add to $config_path"
         printf '%s\n' "$backup_path"
@@ -362,9 +365,9 @@ append_sync_sections() {
         cp -p "$config_path" "$backup_path"
         log_step "sync: backed up $config_path to $backup_path"
     else
-        printf '# lessons settings; see docs/config.sample.toml for every key.\n' > "$config_path"
+        printf '# lessons settings; see docs/config.sample.toml for every key.\n' >"$config_path"
     fi
-    printf '%s' "$new_text" >> "$config_path"
+    printf '%s' "$new_text" >>"$config_path"
     log_step "sync: appended to $config_path:$new_text"
     printf '%s\n' "$backup_path"
 }
@@ -464,7 +467,7 @@ validated_list() {
     local list_name="$1" csv_text="$2" known_words="$3"
     local requested_word
     local -a requested_words=()
-    IFS=',' read -r -a requested_words <<< "$csv_text"
+    IFS=',' read -r -a requested_words <<<"$csv_text"
     for requested_word in ${requested_words[@]+"${requested_words[@]}"}; do
         case " $known_words " in
             *" $requested_word "*) printf '%s\n' "$requested_word" ;;
@@ -583,7 +586,7 @@ run_sync_self_test() {
     printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' '' | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/created" "" "" "" "" work >/dev/null
     config_text="$(cat "$test_root/created/config.toml" 2>/dev/null)"
     check_equal "a missing config is created with the answers" "1 1" \
-        "$(grep -cxF '[sync.work]' <<< "$config_text") $(grep -cxF 'ssh_key = "/keys/main"' <<< "$config_text")"
+        "$(grep -cxF '[sync.work]' <<<"$config_text") $(grep -cxF 'ssh_key = "/keys/main"' <<<"$config_text")"
 
     mkdir -p "$test_root/shared-key"
     printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' '' '' '' '' '' '' | LESSONS_SETUP_ASSUME_TTY=1 \
@@ -592,12 +595,12 @@ run_sync_self_test() {
         "$(grep -cxF 'ssh_key = "/keys/main"' "$test_root/shared-key/config.toml" 2>/dev/null)"
 
     mkdir -p "$test_root/existing"
-    printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' > "$test_root/existing/config.toml"
+    printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' >"$test_root/existing/config.toml"
     printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' '' '' '' '' | LESSONS_SETUP_ASSUME_TTY=1 \
         fn_configure "$test_root/existing" "" "" "" "" work shared >/dev/null
     config_text="$(cat "$test_root/existing/config.toml")"
     check_equal "an existing section is untouched and a missing one is appended" "1 1 1" \
-        "$(grep -cxF 'remote = "git@github.com:owner/kept.git"' <<< "$config_text") $(grep -cxF '[sync.shared]' <<< "$config_text") $(grep -cxF '[sync.work]' <<< "$config_text")"
+        "$(grep -cxF 'remote = "git@github.com:owner/kept.git"' <<<"$config_text") $(grep -cxF '[sync.shared]' <<<"$config_text") $(grep -cxF '[sync.work]' <<<"$config_text")"
     check_equal "an existing config is backed up before the append" "1" \
         "$(find "$test_root/existing" -name 'config.toml.bak-*' | grep -c .)"
 
@@ -615,7 +618,7 @@ run_sync_self_test() {
     prompt_text="$(LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" configure_sync "$lessons_binary" "$test_root/flags" \
         "$SYNC_TEST_REMOTE" /keys/main on-demand "" work shared </dev/null 2>&1 >/dev/null || true)"
     check_equal "flags given: nothing is asked" "0 2" \
-        "$(grep -c 'Sync repo URL\|SSH key for\|Update mode for' <<< "$prompt_text") $(grep -cxF 'update = "on-demand"' "$test_root/flags/config.toml")"
+        "$(grep -c 'Sync repo URL\|SSH key for\|Update mode for' <<<"$prompt_text") $(grep -cxF 'update = "on-demand"' "$test_root/flags/config.toml")"
 
     mkdir -p "$test_root/no-tty"
     printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main | fn_configure "$test_root/no-tty" "" "" "" "" work >/dev/null
@@ -627,11 +630,11 @@ run_sync_self_test() {
         "$(normalized_remote ' git@GitHub.com:Owner/Repo.git/ ') $(normalized_remote 'ssh://git@GITHUB.com/o/r.git') $(normalized_remote 'HTTPS://GitHub.COM/o/r//') $(normalized_remote './a/b:c')"
 
     mkdir -p "$test_root/same-remote"
-    printf '[sync.work]\nremote = "git@github.com:owner/lessons-repo"\nssh_key = "/keys/kept"\n' > "$test_root/same-remote/config.toml"
+    printf '[sync.work]\nremote = "git@github.com:owner/lessons-repo"\nssh_key = "/keys/kept"\n' >"$test_root/same-remote/config.toml"
     prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
         configure_sync "$lessons_binary" "$test_root/same-remote" "" "" "" "" work shared 2>&1 >/dev/null || true)"
     check_equal "an existing section is not asked again and lends its key to the same remote" "0 2" \
-        "$(grep -c 'URL for work\|SSH key for' <<< "$prompt_text") $(grep -cxF 'ssh_key = "/keys/kept"' "$test_root/same-remote/config.toml")"
+        "$(grep -c 'URL for work\|SSH key for' <<<"$prompt_text") $(grep -cxF 'ssh_key = "/keys/kept"' "$test_root/same-remote/config.toml")"
 
     mkdir -p "$test_root/by-number/ssh"
     touch "$test_root/by-number/ssh/id_first" "$test_root/by-number/ssh/id_first.pub" "$test_root/by-number/ssh/id_second.pub"
@@ -664,15 +667,15 @@ run_sync_self_test() {
     prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main hourly on-demand 0 7 | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
         configure_sync "$lessons_binary" "$test_root/bad-answers" "" "" "" "" work 2>&1 >/dev/null || true)"
     check_equal "a bad typed mode or minutes is asked again" "1 1 1 1" \
-        "$(grep -c 'unknown update mode "hourly"' <<< "$prompt_text") $(grep -c 'not "0"' <<< "$prompt_text") $(grep -cxF 'update = "on-demand"' "$test_root/bad-answers/config.toml" 2>/dev/null) $(grep -cxF 'pull_every_minutes = 7' "$test_root/bad-answers/config.toml" 2>/dev/null)"
+        "$(grep -c 'unknown update mode "hourly"' <<<"$prompt_text") $(grep -c 'not "0"' <<<"$prompt_text") $(grep -cxF 'update = "on-demand"' "$test_root/bad-answers/config.toml" 2>/dev/null) $(grep -cxF 'pull_every_minutes = 7' "$test_root/bad-answers/config.toml" 2>/dev/null)"
 
     printf '%s\n' '[sync.work]' 'remote="git@github.com:o/tight"' "ssh_key = 'C:\\lit'  # 'note'" '[sync.shared]' \
-        'remote = "git@github.com:o/r" # "note"' 'ssh_key = "C:\\keys\\a\"b"' '[sync.personal]' 'ssh_key = "a\tb"' > "$test_root/values.toml"
+        'remote = "git@github.com:o/r" # "note"' 'ssh_key = "C:\\keys\\a\"b"' '[sync.personal]' 'ssh_key = "a\tb"' >"$test_root/values.toml"
     check_equal "existing values: any spacing, comments ignored, literal and basic strings decoded, other escapes unread" \
         'git@github.com:o/tight|C:\lit|git@github.com:o/r|C:\keys\a"b||' \
         "$(existing_sync_value "$test_root/values.toml" work remote)|$(existing_sync_value "$test_root/values.toml" work ssh_key)|$(existing_sync_value "$test_root/values.toml" shared remote)|$(existing_sync_value "$test_root/values.toml" shared ssh_key)|$(existing_sync_value "$test_root/values.toml" personal ssh_key)|$(existing_sync_value "$test_root/values.toml" personal remote)"
 
-    printf '[sync.workx]\nremote = "x"\n[sync.work]   \nremote = "spaced"\nremote = "duplicate"\n  [sync.shared] # note\nremote = "commented"\r\n[sync.personal]\r\nremote = "crlf"\r\n' > "$test_root/headers.toml"
+    printf '[sync.workx]\nremote = "x"\n[sync.work]   \nremote = "spaced"\nremote = "duplicate"\n  [sync.shared] # note\nremote = "commented"\r\n[sync.personal]\r\nremote = "crlf"\r\n' >"$test_root/headers.toml"
     fn_section_state() { # domain; prints "<found|missing>:<remote>"
         has_sync_section "$test_root/headers.toml" "$1" && printf 'found' || printf 'missing'
         printf ':%s' "$(existing_sync_value "$test_root/headers.toml" "$1" remote)"
@@ -682,14 +685,14 @@ run_sync_self_test() {
 
     if [[ -x "$lessons_binary" ]]; then
         mkdir -p "$test_root/restored"
-        printf 'default_search = ["work"]\n' > "$test_root/restored/config.toml"
+        printf 'default_search = ["work"]\n' >"$test_root/restored/config.toml"
         cp -p "$test_root/restored/config.toml" "$test_root/restored/original.toml"
-        printf '\n[sync.work]\nremtoe = "typo"\n' >> "$test_root/restored/config.toml"
+        printf '\n[sync.work]\nremtoe = "typo"\n' >>"$test_root/restored/config.toml"
         validate_config "$lessons_binary" "$test_root/restored" "$test_root/restored/config.toml" "$test_root/restored/original.toml" 2>/dev/null || true
         check_equal "a failed validation restores the backup" "default_search = [\"work\"]" "$(cat "$test_root/restored/config.toml")"
 
         mkdir -p "$test_root/invalid"
-        printf '[sync.work]\nremote = "git@github.com:owner/r.git"\nssh_key = "/keys/main"\nremtoe = "typo"\n' > "$test_root/invalid/config.toml"
+        printf '[sync.work]\nremote = "git@github.com:owner/r.git"\nssh_key = "/keys/main"\nremtoe = "typo"\n' >"$test_root/invalid/config.toml"
         check_equal "a misspelled key fails validation and a new file is removed" "refused no file" \
             "$(validate_config "$lessons_binary" "$test_root/invalid" "$test_root/invalid/config.toml" none 2>/dev/null && echo loaded || echo refused) $([[ -e "$test_root/invalid/config.toml" ]] && echo file || echo 'no file')"
         check_equal "a valid appended config passes validation" "loaded" \
@@ -749,17 +752,47 @@ main() {
     local domains_csv="" agents_csv="" flag_remote="" flag_key="" flag_mode="" flag_minutes="" skip_sync=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --domains) domains_csv="${2:-}"; shift 2 || usage ;;
-            --agents) agents_csv="${2:-}"; shift 2 || usage ;;
-            --remote) flag_remote="${2:-}"; shift 2 || usage ;;
-            --ssh-key) flag_key="${2:-}"; shift 2 || usage ;;
-            --update) flag_mode="${2:-}"; shift 2 || usage ;;
-            --pull-every-minutes) flag_minutes="${2:-}"; shift 2 || usage ;;
-            --no-sync) skip_sync=true; shift ;;
-            --dry-run) dry_run=true; shift ;;
-            --test) run_self_test; return 0 ;;
+            --domains)
+                domains_csv="${2:-}"
+                shift 2 || usage
+                ;;
+            --agents)
+                agents_csv="${2:-}"
+                shift 2 || usage
+                ;;
+            --remote)
+                flag_remote="${2:-}"
+                shift 2 || usage
+                ;;
+            --ssh-key)
+                flag_key="${2:-}"
+                shift 2 || usage
+                ;;
+            --update)
+                flag_mode="${2:-}"
+                shift 2 || usage
+                ;;
+            --pull-every-minutes)
+                flag_minutes="${2:-}"
+                shift 2 || usage
+                ;;
+            --no-sync)
+                skip_sync=true
+                shift
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --test)
+                run_self_test
+                return 0
+                ;;
             -h | --help) usage ;;
-            *) printf 'setup: unknown option %s\n' "$1" >&2; usage ;;
+            *)
+                printf 'setup: unknown option %s\n' "$1" >&2
+                usage
+                ;;
         esac
     done
     [[ -n "$domains_csv" ]] || usage
