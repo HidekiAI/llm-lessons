@@ -94,7 +94,7 @@ claude mcp add --scope user lessons -- lessons mcp
 
 ### Optional, Claude Code only: prompt hook
 
-opencode gets the same lessons through the MCP server or the `AGENTS.md` line above. Claude Code can additionally search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which Claude Code adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt.
+opencode gets the same lessons through the MCP server or the `AGENTS.md` line above. Claude Code can additionally search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which Claude Code adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt. A lesson matches only when it shares at least four ordinary words with the prompt, or one identifier-like term (`not_found_or_no_access`, `src/mcp.rs`, `v1.2.3`), as whole words (no stemming, so `failing` does not match `failed`); so chat prompts and prompts of one ordinary word print nothing.
 
 <details>
 <summary>Hook setup for <code>~/.claude/settings.json</code></summary>

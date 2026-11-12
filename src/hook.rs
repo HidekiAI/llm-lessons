@@ -44,6 +44,7 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
         serde_json::from_reader(hook_stdin).context("cannot parse the hook JSON on stdin")?;
     let hook_config = config::load(lessons_home)?.hook;
     let fts_query: Option<String> = query::fts_query_from_text(&hook_input.prompt);
+    let prompt_terms: Vec<String> = query::terms_from_text(&hook_input.prompt);
     journal!(
         "hook: prompt -> {fts_query:?}, domains {:?}",
         hook_config.domains
@@ -51,11 +52,19 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
     let hits: Vec<SearchHit> = match &fts_query {
         Some(fts_query) => {
             let opened = open_readable_domains(lessons_home, &hook_config.domains);
+            // The query is an OR of the prompt's words, so it returns the best lessons for ANY prompt; keep
+            // only those that share enough with this one (issue 5).
+            // The pool is a deliberate bound, a latency and recall trade-off: the search ranks by bm25 (rare words
+            // dominate), not by shared words, so a lesson that shares four common words can rank below the pool and be missed.
+            // An identifier term ranks high, so the weight-4 path is nearly safe; only the four-ordinary-words path can miss.
             let candidate_hits: Vec<SearchHit> = store::search_all(
                 &opened,
                 fts_query,
                 hook_config.max_results.saturating_mul(BOOST_POOL_FACTOR),
-            )?;
+            )?
+            .into_iter()
+            .filter(|hit| shared_weight(hit, &prompt_terms) >= MIN_SHARED_WEIGHT)
+            .collect();
             boost_current_repo(
                 candidate_hits,
                 hook_input.cwd.as_deref(),
@@ -66,6 +75,69 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
     };
     journal!("hook: {} hit(s) printed", hits.len());
     Ok(render(&hits))
+}
+
+/// What a lesson must share with the prompt to be worth printing: four ordinary words, or one
+/// identifier-like term (`not_found_or_no_access`, `src/mcp.rs`, `v1.2.3`). Chat prompts therefore
+/// print nothing, and so does a prompt of a few ordinary words, on purpose: with lessons this long a
+/// lesson shares two or three common words with almost any prompt. Measured on ten real prompts (issue 5):
+/// at 2 or 3 some chat prompts still pulled up to 3 lessons; at 4 all five chat prompts were silent and
+/// all five relevant prompts still found their lesson.
+const MIN_SHARED_WEIGHT: usize = 4;
+/// Weight of a shared identifier-like term: one is enough on its own to reach `MIN_SHARED_WEIGHT`.
+const IDENTIFIER_TERM_WEIGHT: usize = 4;
+/// Weight of a shared ordinary word: `MIN_SHARED_WEIGHT` of them are needed.
+const ORDINARY_TERM_WEIGHT: usize = 1;
+
+/// Whether `term` occurs in `text` as a whole word: the characters on both sides are not part of a
+/// word (`show` is not found in `shown`, `ready` not in `already`). Both are lower case. Two consequences, kept on
+/// purpose: the search stems words (porter) and folds accents, but this check does not, so a lesson that says `failed`
+/// matches the search for `failing` yet shares no whole word with it; and a joiner (`-`, `.`, `/`) ends a word on the
+/// lesson side, so the term `foo` is found in `foo-bar` (a term that itself holds a joiner must match it exactly).
+fn contains_whole_term(text: &str, term: &str) -> bool {
+    let fn_is_word_char = |character: char| character.is_alphanumeric() || character == '_';
+    text.match_indices(term).any(|(start, matched)| {
+        let before_ok: bool = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !fn_is_word_char(character));
+        let after_ok: bool = text[start + matched.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| !fn_is_word_char(character));
+        before_ok && after_ok
+    })
+}
+
+/// The summed weight of the prompt terms that appear anywhere in the lesson's text.
+fn shared_weight(hit: &SearchHit, prompt_terms: &[String]) -> usize {
+    let lesson = &hit.lesson;
+    let lesson_text: String = [
+        Some(lesson.title.as_str()),
+        Some(lesson.problem.as_str()),
+        lesson.context.as_deref(),
+        lesson.root_cause.as_deref(),
+        lesson.resolution.as_deref(),
+        lesson.failed_tries.as_deref(),
+        lesson.tags.as_deref(),
+        lesson.env_versions.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<&str>>()
+    .join(" ")
+    .to_lowercase();
+    prompt_terms
+        .iter()
+        .filter(|term| contains_whole_term(&lesson_text, term))
+        .map(|term| {
+            if query::is_identifier_like(term) {
+                IDENTIFIER_TERM_WEIGHT
+            } else {
+                ORDINARY_TERM_WEIGHT
+            }
+        })
+        .sum()
 }
 
 /// Opens each existing file of `domains`, skipping one that fails to open (corrupt, locked, no
@@ -205,6 +277,160 @@ mod tests {
         user_prompt_submit(lessons_home, hook_json.as_bytes())
     }
 
+    /// A lesson with the given title, problem and fix, in shared.db.
+    fn add_full_lesson(lessons_home: &Path, title: &str, problem: &str, resolution: &str) {
+        let conn = open(&Domain::Shared.file_path(lessons_home), OpenMode::Create).unwrap();
+        insert(
+            &conn,
+            &NewLesson {
+                title: title.into(),
+                problem: problem.into(),
+                resolution: Some(resolution.into()),
+                ..NewLesson::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// A home with two lessons whose words (file, time, review, push) also turn up in everyday chat.
+    fn home_with_everyday_words_in_lessons() -> tempfile::TempDir {
+        let temp_dir = tempfile::tempdir().unwrap();
+        add_full_lesson(
+            temp_dir.path(),
+            "A perl substitution with the pipe delimiter corrupts a source file",
+            "perl s with a pipe in the pattern mangled the file at the start of the file; time was lost",
+            "Use another delimiter, or the editor tool; review the diff before the push",
+        );
+        add_full_lesson(
+            temp_dir.path(),
+            "Registry pull fails with not_found_or_no_access",
+            "docker pull failed with not_found_or_no_access",
+            "Log in again",
+        );
+        temp_dir
+    }
+
+    /// Issue 5: the hook used to return the best lessons for ANY prompt, because the query is an OR of
+    /// the prompt's words and nothing said "no good match". A lesson must now share four ordinary words
+    /// with the prompt, or one identifier-like term.
+    #[test]
+    fn everyday_prompts_print_nothing_when_a_lesson_shares_only_a_few_ordinary_words() {
+        let temp_dir = home_with_everyday_words_in_lessons();
+        let prompts: &[&str] = &[
+            "what time is it",
+            "ok thanks, go ahead",
+            "show me the file",
+            "push it now",
+            "start the day",
+        ];
+        prompts.iter().for_each(|prompt| {
+            let hook_json: String = serde_json::json!({ "prompt": prompt }).to_string();
+            assert_eq!(
+                hook_output(temp_dir.path(), &hook_json).unwrap(),
+                "",
+                "{prompt}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_prompt_sharing_four_ordinary_words_prints_the_lesson() {
+        let temp_dir = home_with_everyday_words_in_lessons();
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"a perl substitution with the pipe delimiter broke my file"}"#,
+        )
+        .unwrap();
+        assert!(hook_text.contains("A perl substitution"), "{hook_text}");
+        // Three shared words are one short of the bar: pins the cutoff at four.
+        assert_eq!(
+            hook_output(temp_dir.path(), r#"{"prompt":"perl substitution file"}"#).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn one_identifier_like_term_is_enough() {
+        let temp_dir = home_with_everyday_words_in_lessons();
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"error: not_found_or_no_access"}"#,
+        )
+        .unwrap();
+        assert!(hook_text.contains("Registry pull fails"), "{hook_text}");
+    }
+
+    /// A prompt word must match a whole word of the lesson: `show` is not found in `shown`, nor `ready` in
+    /// `already`. Here the lesson holds one exact word (`prompt`, so the search returns it) and only
+    /// pieces of the other four.
+    #[test]
+    fn a_prompt_word_inside_a_longer_lesson_word_does_not_count() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        add_full_lesson(
+            temp_dir.path(),
+            "Hook prompt notes",
+            "shown already reviewed pushes preview reorder newsfeed",
+            "none",
+        );
+        assert_eq!(
+            hook_output(
+                temp_dir.path(),
+                r#"{"prompt":"prompt show ready review push"}"#
+            )
+            .unwrap(),
+            ""
+        );
+        // The same for the tail of a longer word: view in preview, order in reorder, feed in newsfeed.
+        assert_eq!(
+            hook_output(temp_dir.path(), r#"{"prompt":"prompt view order feed"}"#).unwrap(),
+            ""
+        );
+        // The control: the same words as whole words do count.
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"prompt shown already reviewed pushes"}"#,
+        )
+        .unwrap();
+        assert!(hook_text.contains("Hook prompt notes"), "{hook_text}");
+    }
+
+    /// `_` and non-ASCII letters belong to a word: `not_found` is not found in `not_found_or_no_access`, and
+    /// `caf` is not found in the accented word that starts with it. (The exact word `recipe` makes the search return the lesson.)
+    #[test]
+    fn underscore_and_non_ascii_letters_keep_a_word_whole() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Escapes, not literals, keep the source ASCII.
+        let accented_title: &str = "caf\u{e9} cr\u{e8}me br\u{fb}l\u{e9}e recipe";
+        add_full_lesson(
+            temp_dir.path(),
+            accented_title,
+            "docker failed with not_found_or_no_access",
+            "none",
+        );
+        assert_eq!(
+            hook_output(temp_dir.path(), r#"{"prompt":"not_found"}"#).unwrap(),
+            ""
+        );
+        assert_eq!(
+            hook_output(temp_dir.path(), r#"{"prompt":"recipe caf cr br"}"#).unwrap(),
+            ""
+        );
+        // The control: the whole words do count.
+        let accented_prompt: String = serde_json::json!({ "prompt": accented_title }).to_string();
+        let hook_text: String = hook_output(temp_dir.path(), &accented_prompt).unwrap();
+        assert!(hook_text.contains("caf\u{e9} cr\u{e8}me"), "{hook_text}");
+    }
+
+    /// The price of the cutoff, kept on purpose: a prompt that is one ordinary word prints nothing.
+    #[test]
+    fn a_prompt_of_one_ordinary_word_prints_nothing() {
+        let temp_dir = home_with_everyday_words_in_lessons();
+        assert_eq!(
+            hook_output(temp_dir.path(), r#"{"prompt":"perl"}"#).unwrap(),
+            ""
+        );
+    }
+
     #[test]
     fn prints_nothing_when_no_lesson_matches() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -245,7 +471,11 @@ mod tests {
             None,
         );
         assert_eq!(
-            hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap(),
+            hook_output(
+                temp_dir.path(),
+                r#"{"prompt":"private registry note not_found_or_no_access"}"#
+            )
+            .unwrap(),
             ""
         );
     }
@@ -268,7 +498,7 @@ mod tests {
         );
         let hook_text: String = hook_output(
             temp_dir.path(),
-            r#"{"prompt":"registry token","cwd":"/home/someone/src/widget-api"}"#,
+            r#"{"prompt":"registry token not_found_or_no_access","cwd":"/home/someone/src/widget-api"}"#,
         )
         .unwrap();
         let first_lesson_line: &str = hook_text.lines().nth(1).unwrap_or("");
@@ -290,7 +520,11 @@ mod tests {
                 None,
             );
         });
-        let hook_text: String = hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap();
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"registry token not_found_or_no_access"}"#,
+        )
+        .unwrap();
         assert_eq!(
             hook_text.matches("\n- [").count() + usize::from(hook_text.starts_with("- [")),
             default_max_results
@@ -301,7 +535,10 @@ mod tests {
     fn output_stays_under_the_hook_output_limit_and_long_lines_are_cut() {
         let temp_dir = tempfile::tempdir().unwrap();
         let conn = open(&Domain::Shared.file_path(temp_dir.path()), OpenMode::Create).unwrap();
-        let huge_line: String = format!("registry {}", "x".repeat(HUGE_FIELD_CHARS));
+        let huge_line: String = format!(
+            "registry token not_found_or_no_access {}",
+            "x".repeat(HUGE_FIELD_CHARS)
+        );
         (0..MANY_LESSONS).for_each(|lesson_index| {
             insert(
                 &conn,
@@ -323,7 +560,11 @@ mod tests {
             format!("[hook]\nmax_results = {MANY_LESSONS}\n"),
         )
         .unwrap();
-        let hook_text: String = hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap();
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"registry token not_found_or_no_access"}"#,
+        )
+        .unwrap();
         assert!(hook_text.starts_with(HEADER));
         assert!(
             hook_text.chars().count() <= MAX_OUTPUT_CHARS,
@@ -351,7 +592,7 @@ mod tests {
             &conn,
             &NewLesson {
                 title: huge_title,
-                problem: "registry token".into(),
+                problem: "registry token not_found_or_no_access".into(),
                 ..NewLesson::default()
             },
         )
@@ -359,12 +600,18 @@ mod tests {
         add_lesson(
             temp_dir.path(),
             Domain::Shared,
-            "small registry lesson",
+            "small registry token lesson",
             None,
         );
-        let hook_text: String =
-            hook_output(temp_dir.path(), r#"{"prompt":"registry token"}"#).unwrap();
-        assert!(hook_text.contains("small registry lesson"), "{hook_text}");
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"registry token not_found_or_no_access"}"#,
+        )
+        .unwrap();
+        assert!(
+            hook_text.contains("small registry token lesson"),
+            "{hook_text}"
+        );
         assert!(hook_text.chars().count() <= MAX_OUTPUT_CHARS);
         assert!(
             !hook_text.contains("line of pasted log"),
@@ -392,6 +639,60 @@ mod tests {
                 hits: 0,
             },
         }
+    }
+
+    /// A hit whose only populated optional field is the one `set_field` fills, so a test sees which field is read.
+    fn weighted_hit(set_field: fn(&mut crate::store::Lesson, String), text: &str) -> SearchHit {
+        let mut mut_hit: SearchHit = search_hit("unrelated title", "unrelated words");
+        mut_hit.lesson.root_cause = None;
+        mut_hit.lesson.resolution = None;
+        mut_hit.lesson.failed_tries = None;
+        set_field(&mut mut_hit.lesson, text.to_string());
+        mut_hit
+    }
+
+    #[test]
+    fn shared_weight_ignores_the_case_of_the_lesson_text() {
+        let prompt_terms: Vec<String> = ["perl", "pipe", "substitution", "failed"]
+            .map(String::from)
+            .to_vec();
+        let hit: SearchHit = weighted_hit(
+            |lesson, text| lesson.title = text,
+            "Perl PIPE Substitution Failed",
+        );
+        assert_eq!(shared_weight(&hit, &prompt_terms), MIN_SHARED_WEIGHT);
+    }
+
+    #[test]
+    fn shared_weight_reads_every_lesson_field() {
+        let prompt_terms: Vec<String> = ["alpha", "bravo", "charlie", "delta", "zulu_9"]
+            .map(String::from)
+            .to_vec();
+        let shared_text: &str = "alpha bravo charlie delta zulu_9";
+        let expected_weight: usize = MIN_SHARED_WEIGHT + IDENTIFIER_TERM_WEIGHT;
+        type SetField = fn(&mut crate::store::Lesson, String);
+        let field_setters: &[(&str, SetField)] = &[
+            ("title", |lesson, text| lesson.title = text),
+            ("problem", |lesson, text| lesson.problem = text),
+            ("context", |lesson, text| lesson.context = Some(text)),
+            ("root_cause", |lesson, text| lesson.root_cause = Some(text)),
+            ("resolution", |lesson, text| lesson.resolution = Some(text)),
+            ("failed_tries", |lesson, text| {
+                lesson.failed_tries = Some(text)
+            }),
+            ("tags", |lesson, text| lesson.tags = Some(text)),
+            ("env_versions", |lesson, text| {
+                lesson.env_versions = Some(text)
+            }),
+        ];
+        field_setters.iter().for_each(|(field_name, set_field)| {
+            let hit: SearchHit = weighted_hit(*set_field, shared_text);
+            assert_eq!(
+                shared_weight(&hit, &prompt_terms),
+                expected_weight,
+                "{field_name}"
+            );
+        });
     }
 
     #[test]
@@ -431,7 +732,11 @@ mod tests {
             "this is not a SQLite file at all",
         )
         .unwrap();
-        let hook_text: String = hook_output(temp_dir.path(), r#"{"prompt":"registry"}"#).unwrap();
+        let hook_text: String = hook_output(
+            temp_dir.path(),
+            r#"{"prompt":"registry token not_found_or_no_access"}"#,
+        )
+        .unwrap();
         assert!(
             hook_text.contains("- [shared] registry token"),
             "{hook_text}"

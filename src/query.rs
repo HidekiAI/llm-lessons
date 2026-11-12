@@ -17,6 +17,10 @@ const MIN_TERM_CHARS: usize = 2;
 /// splits on them inside the quotes, which turns such a word into an exact phrase match.
 const JOINER_CHARS: &[char] = &['_', '-', '.', '/'];
 
+/// Each part of a dotted name must be at least this long to count as a name (`mcp.rs`), which keeps an
+/// abbreviation (`e.g`) out.
+const MIN_DOTTED_PART_CHARS: usize = 2;
+
 /// Words too common to help ranking. Compared in lower case.
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "if",
@@ -26,6 +30,36 @@ const STOPWORDS: &[&str] = &[
 
 /// Builds `"term1" OR "term2" ...` from free text, or `None` when no usable term is left.
 pub fn fts_query_from_text(text: &str) -> Option<String> {
+    let terms: Vec<String> = terms_from_text(text);
+    (!terms.is_empty()).then(|| {
+        terms
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\""))) // the splitter already drops `"`; escaping stays in case the word rules change
+            .collect::<Vec<String>>()
+            .join(" OR ")
+    })
+}
+
+/// True for a term that names something specific (an identifier, a path, a version, a file name): it holds
+/// `_` or `/`, or starts with a letter and holds a digit (`x86`, `v1.2.3`), or is a dotted name whose parts are each at
+/// least two characters long (`mcp.rs`, `settings.json`). An ordinary word is not, and neither are a bare
+/// number (`10`, `404`), a hyphenated compound (`follow-up`, `pre-commit`) or an abbreviation (`e.g`): a
+/// lesson that shares one of those with a prompt is weak evidence, while one that shares
+/// `not_found_or_no_access` is strong. A slash pair of ordinary words (`and/or`) still counts as a path, on purpose.
+pub fn is_identifier_like(term: &str) -> bool {
+    let has_underscore_or_slash: bool = term.contains('_') || term.contains('/');
+    let has_letter_and_digit: bool = term.chars().next().is_some_and(char::is_alphabetic) // starts with a letter, so an ordinal or unit (`2nd`, `5min`, `10x`) is not a name
+        && term.chars().any(|character| character.is_ascii_digit());
+    let is_dotted_name: bool = term.contains('.')
+        && term
+            .split('.')
+            .all(|part| part.chars().count() >= MIN_DOTTED_PART_CHARS);
+    has_underscore_or_slash || has_letter_and_digit || is_dotted_name
+}
+
+/// The distinct, lower-cased usable terms of `text` (no stopwords, no one-letter words), in order of
+/// first mention, at most `MAX_TERMS`.
+pub fn terms_from_text(text: &str) -> Vec<String> {
     let fn_is_word_char =
         |character: char| character.is_alphanumeric() || JOINER_CHARS.contains(&character);
     let fn_is_kept_term =
@@ -48,13 +82,7 @@ pub fn fts_query_from_text(text: &str) -> Option<String> {
         }
     }
 
-    (!mut_unique_terms.is_empty()).then(|| {
-        mut_unique_terms
-            .iter()
-            .map(|term| format!("\"{}\"", term.replace('"', "\"\""))) // the splitter already drops `"`; escaping stays in case the word rules change
-            .collect::<Vec<String>>()
-            .join(" OR ")
-    })
+    mut_unique_terms
 }
 
 #[cfg(test)]
@@ -62,6 +90,50 @@ mod tests {
     use super::*;
     use crate::db::{OpenMode, open};
     use rusqlite::Connection;
+
+    #[test]
+    fn terms_are_distinct_lower_case_and_without_stopwords() {
+        assert_eq!(
+            terms_from_text("The Perl perl PERL, a pipe -- of v1.2.3 and src/mcp.rs"),
+            vec!["perl", "pipe", "v1.2.3", "src/mcp.rs"]
+        );
+        assert!(terms_from_text("the a of").is_empty());
+    }
+
+    #[test]
+    fn only_identifiers_paths_and_versions_are_identifier_like() {
+        let cases: &[(&str, bool)] = &[
+            ("not_found_or_no_access", true),
+            ("src/mcp.rs", true),
+            ("v1.2.3", true),
+            ("x86", true),
+            ("docs/plan", true),
+            // Accepted: a slash pair of ordinary words looks like a path, so it counts too.
+            ("and/or", true),
+            ("mcp.rs", true),
+            ("settings.json", true),
+            ("pre-commit", false),
+            ("follow-up", false),
+            ("up-to-date", false),
+            ("e.g", false),
+            ("i.e", false),
+            ("perl", false),
+            ("substitution", false),
+            ("time", false),
+            ("10", false),
+            ("404", false),
+            ("2025", false),
+            ("2nd", false),
+            ("3rd", false),
+            ("5min", false),
+            ("10x", false),
+            ("sha256", true),
+            ("e0277", true),
+        ];
+        cases.iter().for_each(|(term, expected)| {
+            assert_eq!(is_identifier_like(term), *expected, "{term}");
+        });
+    }
 
     fn search_db() -> (tempfile::TempDir, Connection) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
