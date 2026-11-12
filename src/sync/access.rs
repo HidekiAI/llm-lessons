@@ -66,35 +66,30 @@ const SIGNING_FAILURES: &[&str] = &["signing failed", "agent refused operation"]
 /// passphrase-protected key, a host-key failure) or a connection that dropped is `Inconclusive` too. An unrecognised
 /// message is never `AuthDenied`.
 pub fn classify_probe(exit_ok: bool, stderr: &str) -> ProbeClass {
-    // TODO(human): begin block 1/1
     // Order matters: a signing failure outranks a refusal, and anything unrecognised falls to Inconclusive, so a new
     // host's wording can never turn an unknown into a pass of the R6 guard. The wording that counts as a refusal
     // depends on the probe: ssh output (it has `debug1:` lines) needs the key offered and rejected, or accepted and
     // then refused by the host; an anonymous HTTPS probe has no key and reads the plain refusal messages.
-    // let lowered_stderr: String = stderr.to_lowercase();
-    // let fn_says_any = |fragments: &[&str]| {
-    //     fragments.iter().any(|fragment| lowered_stderr.contains(fragment))
-    // };
-    // let key_accepted: bool = lowered_stderr.contains("server accepts key");
-    // let key_offered_and_rejected: bool = lowered_stderr.contains("offering public key")
-    //     && !key_accepted
-    //     && fn_says_any(SSH_KEY_REJECTIONS);
-    // let host_refused: bool = match lowered_stderr.contains("debug1:") {
-    //     true => key_offered_and_rejected || (key_accepted && fn_says_any(SSH_HOST_REFUSALS)),
-    //     false => fn_says_any(ANONYMOUS_HTTPS_REFUSALS),
-    // };
-    // match (exit_ok, fn_says_any(SIGNING_FAILURES), host_refused) {
-    //     (true, _, _) => ProbeClass::Readable,
-    //     (false, true, _) => ProbeClass::Inconclusive,
-    //     (false, false, true) => ProbeClass::AuthDenied,
-    //     (false, false, false) => ProbeClass::Inconclusive,
-    // }
-    // was: let key_offered_but_not_accepted = "offering public key" without "server accepts key", and a single
-    // was: NO_ACCESS_MESSAGES list read for ssh and HTTPS alike, so a dropped connection after the offer, or
-    // was: "access denied" in a proxy message, could classify a key as AuthDenied (review findings 1 and 4).
-    let verdict: ProbeClass = ();
-    verdict
-    // TODO(human): end block 1/1
+    let lowered_stderr: String = stderr.to_lowercase();
+    let fn_says_any = |fragments: &[&str]| {
+        fragments
+            .iter()
+            .any(|fragment| lowered_stderr.contains(fragment))
+    };
+    let key_accepted: bool = lowered_stderr.contains("server accepts key");
+    let key_offered_and_rejected: bool = lowered_stderr.contains("offering public key")
+        && !key_accepted
+        && fn_says_any(SSH_KEY_REJECTIONS);
+    let host_refused: bool = match lowered_stderr.contains("debug1:") {
+        true => key_offered_and_rejected || (key_accepted && fn_says_any(SSH_HOST_REFUSALS)),
+        false => fn_says_any(ANONYMOUS_HTTPS_REFUSALS),
+    };
+    match (exit_ok, fn_says_any(SIGNING_FAILURES), host_refused) {
+        (true, _, _) => ProbeClass::Readable,
+        (false, true, _) => ProbeClass::Inconclusive,
+        (false, false, true) => ProbeClass::AuthDenied,
+        (false, false, false) => ProbeClass::Inconclusive,
+    }
 }
 
 /// What the visibility probe records. `url_derivable` is false when no `https://<host>/<path>` can be derived from the
