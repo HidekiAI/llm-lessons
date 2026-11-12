@@ -589,7 +589,7 @@ mod tests {
     use super::*;
     use crate::db::{OpenMode, open};
     use crate::store::{Lesson, LessonPatch, NewLesson, all_lessons, find_by_id, insert, update};
-    use crate::sync::access::{ProbeClass, ProbeRequest, WorkGuard};
+    use crate::sync::access::{ProbeClass, ProbeRequest, Visibility, WorkGuard};
     use crate::sync::files::{ClonePaths, SyncState, from_jsonl, read_state, write_state};
     use crate::sync::git::{GitRunner, SYNC_FALLBACK_BRANCH};
 
@@ -1600,6 +1600,9 @@ mod tests {
     }
     // S5b cycle rows (the `access_` prefix is what `cargo test access` matches): the guard runs under the lock, before
     // anything is fetched, and a refusal is never remembered.
+    /// The work key and the one other key of `work_guard_for_tests`.
+    const KEYS_PROBED: usize = 2;
+
     fn work_guard_for_tests() -> WorkGuard {
         WorkGuard {
             work_key: PathBuf::from("/k/work"),
@@ -1684,7 +1687,7 @@ mod tests {
         );
         assert_eq!(
             calls.get(),
-            2,
+            KEYS_PROBED,
             "the work key and the one other key, nothing anonymous for a local path"
         );
     }
@@ -1769,7 +1772,7 @@ mod tests {
         );
         assert_eq!(
             allowed_calls.get(),
-            2,
+            KEYS_PROBED,
             "the next cycle probed again instead of trusting the earlier refusal"
         );
     }
@@ -1785,6 +1788,61 @@ mod tests {
         assert_eq!(
             state.last_access_check_unix_secs, None,
             "no https form, so nothing was probed or recorded"
+        );
+    }
+    #[test]
+    fn access_the_cycle_records_the_visibility_once_and_does_not_probe_again_until_due() {
+        // An https remote git is told to read from the local bare repository, so the anonymous URL is derivable and no
+        // network is touched.
+        const HTTPS_REMOTE: &str = "https://example.com/o/r.git";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bare = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let rewritten_env: Vec<(String, String)> = machine
+            .git_env
+            .iter()
+            .cloned()
+            .chain([
+                ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+                (
+                    "GIT_CONFIG_KEY_0".to_string(),
+                    format!("url.{bare}.insteadOf"),
+                ),
+                ("GIT_CONFIG_VALUE_0".to_string(), HTTPS_REMOTE.to_string()),
+            ])
+            .collect();
+        let anonymous_calls = Cell::new(0);
+        let probe = |request: &ProbeRequest| match request {
+            ProbeRequest::Anonymous { url } if url == HTTPS_REMOTE => {
+                anonymous_calls.set(anonymous_calls.get() + 1);
+                ProbeClass::Readable
+            }
+            ProbeRequest::Anonymous { .. } | ProbeRequest::WithKey { .. } => {
+                ProbeClass::Inconclusive
+            }
+        };
+        let job = CloneJob {
+            normalized_remote: HTTPS_REMOTE,
+            probe: &probe,
+            git_env: &rewritten_env,
+            ..machine.job(HTTPS_REMOTE)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::Synced
+        );
+        let state = read_state(&machine.paths(HTTPS_REMOTE).state_file());
+        assert_eq!(state.visibility, Visibility::Public);
+        assert_eq!(state.last_access_check_unix_secs, Some(SOME_NOW));
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW + 1).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(
+            anonymous_calls.get(),
+            1,
+            "the second cycle is inside the recheck interval, so no probe"
         );
     }
 }
