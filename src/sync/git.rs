@@ -1085,4 +1085,58 @@ mod tests {
             "[]"
         );
     }
+    /// More than the 64 KiB a pipe holds, so a runner that stops draining would block and hit the deadline.
+    const BIG_OUTPUT_BYTES: usize = 300_000;
+    const BIG_OUTPUT_DEADLINE_SECS: u64 = 20;
+
+    #[test]
+    fn a_run_with_a_deadline_reads_output_larger_than_a_pipe_holds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let big_alias: String =
+            format!("alias.big=!head -c {BIG_OUTPUT_BYTES} /dev/zero | tr '\\0' x");
+        let output = runner
+            .run_with_deadline(
+                &["-c", &big_alias, "big"],
+                Duration::from_secs(BIG_OUTPUT_DEADLINE_SECS),
+            )
+            .unwrap();
+        assert_eq!(output.stdout.len(), BIG_OUTPUT_BYTES);
+    }
+
+    /// Marks the child process of the stdin test below.
+    const STDIN_CHILD_ENV: &str = "LESSONS_TEST_STDIN_CHILD";
+
+    #[test]
+    fn a_run_with_a_deadline_never_hands_git_the_callers_stdin() {
+        // `cat` waits for its stdin: with an open, silent stdin it would block until the deadline; with a closed one it
+        // ends at once. The harness's own stdin may already be /dev/null, so the test runs itself in a child whose stdin
+        // is an open pipe nobody writes to.
+        if std::env::var_os(STDIN_CHILD_ENV).is_some() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let output = GitRunner::new(temp_dir.path(), "ssh")
+                .run_with_deadline(
+                    &["-c", "alias.slurp=!cat", "slurp"],
+                    Duration::from_secs(SLOW_SSH_SLEEP_SECS),
+                )
+                .unwrap();
+            assert!(output.exit_ok);
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sync::git::tests::a_run_with_a_deadline_never_hands_git_the_callers_stdin",
+            ])
+            .env(STDIN_CHILD_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let held_open = child.stdin.take(); // `wait` would close it; keep the pipe open until the child is done
+        let status = child.wait().unwrap();
+        drop(held_open);
+        assert!(status.success(), "git read the caller's stdin and blocked");
+    }
 }

@@ -263,8 +263,9 @@ fn main() -> Result<ExitCode> {
     // Every command but `sync` ends in success or in an error (exit 1); `sync` also has an exit code of its own.
     let fn_done = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
     // R13: a remote recorded public is warned about on stderr by every command but `init`, from one place and from the
-    // state files alone (no network). The warning is a caution: nothing here can fail or change a command.
-    if !matches!(cli.command, Command::Init { .. }) {
+    // state files alone (no network). The warning is a caution: nothing here can fail or change a command. `sync` is
+    // warned about AFTER it ran, because a cycle can be the first to find a remote public.
+    if !matches!(cli.command, Command::Init { .. } | Command::Sync { .. }) {
         warn_public_remotes(&fn_lessons_home);
     }
     match cli.command {
@@ -303,7 +304,11 @@ fn main() -> Result<ExitCode> {
         )),
         Command::Retire { id, by } => fn_done(run_retire(&fn_lessons_home()?, &id, &by)),
         Command::Move { id, to } => fn_done(run_move(&fn_lessons_home()?, &id, to)),
-        Command::Sync { domain } => run_sync(&fn_lessons_home()?, domain),
+        Command::Sync { domain } => {
+            let sync_exit: Result<ExitCode> = run_sync(&fn_lessons_home()?, domain);
+            warn_public_remotes(&fn_lessons_home);
+            sync_exit
+        }
         Command::Mcp => fn_done(mcp::serve(
             &fn_lessons_home()?,
             std::io::stdin().lock(),
@@ -329,7 +334,10 @@ fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
             // A closed stderr (a hook whose reader went away) must not turn a caution into a panic.
             drop(writeln!(std::io::stderr(), "{warning_line}"));
         }),
-        Err(skipped) => journal!("public warning skipped: {skipped:#}"),
+        Err(skipped) => journal!(
+            "public warning skipped: {}",
+            sync::redact_credentials(&format!("{skipped:#}")) // a config parse error may quote a remote with a token
+        ),
     }
 }
 

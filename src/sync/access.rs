@@ -1125,9 +1125,16 @@ mod tests {
             command.git_args,
             vec!["ls-remote", "--", "git@github.com:o/r.git", "HEAD"]
         );
-        assert!(
-            command.env_remove.is_empty(),
-            "a key probe keeps the user's environment"
+        // The work-key probe must really use the key: no global or system git config (an `insteadOf` there could send it
+        // to another URL read with other credentials) and nothing injected through the inherited environment. HOME stays
+        // set: ssh needs it for known_hosts.
+        assert_eq!(env_value(&command, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
+        assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
+        assert_eq!(env_value(&command, "HOME"), None);
+        assert_eq!(
+            command.env_remove,
+            vec!["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"],
+            "config injected through the inherited environment never reaches the key probe"
         );
     }
 
@@ -1147,10 +1154,20 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(env_value(&command, "HOME"), Some("/dev/null"));
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
+        // Config injected through the inherited environment, and any proxy (a proxy's "access denied" page must not
+        // read as a private repository), never reach the probe.
         assert_eq!(
             command.env_remove,
-            vec!["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"],
-            "config injected through the inherited environment never reaches the probe"
+            vec![
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+            ],
         );
         let expected_git_args: Vec<&str> = vec![
             "-c",
