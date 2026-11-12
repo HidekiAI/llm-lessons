@@ -199,3 +199,65 @@ test("a host that passes no output, or a frozen parts array, does not make the h
     await hooks["chat.message"]({ sessionID: SESSION_ID }, undefined)
     await hooks["chat.message"](undefined, { message: { id: MESSAGE_ID }, parts: Object.freeze([{ type: "text", text: "anything" }]) })
 })
+
+// opencode 2 path: default export { id, setup(context) } registering the "prompt" session hook.
+const setupV2 = async (lessonsBinary) => {
+    process.env.LESSONS_BIN = lessonsBinary
+    const { default: pluginDefinition } = await import(`${PLUGIN_URL}?v2=${encodeURIComponent(lessonsBinary)}`)
+    const registeredHooks = new Map()
+    const disposed = []
+    const context = {
+        location: { directory: "/work/repo" },
+        session: {
+            hook: async (name, callback) => {
+                registeredHooks.set(name, callback)
+                return { dispose: async () => disposed.push(name) }
+            },
+        },
+    }
+    const cleanup = await pluginDefinition.setup(context)
+    return { pluginDefinition, registeredHooks, disposed, cleanup }
+}
+
+test("v2: default export has an id and a setup function, and registers only the prompt hook", async () => {
+    const { script } = fakeLessons("L")
+    const { pluginDefinition, registeredHooks } = await setupV2(script)
+    assert.equal(typeof pluginDefinition.id, "string")
+    assert.deepEqual([...registeredHooks.keys()], ["prompt"])
+})
+
+test("v2: the prompt hook appends the lessons to the prompt text and sends prompt and cwd", async () => {
+    const { script, stdinRecord } = fakeLessons("LESSON: use another delimiter")
+    const { registeredHooks } = await setupV2(script)
+    const event = { prompt: { text: "perl pipe broke" } }
+    await registeredHooks.get("prompt")(event)
+    assert.equal(event.prompt.text, "perl pipe broke\n\nLESSON: use another delimiter")
+    assert.deepEqual(JSON.parse(readFileSync(stdinRecord, "utf8")), { prompt: "perl pipe broke", cwd: "/work/repo" })
+})
+
+test("v2: nothing printed, a failing lessons or a malformed event leaves the prompt alone and does not throw", async () => {
+    const silent = await setupV2(fakeLessons("").script)
+    const failing = await setupV2(fakeLessons("partial", { exitCode: 1 }).script)
+    const silentEvent = { prompt: { text: "hello" } }
+    const failingEvent = { prompt: { text: "hello" } }
+    await silent.registeredHooks.get("prompt")(silentEvent)
+    await failing.registeredHooks.get("prompt")(failingEvent)
+    for (const malformed of [undefined, {}, { prompt: {} }, { prompt: { text: 5 } }, { prompt: { text: "" } }]) {
+        await silent.registeredHooks.get("prompt")(malformed)
+    }
+    assert.deepEqual([silentEvent.prompt.text, failingEvent.prompt.text], ["hello", "hello"])
+})
+
+test("v2: the cleanup returned by setup disposes the hook registration", async () => {
+    const { script } = fakeLessons("L")
+    const { cleanup, disposed } = await setupV2(script)
+    await cleanup()
+    assert.deepEqual(disposed, ["prompt"])
+})
+
+test("v2: a prompt whose text is not a string is never rewritten, even when lessons would print", async () => {
+    const { registeredHooks } = await setupV2(fakeLessons("L").script)
+    const numberEvent = { prompt: { text: 5 } }
+    await registeredHooks.get("prompt")(numberEvent)
+    assert.equal(numberEvent.prompt.text, 5)
+})

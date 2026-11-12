@@ -62,10 +62,23 @@ export const LessonsHook = async ({ directory }) => {
     }
 }
 
-// opencode 2 loads a plugin from its default export (an id plus a server hook function); opencode 1 reads the named
-// export above. Same shape as the herdr plugin that opencode 2 already loads.
+// opencode 2 loads a plugin from its default export: an id and a `setup(context)` that registers hooks. Its server
+// hooks (the `chat.message` above) are not called there; the `prompt` session hook is, and it may edit the prompt
+// text before the message is stored, so the lessons are appended to it. `server` stays for opencode 1.
+const addLessonsToPrompt = async (event, workingDirectory) => {
+    const promptText = event?.prompt?.text
+    const lessonsText = typeof promptText === "string" && promptText !== "" ? await runLessonsHook(promptText, workingDirectory) : ""
+    lessonsText === "" || (event.prompt.text = `${promptText}\n\n${lessonsText}`)
+}
+
 export default {
     id: "lessons.hook",
     server: LessonsHook,
-    setup() {},
+    // Same guard as the opencode 1 hook: whatever the host hands over, a lessons problem must never break a prompt.
+    setup: async (context) => {
+        const registration = await context.session.hook("prompt", (event) =>
+            addLessonsToPrompt(event, context.location?.directory).catch(() => {}),
+        )
+        return () => registration.dispose()
+    },
 }
