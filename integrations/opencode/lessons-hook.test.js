@@ -261,3 +261,10 @@ test("v2: a prompt whose text is not a string is never rewritten, even when less
     await registeredHooks.get("prompt")(numberEvent)
     assert.equal(numberEvent.prompt.text, 5)
 })
+
+test("v2: a prompt that cannot be edited (frozen) does not make the hook throw", async () => {
+    const { registeredHooks } = await setupV2(fakeLessons("L").script)
+    const frozenEvent = { prompt: Object.freeze({ text: "hello" }) }
+    await registeredHooks.get("prompt")(frozenEvent)
+    assert.equal(frozenEvent.prompt.text, "hello")
+})

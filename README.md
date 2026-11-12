@@ -94,9 +94,9 @@ opencode mcp add --global lessons -- lessons mcp
 claude mcp add --scope user lessons -- lessons mcp
 ```
 
-### Optional, Claude Code only: prompt hook
+### Optional: prompt hook
 
-opencode gets the same lessons through the MCP server or the `AGENTS.md` line above. Claude Code can additionally search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which Claude Code adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt. A lesson matches only when it shares at least four ordinary words with the prompt, or one identifier-like term (`not_found_or_no_access`, `src/mcp.rs`, `v1.2.3`), as whole words (no stemming, so `failing` does not match `failed`); so chat prompts and prompts of one ordinary word print nothing.
+Both agents can search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which the agent adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt. A lesson matches only when it shares at least four ordinary words with the prompt, or one identifier-like term (`not_found_or_no_access`, `src/mcp.rs`, `v1.2.3`), as whole words (no stemming, so `failing` does not match `failed`); so chat prompts and prompts of one ordinary word print nothing. Claude Code runs it from a hook entry (below); opencode runs it from the plugin that `scripts/setup.sh --agents opencode` installs (see Install).
 
 <details>
 <summary>Hook setup for <code>~/.claude/settings.json</code></summary>
@@ -114,6 +114,11 @@ Use the absolute path to `lessons` if it is not on the PATH the hook sees.
 ```
 
 </details>
+
+## Troubleshooting
+
+- **opencode shows the lessons plugin as failed** (`Plugin must export a default definition...`, or it keeps failing after you fixed the file): the opencode background service keeps the plugin it loaded when it started and does not re-read a changed file. Run `opencode service restart`, then open a new session and check `/plugins` and `/mcp`. The log entry named by the error reference is in `~/.local/share/opencode/log/opencode.log`.
+- **The hook prints nothing in either agent**: expected for chat prompts, see the matching rule above. Check that `lessons` is on the PATH the agent sees, or use its absolute path.
 
 ## FAQ
 

@@ -1,5 +1,6 @@
 // opencode plugin: before each user message, ask `lessons hook user-prompt-submit` for relevant lessons and
-// add them to the message as a synthetic text part. Silent when nothing is relevant, when `lessons` is missing,
+// add them to the message (opencode 1: as a synthetic text part; opencode 2: appended to the prompt text, see the
+// default export at the end). Silent when nothing is relevant, when `lessons` is missing,
 // slow or failing: a lessons problem must never block or break a prompt.
 //
 // Install: copy this one file into opencode's plugins directory (scripts/setup.sh --agents opencode does it).
@@ -64,21 +65,18 @@ export const LessonsHook = async ({ directory }) => {
 
 // opencode 2 loads a plugin from its default export: an id and a `setup(context)` that registers hooks. Its server
 // hooks (the `chat.message` above) are not called there; the `prompt` session hook is, and it may edit the prompt
-// text before the message is stored, so the lessons are appended to it. `server` stays for opencode 1.
-const addLessonsToPrompt = async (event, workingDirectory) => {
-    const promptText = event?.prompt?.text
-    const lessonsText = typeof promptText === "string" && promptText !== "" ? await runLessonsHook(promptText, workingDirectory) : ""
-    lessonsText === "" || (event.prompt.text = `${promptText}\n\n${lessonsText}`)
-}
-
+// text before the message is stored, so the lessons are appended to it. The named export above stays for opencode 1;
+// the default object has no `server` key, so opencode 1 cannot register the hook twice.
 export default {
     id: "lessons.hook",
-    server: LessonsHook,
-    // Same guard as the opencode 1 hook: whatever the host hands over, a lessons problem must never break a prompt.
     setup: async (context) => {
-        const registration = await context.session.hook("prompt", (event) =>
-            addLessonsToPrompt(event, context.location?.directory).catch(() => {}),
-        )
+        const addLessonsToPrompt = async (event) => {
+            const promptText = event?.prompt?.text
+            const lessonsText = typeof promptText === "string" && promptText !== "" ? await runLessonsHook(promptText, context.location?.directory) : ""
+            lessonsText === "" || (event.prompt.text = `${promptText}\n\n${lessonsText}`)
+        }
+        // Same guard as the opencode 1 hook: whatever the host hands over, a lessons problem must never break a prompt.
+        const registration = await context.session.hook("prompt", (event) => addLessonsToPrompt(event).catch(() => {}))
         return () => registration.dispose()
     },
 }
