@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs `lessons`, creates the chosen DB files, sets up their sync, and registers the MCP server with coding agents.
 #
-#   scripts/setup.sh --domains work,shared [--agents opencode,claude] [--dry-run]
+#   scripts/setup.sh --domains work,shared [--agents opencode,claude] [--no-skills] [--dry-run]
 #                    [--remote URL --ssh-key PATH [--update live|on-demand] [--pull-every-minutes N] | --no-sync]
 #   scripts/setup.sh --test        # run this script's own checks; touches only temp dirs
 #
@@ -27,6 +27,9 @@ readonly REPO_ROOT
 readonly KNOWN_DOMAINS="work personal shared"
 readonly KNOWN_AGENTS="opencode claude"
 readonly MCP_SERVER_NAME="lessons"
+readonly SKILL_NAME="lessons"
+# The skill this repo ships, copied into each agent's skills directory by install_skill.
+readonly SKILL_SOURCE="$REPO_ROOT/skills/$SKILL_NAME/SKILL.md"
 readonly EXIT_USAGE=2
 readonly EXIT_FAILURE=1
 readonly KNOWN_UPDATE_MODES="live on-demand"
@@ -519,8 +522,91 @@ register_agent() {
     fi
 }
 
+# The directory `agent_name` loads the skill from: its skills directory plus the skill's own name. Prints one absolute
+# path, or fails for an agent with no skills directory or a base that is not an absolute path.
+skill_install_dir() {
+    # Each agent has its own skills root; opencode follows XDG_CONFIG_HOME when it is set, Claude Code uses ~/.claude.
+    # An unknown agent is an error, never a guessed path (the caller would then write into it). So is a base that is
+    # not absolute: an empty HOME would aim at the filesystem root, a relative XDG_CONFIG_HOME at the current directory.
+    local agent_name="$1" skills_base
+    case "${HOME:-}" in
+        /?*) ;;
+        *)
+            printf 'setup: HOME is empty or not an absolute path\n' >&2
+            return 1
+            ;;
+    esac
+    case "$agent_name" in
+        claude) skills_base="$HOME/.claude/skills" ;;
+        opencode) skills_base="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills" ;;
+        *)
+            printf 'setup: no skills directory for agent "%s"\n' "$agent_name" >&2
+            return 1
+            ;;
+    esac
+    case "$skills_base" in
+        /*) printf '%s\n' "$skills_base/$SKILL_NAME" ;;
+        *)
+            printf 'setup: the skills directory "%s" is not an absolute path; check XDG_CONFIG_HOME\n' "$skills_base" >&2
+            return 1
+            ;;
+    esac
+}
+
+# What to do about the skill in `target_dir`: prints `install`, `skip-exists` or `skip-symlink`. Pure: it only looks.
+# The symlink check covers the skill directory and every directory above it up to HOME (or up to / when the target is
+# outside HOME). Not guarded: a link above HOME, and another process creating SKILL.md between this check and the copy.
+skill_install_decision() {
+    # A symlink anywhere between HOME and the skill directory points into some other repository, such as the owner's own
+    # skills or dotfiles repo: writing there would put files in that repo, so it wins over everything. An existing
+    # SKILL.md, even a dangling link, is never overwritten. Name the two facts, then one `case` over both, with a failing
+    # default arm so a new combination cannot fall through silently.
+    local target_dir="$1" tree_kind=plain skill_file_kind walked_path home_root="${HOME:-/}"
+    home_root="${home_root%"${home_root##*[!/]}"}" # trailing slashes of HOME (one or many) would never equal what dirname prints
+    walked_path="$target_dir"
+    while [[ "$walked_path" != "$home_root" && "$walked_path" != / && "$walked_path" != . ]]; do
+        [[ -L "$walked_path" ]] && tree_kind="link"
+        walked_path="$(dirname "$walked_path")"
+    done
+    skill_file_kind="$([[ -e "$target_dir/SKILL.md" || -L "$target_dir/SKILL.md" ]] && echo there || echo none)"
+    case "$tree_kind/$skill_file_kind" in
+        link/*) printf '%s\n' skip-symlink ;;
+        plain/there) printf '%s\n' skip-exists ;;
+        plain/none) printf '%s\n' install ;;
+        *) # defensive: the two facts only take the values above, so this arm cannot be reached today
+            printf 'setup: unexpected skill facts "%s"\n' "$tree_kind/$skill_file_kind" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Copies the shipped skill into `agent_name`'s skills directory unless the decision says to leave it. Returns 0 for
+# a skip or a failed copy (this step must not undo the steps before it); 1 only for an agent with no skills directory
+# or a decision that failed.
+install_skill() {
+    # Same shape as register_agent: skip an agent that is not installed, then act on the decision. The decision is
+    # captured first and checked, so a failing decision stops the step instead of falling through the `case`. The copy
+    # goes through run_step, so --dry-run only logs it.
+    local agent_name="$1" target_dir decision
+    if ! command -v "$agent_name" >/dev/null 2>&1; then
+        log_step "skip skill for $agent_name: not installed"
+        return 0
+    fi
+    target_dir="$(skill_install_dir "$agent_name")" || return 1
+    decision="$(skill_install_decision "$target_dir")" || return 1
+    case "$decision" in
+        install)
+            if ! run_step mkdir -p "$target_dir" || ! run_step cp -- "$SKILL_SOURCE" "$target_dir/SKILL.md"; then
+                log_step "WARNING: installing the skill for $agent_name failed; copy $SKILL_SOURCE to $target_dir by hand"
+            fi
+            ;;
+        skip-exists) log_step "skip skill for $agent_name: $target_dir/SKILL.md already exists, left as it is" ;;
+        skip-symlink) log_step "skip skill for $agent_name: a symlink on $target_dir or a directory above it (up to HOME), left alone" ;;
+    esac
+}
+
 run_setup() {
-    local domains_csv="$1" agents_csv="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6" skip_sync="$7"
+    local domains_csv="$1" agents_csv="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6" skip_sync="$7" skip_skills="$8"
     local domain_name agent_name
     local -a domain_names=() agent_names=()
     check_platform "$(uname -s)" "$(uname -r)" "${WSL_DISTRO_NAME:-}" "${LESSONS_HOME:-$HOME/.lessons}" || exit "$EXIT_USAGE"
@@ -562,7 +648,153 @@ run_setup() {
     for agent_name in ${agent_names[@]+"${agent_names[@]}"}; do
         register_agent "$agent_name" "$lessons_binary"
     done
+    if [[ "$skip_skills" != true ]]; then
+        # The skill goes to every chosen agent, after the MCP registration; --no-skills skips this whole step.
+        for agent_name in ${agent_names[@]+"${agent_names[@]}"}; do
+            # A skill that cannot be installed must not stop the rest of setup (set -e would, on a return of 1).
+            install_skill "$agent_name" || log_step "WARNING: no skill installed for $agent_name"
+        done
+    fi
     log_step "setup: done"
+}
+
+# The skill-install checks, run by --test in throwaway HOME dirs with a fake agent on the PATH. Called from
+# run_self_test, whose check_equal and failure count it uses. Each guard of install_skill has a check that goes red
+# when the guard is removed.
+run_skill_self_test() {
+    local test_root fake_bin bare_bin agent_name tool_name tool_path none_log
+    test_root="$(mktemp -d "${TMPDIR:-/tmp}/lessons-setup-skill.XXXXXX")"
+    # shellcheck disable=SC2064 # expand test_root now: it is local and gone when the trap runs
+    trap "rm -rf '$test_root'" RETURN
+    fake_bin="$test_root/bin"
+    bare_bin="$test_root/bare"
+    mkdir -p "$fake_bin" "$bare_bin"
+    for agent_name in claude opencode; do
+        printf '#!/bin/sh\nexit 0\n' >"$fake_bin/$agent_name"
+        chmod +x "$fake_bin/$agent_name"
+    done
+    # A PATH with the tools install_skill needs but no agent, whatever is installed on this host.
+    for tool_name in mkdir date tee dirname cp cat; do
+        tool_path="$(command -v "$tool_name")"
+        ln -s "$tool_path" "$bare_bin/$tool_name"
+    done
+
+    check_equal "skill dir: claude, opencode by default, opencode under XDG_CONFIG_HOME, in that order" \
+        "/h/.claude/skills/lessons /h/.config/opencode/skills/lessons /x/opencode/skills/lessons" \
+        "$(HOME=/h XDG_CONFIG_HOME='' skill_install_dir claude) $(HOME=/h XDG_CONFIG_HOME='' skill_install_dir opencode) $(HOME=/h XDG_CONFIG_HOME=/x skill_install_dir opencode)"
+    check_equal "skill dir: an unknown agent has none, prints no path and says why" "refused 1" \
+        "$(HOME=/h skill_install_dir cursor >/dev/null 2>&1 && echo accepted || echo refused) $(HOME=/h skill_install_dir cursor 2>&1 | grep -c "no skills directory for agent")"
+    check_equal "skill dir: an empty or relative HOME, or a relative XDG_CONFIG_HOME, is refused" "refused refused refused" \
+        "$(HOME='' XDG_CONFIG_HOME='' skill_install_dir claude >/dev/null 2>&1 && echo accepted || echo refused) $(HOME=rel XDG_CONFIG_HOME='' skill_install_dir opencode >/dev/null 2>&1 && echo accepted || echo refused) $(HOME=/h XDG_CONFIG_HOME=rel skill_install_dir opencode >/dev/null 2>&1 && echo accepted || echo refused)"
+
+    # The decision: a symlink anywhere in the agent's tree wins, then an existing SKILL.md, else install.
+    mkdir -p "$test_root/d-there/skills/lessons" "$test_root/d-other/skills" "$test_root/d-real/skills/lessons"
+    : >"$test_root/d-there/skills/lessons/SKILL.md"
+    ln -s "$test_root/d-real/skills" "$test_root/d-other/linked"
+    : >"$test_root/d-real/skills/lessons/SKILL.md"
+    mkdir -p "$test_root/d-dangling/skills/lessons"
+    ln -s "$test_root/nowhere" "$test_root/d-dangling/skills/lessons/SKILL.md"
+    check_equal "skill decision: fresh, existing, symlinked parent (even with a SKILL.md inside), dangling SKILL.md" \
+        "install skip-exists skip-symlink skip-exists" \
+        "$(HOME="$test_root" skill_install_decision "$test_root/d-fresh/skills/lessons") $(HOME="$test_root" skill_install_decision "$test_root/d-there/skills/lessons") $(HOME="$test_root" skill_install_decision "$test_root/d-other/linked/lessons") $(HOME="$test_root" skill_install_decision "$test_root/d-dangling/skills/lessons")"
+    mkdir -p "$test_root/d-lesson-link/skills" "$test_root/d-root-real/skills" "$test_root/d-elsewhere/lessons"
+    ln -s "$test_root/d-elsewhere/lessons" "$test_root/d-lesson-link/skills/lessons"
+    ln -s "$test_root/d-root-real" "$test_root/d-agent-root-link"
+    check_equal "skill decision: the skill directory itself or the agent's root being a symlink is skipped too" \
+        "skip-symlink skip-symlink" \
+        "$(HOME="$test_root" skill_install_decision "$test_root/d-lesson-link/skills/lessons") $(HOME="$test_root" skill_install_decision "$test_root/d-agent-root-link/skills/lessons")"
+
+    # install_skill end to end, in a throwaway HOME with a fake agent on the PATH.
+    local home_fresh="$test_root/h-fresh" home_link="$test_root/h-link" home_dry="$test_root/h-dry" home_none="$test_root/h-none" home_fail="$test_root/h-fail"
+    mkdir -p "$home_fresh" "$home_link/.claude" "$home_dry" "$home_none" "$home_fail/.claude/skills"
+    (HOME="$home_fresh" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude) >/dev/null 2>&1 || true
+    check_equal "install_skill: a fresh HOME gets the shipped skill, byte for byte" "same" \
+        "$(cmp -s "$SKILL_SOURCE" "$home_fresh/.claude/skills/lessons/SKILL.md" && echo same || echo different)"
+    mkdir -p "$home_fresh/.claude/skills/lessons"
+    printf 'edited by the user\n' >"$home_fresh/.claude/skills/lessons/SKILL.md"
+    (HOME="$home_fresh" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude) >/dev/null 2>&1 || true
+    check_equal "install_skill: a second run never overwrites an existing SKILL.md (back-to-back)" "edited by the user" \
+        "$(cat "$home_fresh/.claude/skills/lessons/SKILL.md")"
+    mkdir -p "$test_root/other-repo-skills"
+    ln -s "$test_root/other-repo-skills" "$home_link/.claude/skills"
+    (HOME="$home_link" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude) >/dev/null 2>&1 || true
+    check_equal "install_skill: a skills directory that is a symlink into another repository is left untouched" "0" \
+        "$(find "$test_root/other-repo-skills" -mindepth 1 | wc -l | tr -d ' ')"
+    (HOME="$home_dry" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" dry_run=true install_skill claude) >/dev/null 2>&1 || true
+    check_equal "install_skill: --dry-run writes nothing" "0" "$(find "$home_dry" -mindepth 1 | wc -l | tr -d ' ')"
+    none_log="$(HOME="$home_none" XDG_CONFIG_HOME='' PATH="$bare_bin" install_skill claude 2>&1)" || true
+    check_equal "install_skill: an agent that is not installed gets nothing and the log says so" "0 1" \
+        "$(find "$home_none" -mindepth 1 | wc -l | tr -d ' ') $(printf '%s\n' "$none_log" | grep -c 'skip skill for claude: not installed')"
+    # A target that is a regular file makes mkdir fail whoever runs the test (a root user could still write into a read-only directory).
+    : >"$home_fail/.claude/skills/lessons"
+    check_equal "install_skill: a failed copy only warns and the step still returns 0" "0 1" \
+        "$(
+            install_output="$(HOME="$home_fail" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude 2>&1)"
+            exit_code=$?
+            printf '%s %s' "$exit_code" "$(printf '%s\n' "$install_output" | grep -c 'WARNING: installing the skill')"
+        )"
+
+    # A symlink anywhere between HOME and the skill directory is skipped, not only the three nearest paths.
+    local home_anc="$test_root/h-anc"
+    mkdir -p "$home_anc" "$test_root/dotfiles-real/opencode/skills"
+    ln -s "$test_root/dotfiles-real" "$home_anc/.config"
+    check_equal "skill decision: a symlinked ancestor below HOME (here ~/.config) is skipped, and HOME's own parents are not looked at" \
+        "skip-symlink" \
+        "$(HOME="$home_anc" skill_install_decision "$home_anc/.config/opencode/skills/lessons")"
+    (HOME="$home_anc" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill opencode) >/dev/null 2>&1 || true
+    check_equal "install_skill: nothing is written through a symlinked ancestor" "0" \
+        "$(find "$test_root/dotfiles-real/opencode/skills" -mindepth 1 | wc -l | tr -d ' ')"
+
+    # The skips say so in the log, with the reason.
+    check_equal "install_skill: an existing SKILL.md and a symlink are each logged as a skip with their reason" "1 1" \
+        "$(
+            exists_log="$(HOME="$home_fresh" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude 2>&1)"
+            link_log="$(HOME="$home_link" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude 2>&1)"
+            printf '%s %s' "$(printf '%s\n' "$exists_log" | grep -c 'already exists, left as it is')" "$(printf '%s\n' "$link_log" | grep -c 'symlink on')"
+        )"
+
+    # A skill that cannot be installed (here a relative XDG_CONFIG_HOME for opencode) must not stop the rest of setup.
+    local refused_run
+    refused_run="$(
+        HOME="$test_root/h-run" XDG_CONFIG_HOME=relative PATH="$fake_bin:$PATH" bash "${BASH_SOURCE[0]}" --domains work --agents opencode,claude --no-sync --dry-run 2>&1 </dev/null
+        printf 'exit=%s\n' "$?"
+    )"
+    check_equal "setup: a skill refused for one agent warns, the other agent still gets its skill, and setup finishes with exit 0" "1 1 1 1" \
+        "$(printf '%s\n' "$refused_run" | grep -c 'WARNING: no skill installed for opencode') $(printf '%s\n' "$refused_run" | grep -c 'run: cp -- .*\.claude/skills/lessons/SKILL.md') $(printf '%s\n' "$refused_run" | grep -c 'setup: done') $(printf '%s\n' "$refused_run" | grep -c '^exit=0$')"
+
+    # A HOME written with a trailing slash still ends the walk, so a symlink ABOVE it (here the parent of HOME) is never looked at.
+    mkdir -p "$test_root/real-parent/h"
+    ln -s "$test_root/real-parent" "$test_root/link-parent"
+    check_equal "skill decision: a HOME with one or several trailing slashes ends the walk at HOME, a link above it does not count" \
+        "install install" \
+        "$(HOME="$test_root/link-parent/h/" skill_install_decision "$test_root/link-parent/h/.claude/skills/lessons") $(HOME="$test_root/link-parent/h//" skill_install_decision "$test_root/link-parent/h/.claude/skills/lessons")"
+
+    # A decision that fails stops the step with a failure, instead of falling through the case and returning 0.
+    check_equal "install_skill: a failing decision makes the step fail and copies nothing" "1 0" \
+        "$(
+            skill_install_decision() { return 1; }
+            mkdir -p "$test_root/h-faildec"
+            (HOME="$test_root/h-faildec" XDG_CONFIG_HOME='' PATH="$fake_bin:$PATH" install_skill claude) >/dev/null 2>&1
+            exit_code=$?
+            printf '%s %s' "$exit_code" "$(find "$test_root/h-faildec" -mindepth 1 | wc -l | tr -d ' ')"
+        )"
+
+    # The whole script: --no-skills leaves the step out, the default includes it (a dry run logs the copy, and writes nothing).
+    local with_skills without_skills
+    mkdir -p "$test_root/h-run"
+    with_skills="$(HOME="$test_root/h-run" PATH="$fake_bin:$PATH" bash "${BASH_SOURCE[0]}" --domains work --agents claude --no-sync --dry-run 2>&1 </dev/null || true)"
+    without_skills="$(HOME="$test_root/h-run" PATH="$fake_bin:$PATH" bash "${BASH_SOURCE[0]}" --domains work --agents claude --no-sync --no-skills --dry-run 2>&1 </dev/null || true)"
+    check_equal "setup: the skill is installed by default and --no-skills leaves it out" "1 0" \
+        "$(printf '%s\n' "$with_skills" | grep -c 'run: cp -- .*skills/lessons/SKILL.md') $(printf '%s\n' "$without_skills" | grep -c 'skills/lessons')"
+    check_equal "setup: a dry run of the whole script writes no skill file" "0" \
+        "$(find "$test_root/h-run" -name SKILL.md | wc -l | tr -d ' ')"
+
+    # The shipped file itself.
+    check_equal "shipped skill: named lessons in its frontmatter" "name: lessons" "$(sed -n 2p "$SKILL_SOURCE")"
+    check_equal "shipped skill: ASCII only, no absolute home path" "0 0" \
+        "$(LC_ALL=C awk '/[\200-\377]/ { count++ } END { print count + 0 }' "$SKILL_SOURCE") $(grep -c -E '/Users/|/home/' "$SKILL_SOURCE" || true)"
+    check_equal "usage names --no-skills" "1" \
+        "$(sed -n "${USAGE_FIRST_LINE},${USAGE_LAST_LINE}p" "${BASH_SOURCE[0]}" | grep -c -e '--no-skills')"
 }
 
 # The sync-configuration checks, run by --test with piped answers in throwaway LESSONS_HOME dirs.
@@ -739,6 +971,7 @@ run_self_test() {
         "$(check_platform MINGW64_NT '' '' /x >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Linux 4.4.0-Microsoft Debian /x >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons >/dev/null 2>&1 && echo ok || echo refused) $(check_platform Darwin 25.1.0 '' /Users/u/.lessons >/dev/null 2>&1 && echo ok || echo refused)"
     check_equal "platform: a WSL2 LESSONS_HOME on the Windows drive is warned about, also the drive root itself" "1 1 0" \
         "$(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c/Users/u/.lessons 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons 2>&1 | grep -c 'Windows drive')"
+    run_skill_self_test
     run_sync_self_test
     if [[ "$failures" -eq 0 ]]; then
         printf 'setup self-test: all checks passed\n'
@@ -749,7 +982,7 @@ run_self_test() {
 }
 
 main() {
-    local domains_csv="" agents_csv="" flag_remote="" flag_key="" flag_mode="" flag_minutes="" skip_sync=false
+    local domains_csv="" agents_csv="" flag_remote="" flag_key="" flag_mode="" flag_minutes="" skip_sync=false skip_skills=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domains)
@@ -780,6 +1013,10 @@ main() {
                 skip_sync=true
                 shift
                 ;;
+            --no-skills)
+                skip_skills=true
+                shift
+                ;;
             --dry-run)
                 dry_run=true
                 shift
@@ -796,7 +1033,7 @@ main() {
         esac
     done
     [[ -n "$domains_csv" ]] || usage
-    run_setup "$domains_csv" "$agents_csv" "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" "$skip_sync"
+    run_setup "$domains_csv" "$agents_csv" "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" "$skip_sync" "$skip_skills"
 }
 
 main "$@"

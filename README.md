@@ -14,7 +14,7 @@ Lessons learned from each|every sessions based on trials, errors, failures, and 
 ## Install
 
 ```sh
-scripts/setup.sh --domains work,shared --agents opencode,claude   # all of the below, plus MCP registration
+scripts/setup.sh --domains work,shared --agents opencode,claude   # all of the below, plus MCP registration and the `lessons` skill
 ```
 
 Or by hand:
@@ -25,6 +25,8 @@ lessons init                  # creates the DB files (--domain work|personal|sha
 ```
 
 `setup.sh` requires `--domains`, so it never creates a file this machine should not hold. `--dry-run` shows the steps without running them.
+
+For each agent in `--agents` that is installed, `setup.sh` also copies the shipped skill (`skills/lessons/SKILL.md`) into that agent's skills directory: `~/.claude/skills/lessons/` for Claude Code, and `$XDG_CONFIG_HOME/opencode/skills/lessons/` (default `~/.config/opencode/skills/lessons/`) for opencode. It never overwrites an existing `SKILL.md`, and it leaves the skill alone when the skill directory or any directory above it, up to your home directory, is a symlink (a symlink usually points into another repository, such as a dotfiles repo, and a copy would put a file there). A symlink above your home directory is not looked at. `--no-skills` skips the step. The skill teaches an agent to search the lessons before a task and to record one after a fix, through the `lessons` CLI, so it works without the MCP server too.
 
 `lessons sync` runs the `git` command, so git must be installed and on your PATH. Without it, sync fails with an error; every other `lessons` command still works. On Windows, use WSL2 and keep `~/.lessons` inside the Linux filesystem.
 
