@@ -456,7 +456,7 @@ fn write_clone_files(cycle: &Cycle, domain: Domain, plan: &DomainPlan) -> Result
 /// The ssh agent socket the user's own ssh configuration names for the host of `remote`, from `ssh -G <host>`; none for
 /// a remote that is not ssh, or when ssh cannot say. Needed because `-F /dev/null` drops that configuration, and a key
 /// that only an agent holds (a `.pub` file for a 1Password key) could not sign without it.
-fn identity_agent_of(remote: &str) -> Option<String> {
+pub(super) fn identity_agent_of(remote: &str) -> Option<String> {
     let host: String = ssh_host_of(remote)?;
     let described = std::process::Command::new("ssh")
         .args(["-G", "--", &host])

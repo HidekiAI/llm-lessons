@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::files::{ClonePaths, SyncState, read_state};
-use super::git::redact_credentials;
+use super::git::{GitRunner, redact_credentials, ssh_command};
+use super::run::identity_agent_of;
 use crate::config::CloneSpec;
+use crate::journal;
 
 /// What one `git ls-remote` probe says about a key (or, anonymously, about the caller).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,33 +187,94 @@ pub struct WorkGuard {
 
 /// The anonymous `https://<host>/<path>` of a remote, or none when it cannot be derived (an ssh alias, a custom port).
 pub fn https_url_of_remote(remote: &str) -> Option<String> {
-    let _ = remote;
-    None
+    // TODO(human): begin block 1/6
+    // Credentials are stripped, and a custom port or a host with no dot is refused: the anonymous probe must not carry a
+    // secret, and an ssh alias or a port names no public host.
+    // let fn_host_and_path = |authority: &str, path: &str| -> Option<String> {
+    //     let host: &str = authority
+    //         .rsplit_once('@')
+    //         .map_or(authority, |(_credentials, host)| host);
+    //     (host.contains('.') && !host.contains(':') && !path.is_empty())
+    //         .then(|| format!("https://{host}/{}", path.trim_start_matches('/')))
+    // };
+    // match remote.split_once("://") {
+    //     Some(("https" | "ssh", rest)) => rest
+    //         .split_once('/')
+    //         .and_then(|(authority, path)| fn_host_and_path(authority, path)),
+    //     Some(_) => None,
+    //     None => remote
+    //         .split_once(':')
+    //         .and_then(|(authority, path)| fn_host_and_path(authority, path)),
+    // }
+    // TODO(human): end block 1/6
 }
 
 /// Whether the visibility is due for a probe: never checked, or the last check is `ACCESS_RECHECK_DAYS` old or more.
 pub fn access_check_due(last_check_unix_secs: Option<u64>, now_secs: u64) -> bool {
-    let _ = (
-        last_check_unix_secs,
-        now_secs,
-        SECS_PER_DAY,
-        ACCESS_RECHECK_DAYS,
-    );
-    false
+    // TODO(human): begin block 2/6
+    // An interval old or older is due; a check time in the future (a clock that moved back) is not, so a wrong clock cannot
+    // make every cycle probe.
+    // last_check_unix_secs.is_none_or(|last_check| {
+    //     now_secs.saturating_sub(last_check) >= ACCESS_RECHECK_DAYS * SECS_PER_DAY
+    // })
+    // TODO(human): end block 2/6
 }
 
 /// The real probe: `git ls-remote` as the request says, its exit status and stderr read by `classify_probe`. Exercised
 /// by hand against every configured host (S5), never by the tests.
 pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
-    let _ = request;
-    ProbeClass::Inconclusive
+    // TODO(human): begin block 3/6
+    // Every outcome becomes a class: a git that cannot start is Inconclusive, never a pass. ssh runs with -v because
+    // classify_probe reads its debug lines; the anonymous probe disables credential helpers and prompts, so no stored login
+    // can make a private repository look public.
+    // let fn_class_of = |runner: &GitRunner, git_args: &[&str]| -> ProbeClass {
+    //     match runner.run(git_args) {
+    //         Ok(output) => classify_probe(output.exit_ok, &output.stderr),
+    //         Err(spawn_error) => {
+    //             journal!("probe: git did not run: {spawn_error:#}");
+    //             ProbeClass::Inconclusive
+    //         }
+    //     }
+    // };
+    // match request {
+    //     ProbeRequest::WithKey { remote, key } => {
+    //         let probing_ssh: String = format!(
+    //             "{} -v",
+    //             ssh_command(key, identity_agent_of(remote).as_deref())
+    //         );
+    //         fn_class_of(
+    //             &GitRunner::new(&std::env::temp_dir(), &probing_ssh),
+    //             &["ls-remote", "--", remote, "HEAD"],
+    //         )
+    //     }
+    //     ProbeRequest::Anonymous { url } => fn_class_of(
+    //         &GitRunner::new(&std::env::temp_dir(), "ssh").with_env("GIT_ASKPASS", ""),
+    //         &["-c", "credential.helper=", "ls-remote", "--", url, "HEAD"],
+    //     ),
+    // }
+    // TODO(human): end block 3/6
 }
 
 /// The R6 decision for a `work` clone with its own remote: probe the work key, then every other key, and let
 /// `decide_access` judge.
 pub fn work_guard_decision(work_remote: &str, guard: &WorkGuard, probe: ProbeFn) -> AccessDecision {
-    let _ = (work_remote, guard, probe);
-    AccessDecision::Allow
+    // TODO(human): begin block 4/6
+    // Probe the work key first, then every other key, and let decide_access judge: the guard fails closed, so nothing here
+    // may turn an unjudged key into a pass.
+    // let fn_probe_with = |key: &Path| {
+    //     probe(&ProbeRequest::WithKey {
+    //         remote: work_remote.to_string(),
+    //         key: key.to_path_buf(),
+    //     })
+    // };
+    // let work_probe: ProbeClass = fn_probe_with(&guard.work_key);
+    // let other_probes: Vec<(&str, ProbeClass)> = guard
+    //     .other_keys
+    //     .iter()
+    //     .map(|(key_name, key)| (key_name.as_str(), fn_probe_with(key)))
+    //     .collect();
+    // decide_access(work_probe, &other_probes)
+    // TODO(human): end block 4/6
 }
 
 /// The state after the visibility step: when a probe is due and a URL can be derived, probe anonymously and record the
@@ -222,21 +285,41 @@ pub fn visibility_after_probe(
     probe: ProbeFn,
     now_secs: u64,
 ) -> SyncState {
-    let _ = (remote, probe, now_secs);
-    state
+    // TODO(human): begin block 5/6
+    // An inconclusive probe records unknown and keeps the old check time, so the next cycle probes again; only a verdict
+    // stamps the time.
+    // let due_url: Option<String> = https_url_of_remote(remote)
+    //     .filter(|_| access_check_due(state.last_access_check_unix_secs, now_secs));
+    // match due_url {
+    //     None => state,
+    //     Some(url) => {
+    //         let class: ProbeClass = probe(&ProbeRequest::Anonymous { url });
+    //         SyncState {
+    //             visibility: visibility_from_probe(class, true),
+    //             last_access_check_unix_secs: (class != ProbeClass::Inconclusive)
+    //                 .then_some(now_secs)
+    //                 .or(state.last_access_check_unix_secs),
+    //             ..state
+    //         }
+    //     }
+    // }
+    // TODO(human): end block 5/6
 }
 
 /// The PUBLIC warnings to print on stderr for the configured clones: one per clone whose recorded visibility is public,
 /// read from the clones' state files (no network).
 pub fn public_warnings(lessons_home: &Path, clones: &[CloneSpec]) -> Vec<String> {
-    let _ = (
-        lessons_home,
-        clones,
-        ClonePaths::new,
-        read_state,
-        public_warning,
-    );
-    Vec::new()
+    // TODO(human): begin block 6/6
+    // State files only, no network: this runs before every command.
+    // clones
+    //     .iter()
+    //     .filter_map(|clone| {
+    //         let state: SyncState =
+    //             read_state(&ClonePaths::new(lessons_home, &clone.normalized_remote).state_file());
+    //         public_warning(&clone.remote, state.visibility)
+    //     })
+    //     .collect()
+    // TODO(human): end block 6/6
 }
 
 #[cfg(test)]
@@ -592,7 +675,8 @@ mod tests {
     #[test]
     fn the_work_guard_probes_the_work_key_then_every_other_key_and_judges() {
         const WORK_REMOTE: &str = "git@gitlab.example.com:org/work.git";
-        let cases: &[(&[(&str, ProbeClass)], bool, &str)] = &[
+        type GuardRow<'row> = (&'row [(&'row str, ProbeClass)], bool, &'row str);
+        let cases: &[GuardRow] = &[
             (
                 &[
                     ("/k/work", ProbeClass::Readable),
