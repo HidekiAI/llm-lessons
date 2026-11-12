@@ -9,6 +9,7 @@ mod query;
 mod store;
 mod sync;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitCode};
 
@@ -324,9 +325,10 @@ fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
         Ok(sync::public_warnings(&lessons_home, &clones))
     });
     match warnings {
-        Ok(warning_lines) => warning_lines
-            .iter()
-            .for_each(|warning_line| eprintln!("{warning_line}")),
+        Ok(warning_lines) => warning_lines.iter().for_each(|warning_line| {
+            // A closed stderr (a hook whose reader went away) must not turn a caution into a panic.
+            drop(writeln!(std::io::stderr(), "{warning_line}"));
+        }),
         Err(skipped) => journal!("public warning skipped: {skipped:#}"),
     }
 }

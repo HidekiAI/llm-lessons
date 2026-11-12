@@ -87,12 +87,12 @@ pub fn sync_clone(
         Some(_held_lock) => {
             let state_read: SyncState = read_state(&paths.state_file());
             // The access guards run under the lock and before anything is fetched. A refusal fails the cycle (and
-            // counts as a failure) but is never remembered as a pass; the visibility step cannot fail.
-            let guarded: Result<SyncState> = check_access(job, state_read.clone(), now_secs);
-            let state_before: SyncState =
-                guarded.as_ref().map_or(state_read, |state| state.clone());
+            // counts as a failure) but is never remembered as a pass; the visibility step cannot fail and is recorded
+            // either way.
+            let (state_before, guard_result): (SyncState, Result<()>) =
+                check_access(job, state_read, now_secs);
             let cycle: Result<Option<String>> =
-                guarded.and_then(|state| run_cycle(job, &paths, &state, on_step));
+                guard_result.and_then(|()| run_cycle(job, &paths, &state_before, on_step));
             let recorded: CycleResult = match &cycle {
                 Ok(last_synced) => CycleResult::Succeeded {
                     // A partial run leaves BASE where it was; see `CloneJob::whole_clone`.
@@ -124,14 +124,18 @@ pub fn sync_clone(
 
 /// The access step of one cycle (plan step S5): the R6 guard for a clone with its own `work` remote, then the R13
 /// visibility probe. A refused guard is an error naming why; the returned state carries the visibility the probe found.
-fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> Result<SyncState> {
+fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, Result<()>) {
     let guard_result: Result<()> = job.work_guard.as_ref().map_or(Ok(()), |guard| {
         match work_guard_decision(job.remote, guard, job.probe) {
             AccessDecision::Allow => Ok(()),
             AccessDecision::Refuse(reason) => bail!("work is refused: {reason}"),
         }
     });
-    guard_result.map(|()| visibility_after_probe(state, job.remote, job.probe, now_secs))
+    // R13 never depends on R6: a remote that is public and refused is still recorded public, so it is still warned about.
+    (
+        visibility_after_probe(state, job.remote, job.probe, now_secs),
+        guard_result,
+    )
 }
 
 /// Takes the clone lock without waiting: the lock is the open file, so the operating system frees it when the process
@@ -1879,6 +1883,35 @@ mod tests {
             work_guard_of(&home_clone, &[shared_work, home_clone.clone()]),
             None,
             "only a work clone is guarded"
+        );
+    }
+    #[test]
+    fn access_a_refused_work_clone_still_records_its_visibility() {
+        // R13 never depends on R6: a work remote that is public AND refused must still be warned about.
+        const HTTPS_REMOTE: &str = "https://example.com/o/work.git";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let fn_probe = |_request: &ProbeRequest| ProbeClass::Readable; // every key reads, and the remote is anonymously readable
+        let job = CloneJob {
+            normalized_remote: HTTPS_REMOTE,
+            probe: &fn_probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(HTTPS_REMOTE)
+        };
+        assert!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).is_err(),
+            "every key reads work: refused"
+        );
+        let state = read_state(&machine.paths(HTTPS_REMOTE).state_file());
+        assert_eq!(
+            state.visibility,
+            Visibility::Public,
+            "the visibility was probed and recorded anyway"
+        );
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "and the refusal still counts as a failure"
         );
     }
 }

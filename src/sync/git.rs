@@ -2,8 +2,10 @@
 //! lookup, push classification and the idempotent clone setup. Sync only ever fetches, commits on top of the remote
 //! tip and pushes: it never runs `git pull` or `git merge`, and it never prompts, because it runs in the background.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -160,6 +162,9 @@ pub struct GitOutput {
     pub stderr: String,
 }
 
+/// How often `run_with_deadline` looks at the child it waits for.
+const DEADLINE_POLL: Duration = Duration::from_millis(20);
+
 /// Runs git for one sync clone. Every call has `GIT_TERMINAL_PROMPT=0` and the clone's ssh command, and is journalled;
 /// `extra_env` is for tests, which point git at their own global config.
 #[derive(Debug, Clone)]
@@ -167,6 +172,8 @@ pub struct GitRunner {
     working_dir: std::path::PathBuf,
     ssh_command: String,
     extra_env: Vec<(String, String)>,
+    /// Variables git must not inherit from the calling process, by name.
+    removed_env: Vec<String>,
 }
 
 impl GitRunner {
@@ -175,7 +182,42 @@ impl GitRunner {
             working_dir: working_dir.to_path_buf(),
             ssh_command: ssh_command.to_string(),
             extra_env: Vec::new(),
+            removed_env: Vec::new(),
         }
+    }
+
+    /// Git must not inherit `name` from the calling process (removed after the `with_env` values are set).
+    pub fn without_env(self, name: &str) -> GitRunner {
+        GitRunner {
+            removed_env: self
+                .removed_env
+                .into_iter()
+                .chain([name.to_string()])
+                .collect(),
+            ..self
+        }
+    }
+
+    /// The git command for `args` with the clone's environment and no stdio set: `run` and `run_with_deadline` share it.
+    fn command_for(&self, args: &[&str]) -> Command {
+        let mut mut_command = Command::new("git");
+        mut_command
+            // A background sync must not start a daemon (fsmonitor) or a detached repack (auto gc) in the clone.
+            .args(["-c", "core.fsmonitor=false", "-c", "gc.auto=0"])
+            .args(args)
+            .current_dir(&self.working_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", &self.ssh_command)
+            .env("GIT_ASKPASS", "") // an askpass helper would prompt; sync never does
+            // classify_push reads git's English messages, so a localized git must not translate them.
+            .env("LC_ALL", "C")
+            .env_remove("GIT_DIR") // a hook-launched process could point git at another repository
+            .env_remove("GIT_WORK_TREE")
+            .envs(self.extra_env.iter().map(|(name, value)| (name, value)));
+        self.removed_env.iter().for_each(|name| {
+            mut_command.env_remove(name);
+        });
+        mut_command
     }
 
     pub fn with_env(self, name: &str, value: &str) -> GitRunner {
@@ -197,19 +239,8 @@ impl GitRunner {
             redact_credentials(&args.join(" ")),
             self.working_dir.display()
         );
-        let output: Output = Command::new("git")
-            // A background sync must not start a daemon (fsmonitor) or a detached repack (auto gc) in the clone.
-            .args(["-c", "core.fsmonitor=false", "-c", "gc.auto=0"])
-            .args(args)
-            .current_dir(&self.working_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_SSH_COMMAND", &self.ssh_command)
-            .env("GIT_ASKPASS", "") // an askpass helper would prompt; sync never does
-            // classify_push reads git's English messages, so a localized git must not translate them.
-            .env("LC_ALL", "C")
-            .env_remove("GIT_DIR") // a hook-launched process could point git at another repository
-            .env_remove("GIT_WORK_TREE")
-            .envs(self.extra_env.iter().map(|(name, value)| (name, value)))
+        let output: Output = self
+            .command_for(args)
             .output()
             .with_context(|| {
                 format!(
@@ -230,6 +261,74 @@ impl GitRunner {
             redact_credentials(git_output.stderr.trim())
         );
         Ok(git_output)
+    }
+
+    /// Like `run`, but the git process is killed and the result is an error when it has not finished within `deadline`:
+    /// git has no connect timeout of its own, so a black-holed host would otherwise hold the caller for minutes.
+    pub fn run_with_deadline(&self, args: &[&str], deadline: Duration) -> Result<GitOutput> {
+        // TODO(human): begin block 1/3
+        // The deadline is wall-clock: the child is polled, killed when it is over, and the caller gets an error naming the
+        // command. Both pipes are drained on their own threads, or a chatty git would block on a full pipe while this waits.
+        // After a kill the readers are left to end by themselves: a grandchild (ssh) may still hold the pipes open.
+        // journal!(
+        //     "git {} (in {}, deadline {deadline:?})",
+        //     redact_credentials(&args.join(" ")),
+        //     self.working_dir.display()
+        // );
+        // // A generic helper: a closure cannot take `impl Read`. The reader threads end by themselves when the pipe closes.
+        // fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        //     std::thread::spawn(move || {
+        //         let mut mut_text: Vec<u8> = Vec::new();
+        //         if let Some(mut mut_pipe) = pipe {
+        //             drop(mut_pipe.read_to_end(&mut mut_text));
+        //         }
+        //         mut_text
+        //     })
+        // }
+        // let mut mut_child: Child = self
+        //     .command_for(args)
+        //     .stdin(Stdio::null())
+        //     .stdout(Stdio::piped())
+        //     .stderr(Stdio::piped())
+        //     .spawn()
+        //     .with_context(|| {
+        //         format!(
+        //             "git {}: could not start git in {}",
+        //             redact_credentials(&args.join(" ")),
+        //             self.working_dir.display()
+        //         )
+        //     })?;
+        // let stdout_reader = drain(mut_child.stdout.take());
+        // let stderr_reader = drain(mut_child.stderr.take());
+        // let started: Instant = Instant::now();
+        // let status: ExitStatus = loop {
+        //     match mut_child.try_wait().context("wait for git")? {
+        //         Some(finished) => break finished,
+        //         None if started.elapsed() >= deadline => {
+        //             // The readers are left to end on their own: a grandchild (ssh) may still hold the pipes open.
+        //             drop(mut_child.kill());
+        //             drop(mut_child.wait());
+        //             bail!(
+        //                 "git {}: did not finish within {deadline:?}, killed",
+        //                 redact_credentials(&args.join(" "))
+        //             )
+        //         }
+        //         None => std::thread::sleep(DEADLINE_POLL),
+        //     }
+        // };
+        // let git_output = GitOutput {
+        //     exit_ok: status.success(),
+        //     stdout: String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned(),
+        //     stderr: String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned(),
+        // };
+        // journal!(
+        //     "git {}: exit_ok={} stderr={:?}",
+        //     redact_credentials(&args.join(" ")),
+        //     git_output.exit_ok,
+        //     redact_credentials(git_output.stderr.trim())
+        // );
+        // Ok(git_output)
+        // TODO(human): end block 1/3
     }
 
     /// Like `run`, but a failure is an error naming the command and its stderr, and the result is stdout.
@@ -286,9 +385,6 @@ pub fn ensure_clone(
     Ok(())
 }
 
-// Unit tests for the pure parsers and E2E tests against temp bare repos (local paths, no network, no ssh). Race: a lost
-// push race is produced for real by two clones pushing to one bare repo, in both orders; nothing depends on timing.
-// Back-to-back: `ensure_clone` twice is pinned. Each test points git at its own empty global config, so the tester's
 /// The ssh agent socket the user's own ssh configuration names for the host of `remote`, from `ssh -G <host>`; none for
 /// a remote that is not ssh, or when ssh cannot say. Needed because `-F /dev/null` drops that configuration, and a key
 /// that only an agent holds (a `.pub` file for a 1Password key) could not sign without it.
@@ -310,6 +406,9 @@ pub fn identity_agent_of(remote: &str) -> Option<String> {
     }
 }
 
+// Unit tests for the pure parsers and E2E tests against temp bare repos (local paths, no network, no ssh). Race: a lost
+// push race is produced for real by two clones pushing to one bare repo, in both orders; nothing depends on timing.
+// Back-to-back: `ensure_clone` twice is pinned. Each test points git at its own empty global config, so the tester's
 // `init.defaultBranch` and signing settings cannot change the result.
 #[cfg(test)]
 mod tests {
@@ -902,5 +1001,89 @@ mod tests {
                     loser.stderr
                 );
             });
+    }
+    /// How long the fake ssh sleeps: far longer than the deadlines used below.
+    const SLOW_SSH_SLEEP_SECS: u64 = 5;
+    const SHORT_DEADLINE_MS: u64 = 300;
+    const GENEROUS_DEADLINE_SECS: u64 = 30;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_outlives_its_deadline_is_killed_and_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let slow_ssh: PathBuf = temp_dir.path().join("slow-ssh");
+        fs::write(
+            &slow_ssh,
+            format!("#!/bin/sh\nsleep {SLOW_SSH_SLEEP_SECS}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&slow_ssh, fs::Permissions::from_mode(EXECUTABLE_MODE)).unwrap();
+        let global_config: PathBuf = temp_dir.path().join("global.gitconfig");
+        fs::write(&global_config, "").unwrap();
+        let runner = GitRunner::new(temp_dir.path(), &slow_ssh.to_string_lossy())
+            .with_env("GIT_CONFIG_GLOBAL", &global_config.to_string_lossy())
+            .with_env("GIT_CONFIG_NOSYSTEM", "1");
+        let started = Instant::now();
+        let result = runner.run_with_deadline(
+            &[
+                "ls-remote",
+                "--",
+                "ssh://git@example.invalid/o/r.git",
+                "HEAD",
+            ],
+            Duration::from_millis(SHORT_DEADLINE_MS),
+        );
+        let error_text: String = format!("{:#}", result.unwrap_err());
+        assert!(
+            error_text.contains("deadline") || error_text.contains("did not finish"),
+            "{error_text}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(SLOW_SSH_SLEEP_SECS - 1),
+            "the caller got control back at the deadline, not when the slow ssh ended"
+        );
+    }
+
+    #[test]
+    fn a_run_inside_its_deadline_returns_what_run_returns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let output = runner
+            .run_with_deadline(&["--version"], Duration::from_secs(GENEROUS_DEADLINE_SECS))
+            .unwrap();
+        assert!(output.exit_ok);
+        assert!(
+            output.stdout.starts_with("git version"),
+            "{}",
+            output.stdout
+        );
+        let failing = runner
+            .run_with_deadline(
+                &["rev-parse", "--verify", "no-such-ref"],
+                Duration::from_secs(GENEROUS_DEADLINE_SECS),
+            )
+            .unwrap();
+        assert!(
+            !failing.exit_ok,
+            "a git that ran and failed is an output, not an error"
+        );
+    }
+
+    #[test]
+    fn a_variable_taken_out_with_without_env_never_reaches_git() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // An alias that prints the variable git was started with.
+        let show_canary: [&str; 3] = ["-c", "alias.canary=!echo \"[$LESSONS_CANARY]\"", "canary"];
+        let with_canary = GitRunner::new(temp_dir.path(), "ssh").with_env("LESSONS_CANARY", "set");
+        assert_eq!(
+            with_canary.run_checked(&show_canary).unwrap().trim(),
+            "[set]"
+        );
+        let without_canary = with_canary.without_env("LESSONS_CANARY");
+        assert_eq!(
+            without_canary.run_checked(&show_canary).unwrap().trim(),
+            "[]"
+        );
     }
 }

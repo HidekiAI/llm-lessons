@@ -160,3 +160,36 @@ fn a_remote_recorded_private_or_never_probed_prints_no_warning() {
         );
     });
 }
+
+#[test]
+fn the_mcp_server_and_sync_keep_the_warning_off_stdout() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (lessons_home, remote) = home_recording_a_public_remote(temp_dir.path());
+    // `mcp` with its stdin closed answers nothing: its stdout is JSON-RPC only, so it must hold no warning.
+    let mcp: Output = run_lessons(&lessons_home, &["mcp"]);
+    assert!(
+        text_of(&mcp.stderr).contains("is PUBLIC"),
+        "mcp warns on stderr: {}",
+        text_of(&mcp.stderr)
+    );
+    assert!(
+        !text_of(&mcp.stdout).contains("PUBLIC"),
+        "mcp stdout is JSON-RPC only"
+    );
+    // `sync` prints its outcome on stdout and the warning on stderr.
+    let synced: Output = run_lessons(&lessons_home, &["sync"]);
+    assert!(
+        text_of(&synced.stdout).contains("synced"),
+        "{}",
+        text_of(&synced.stdout)
+    );
+    assert!(
+        !text_of(&synced.stdout).contains("PUBLIC"),
+        "sync stdout stays clean"
+    );
+    assert!(
+        text_of(&synced.stderr).contains(&format!("WARNING: {remote} is PUBLIC")),
+        "sync warns on stderr: {}",
+        text_of(&synced.stderr)
+    );
+}

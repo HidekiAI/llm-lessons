@@ -269,6 +269,7 @@ pub fn combine_outcomes(outcomes: &[CycleOutcome]) -> CycleOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::access::Visibility;
     use crate::sync::git::{GitOutput, GitRunner};
     use crate::sync::{MergedField, Version};
     use std::fs;
@@ -831,5 +832,18 @@ mod tests {
             vec![Domain::Work],
             "three copies of one domain"
         );
+    }
+    #[test]
+    fn a_failed_cycle_keeps_the_recorded_visibility_and_check_time() {
+        const SOME_NOW: u64 = 1_762_000_000;
+        const CHECKED_AT: u64 = 1_761_900_000;
+        let before = SyncState {
+            visibility: Visibility::Public,
+            last_access_check_unix_secs: Some(CHECKED_AT),
+            ..SyncState::default()
+        };
+        let after = state_after_cycle(before, CycleResult::Failed, SOME_NOW);
+        assert_eq!(after.visibility, Visibility::Public);
+        assert_eq!(after.last_access_check_unix_secs, Some(CHECKED_AT));
     }
 }
