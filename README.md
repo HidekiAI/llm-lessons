@@ -154,7 +154,7 @@ When `work` shares a repo with `personal` or `shared`, sync notes once per sync 
 ### Why do you need 3 different databases?
 
 - **The leak.** One database with a `domain` column keeps every lesson on every machine, so a work lesson (a server name, a customer, a ticket) would sit on your home machine.
-- **The missing file.** If you split machines (Scenario A): a machine that never has `work.db` cannot expose it. Your home machine holds `personal.db` and `shared.db`; your work machine holds `work.db` and `shared.db`. Scenario B (all three on every machine) gives this up.
+- **The missing file.** If you split machines and repos (Scenario A, with a work-only repo): a machine that never has `work.db` and never clones the work repo cannot expose it. Your home machine holds `personal.db` and `shared.db`; your work machine holds `work.db` and `shared.db`. Scenario B (all three on every machine) gives this up.
 - **The sync.** Each file syncs to its own repo (keep `work` private), or all three share one. With one shared repo, everyone who can read it can read all three, so split `work` into a repo of its own if anyone else can read the shared one (see [how to share lessons](#how-do-i-share-my-sqlite-db-lessons-so-that-lessons-learned-at-work-can-be-applied-to-home-and-vice-versa)).
 - **The search.** `lessons search --in personal,shared` reads only the files you name.
 
