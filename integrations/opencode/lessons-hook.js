@@ -3,7 +3,7 @@
 // slow or failing: a lessons problem must never block or break a prompt.
 //
 // Install: copy this one file into opencode's plugins directory (scripts/setup.sh --agents opencode does it).
-// opencode loads every export of a file in that directory as a plugin, so this file exports only the plugin.
+// opencode 1 loads every function export of a file in that directory as a plugin, so this file exports only the plugin function and the default object opencode 2 needs.
 
 import { execFile } from "node:child_process"
 import { randomUUID } from "node:crypto"
@@ -60,4 +60,12 @@ export const LessonsHook = async ({ directory }) => {
         // The one guard that keeps the promise: whatever the host hands over, a lessons problem must never break a prompt.
         "chat.message": async (input, output) => addLessonsToMessage(input, output).catch(() => {}),
     }
+}
+
+// opencode 2 loads a plugin from its default export (an id plus a server hook function); opencode 1 reads the named
+// export above. Same shape as the herdr plugin that opencode 2 already loads.
+export default {
+    id: "lessons.hook",
+    server: LessonsHook,
+    setup() {},
 }
