@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::files::{ClonePaths, SyncState, read_state};
-use super::git::{GitRunner, identity_agent_of, redact_credentials, ssh_command};
+use super::files::{read_state, ClonePaths, SyncState};
+use super::git::{identity_agent_of, redact_credentials, ssh_command, GitRunner};
 use crate::config::CloneSpec;
 use crate::journal;
 
@@ -241,84 +241,76 @@ pub struct ProbeCommand {
 /// The ssh command of a key probe: the key alone, verbose so `classify_probe` can read how far authentication got, and a
 /// connect timeout so a black-holed host fails the probe.
 fn ssh_probe_command(key: &Path, identity_agent: Option<&str>) -> String {
-    // TODO(human): begin block 1/6
     // Only the key given is offered (`-F /dev/null` in ssh_command drops the user's ssh config); `-v` lets classify_probe
     // read how far authentication got; ConnectTimeout makes a black-holed host fail the probe.
-    // format!(
-    //     "{} -v -o ConnectTimeout={PROBE_TIMEOUT_SECS}",
-    //     ssh_command(key, identity_agent)
-    // )
-    // TODO(human): end block 1/6
+    format!(
+        "{} -v -o ConnectTimeout={PROBE_TIMEOUT_SECS}",
+        ssh_command(key, identity_agent)
+    )
 }
 
 /// The environment of an anonymous probe: no askpass, no global, system or XDG git config, no home directory (so no
 /// netrc), and git's low-speed limits so a stalled transfer ends.
 fn anonymous_probe_env() -> Vec<(String, String)> {
-    // TODO(human): begin block 2/6
     // No stored login can make a private repository look public: no askpass, no global, system or XDG git config (an
-    // `insteadOf` there could turn this into an authenticated read) and no HOME (a netrc). Git's low-speed limits end a stalled
-    // transfer.
-    // [
-    //     ("GIT_ASKPASS", ""),
-    //     ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    //     ("GIT_CONFIG_NOSYSTEM", "1"),
-    //     // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
-    //     ("XDG_CONFIG_HOME", "/dev/null"),
-    //     ("HOME", "/dev/null"),
-    //     (
-    //         "GIT_HTTP_LOW_SPEED_LIMIT",
-    //         &PROBE_LOW_SPEED_BYTES_PER_SEC.to_string(),
-    //     ),
-    //     ("GIT_HTTP_LOW_SPEED_TIME", &PROBE_TIMEOUT_SECS.to_string()),
-    // ]
-    // .iter()
-    // .map(|(name, value)| (name.to_string(), value.to_string()))
-    // .collect()
-    // TODO(human): end block 2/6
+    // `insteadOf` there could turn this into an authenticated read) and no HOME (a netrc). Git's low-speed limits end a
+    // stalled transfer.
+    [
+        ("GIT_ASKPASS", ""),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
+        ("XDG_CONFIG_HOME", "/dev/null"),
+        ("HOME", "/dev/null"),
+        (
+            "GIT_HTTP_LOW_SPEED_LIMIT",
+            &PROBE_LOW_SPEED_BYTES_PER_SEC.to_string(),
+        ),
+        ("GIT_HTTP_LOW_SPEED_TIME", &PROBE_TIMEOUT_SECS.to_string()),
+    ]
+    .iter()
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+    .collect()
 }
 
 /// The key probe: `remote` read with `key` alone, through `ssh_probe_command`.
 fn key_probe_command(remote: &str, key: &Path, identity_agent: Option<&str>) -> ProbeCommand {
-    // TODO(human): begin block 3/6
     // The key probe keeps the user's environment: only the ssh command isolates it, and nothing is removed.
-    // ProbeCommand {
-    //     ssh_command: ssh_probe_command(key, identity_agent),
-    //     env: Vec::new(),
-    //     env_remove: Vec::new(),
-    //     git_args: ["ls-remote", "--", remote, "HEAD"]
-    //         .map(String::from)
-    //         .to_vec(),
-    // }
-    // TODO(human): end block 3/6
+    ProbeCommand {
+        ssh_command: ssh_probe_command(key, identity_agent),
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        git_args: ["ls-remote", "--", remote, "HEAD"]
+            .map(String::from)
+            .to_vec(),
+    }
 }
 
 /// The anonymous probe: `url` read with no identity, no credential helper, no redirect and no config injected through
 /// the environment (an `insteadOf` or a proxy there must not reach it).
 fn anonymous_probe_command(url: &str) -> ProbeCommand {
-    // TODO(human): begin block 4/6
     // The anonymous probe is isolated three ways: its environment (anonymous_probe_env), the variables it must not inherit
     // (config injected through GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS) and git's own switches (no credential helper, no
     // redirect: a renamed repository stays unknown, the safe direction).
-    // ProbeCommand {
-    //     ssh_command: "ssh".to_string(), // never run: the URL is https
-    //     env: anonymous_probe_env(),
-    //     env_remove: ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]
-    //         .map(String::from)
-    //         .to_vec(),
-    //     git_args: [
-    //         "-c",
-    //         "credential.helper=",
-    //         "-c",
-    //         "http.followRedirects=false",
-    //         "ls-remote",
-    //         "--",
-    //         url,
-    //         "HEAD",
-    //     ]
-    //     .map(String::from)
-    //     .to_vec(),
-    // }
-    // TODO(human): end block 4/6
+    ProbeCommand {
+        ssh_command: "ssh".to_string(), // never run: the URL is https
+        env: anonymous_probe_env(),
+        env_remove: ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]
+            .map(String::from)
+            .to_vec(),
+        git_args: [
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--",
+            url,
+            "HEAD",
+        ]
+        .map(String::from)
+        .to_vec(),
+    }
 }
 
 /// The command of one probe, built without running anything so its isolation and its timeouts can be tested.
@@ -332,60 +324,39 @@ pub fn probe_command_of(request: &ProbeRequest, identity_agent: Option<&str>) ->
 
 /// A git runner for `command`: its ssh command and environment set, the variables it must not inherit removed.
 fn runner_for(command: &ProbeCommand) -> GitRunner {
-    // TODO(human): begin block 5/6
     // The runner carries the command's ssh command and environment, then drops the variables the probe must not inherit.
-    // let runner_with_env: GitRunner = command.env.iter().fold(
-    //     GitRunner::new(&std::env::temp_dir(), &command.ssh_command),
-    //     |runner_so_far, (name, value)| runner_so_far.with_env(name, value),
-    // );
-    // command
-    //     .env_remove
-    //     .iter()
-    //     .fold(runner_with_env, |runner_so_far, name| {
-    //         runner_so_far.without_env(name)
-    //     })
-    // TODO(human): end block 5/6
+    let runner_with_env: GitRunner = command.env.iter().fold(
+        GitRunner::new(&std::env::temp_dir(), &command.ssh_command),
+        |runner_so_far, (name, value)| runner_so_far.with_env(name, value),
+    );
+    command
+        .env_remove
+        .iter()
+        .fold(runner_with_env, |runner_so_far, name| {
+            runner_so_far.without_env(name)
+        })
 }
 
 /// The real probe: `git ls-remote` as the request says, its exit status and stderr read by `classify_probe`. Exercised
 /// by hand against every configured host (S5), never by the tests.
 pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
-    // TODO(human): begin block 6/6
     // Every outcome becomes a class: a git that cannot start, or that outlives PROBE_DEADLINE_SECS, is Inconclusive and
     // never a pass. Running the command is exercised by hand against every configured host.
-    // was: let agent: Option<String> = match request {
-    // was:     ProbeRequest::WithKey { remote, .. } => identity_agent_of(remote),
-    // was:     ProbeRequest::Anonymous { .. } => None,
-    // was: };
-    // was: let command: ProbeCommand = probe_command_of(request, agent.as_deref());
-    // was: let runner: GitRunner = command.env.iter().fold(
-    // was:     GitRunner::new(&std::env::temp_dir(), &command.ssh_command),
-    // was:     |runner_so_far, (name, value)| runner_so_far.with_env(name, value),
-    // was: );
-    // was: let git_args: Vec<&str> = command.git_args.iter().map(String::as_str).collect();
-    // was: match runner.run(&git_args) {
-    // was:     Ok(output) => classify_probe(output.exit_ok, &output.stderr),
-    // was:     Err(spawn_error) => {
-    // was:         journal!("probe: git did not run: {spawn_error:#}");
-    // was:         ProbeClass::Inconclusive
-    // was:     }
-    // was: }
-    // let agent: Option<String> = match request {
-    //     ProbeRequest::WithKey { remote, .. } => identity_agent_of(remote),
-    //     ProbeRequest::Anonymous { .. } => None,
-    // };
-    // let command: ProbeCommand = probe_command_of(request, agent.as_deref());
-    // let git_args: Vec<&str> = command.git_args.iter().map(String::as_str).collect();
-    // match runner_for(&command)
-    //     .run_with_deadline(&git_args, Duration::from_secs(PROBE_DEADLINE_SECS))
-    // {
-    //     Ok(output) => classify_probe(output.exit_ok, &output.stderr),
-    //     Err(spawn_or_deadline_error) => {
-    //         journal!("probe: git gave no answer: {spawn_or_deadline_error:#}");
-    //         ProbeClass::Inconclusive
-    //     }
-    // }
-    // TODO(human): end block 6/6
+    let agent: Option<String> = match request {
+        ProbeRequest::WithKey { remote, .. } => identity_agent_of(remote),
+        ProbeRequest::Anonymous { .. } => None,
+    };
+    let command: ProbeCommand = probe_command_of(request, agent.as_deref());
+    let git_args: Vec<&str> = command.git_args.iter().map(String::as_str).collect();
+    match runner_for(&command)
+        .run_with_deadline(&git_args, Duration::from_secs(PROBE_DEADLINE_SECS))
+    {
+        Ok(output) => classify_probe(output.exit_ok, &output.stderr),
+        Err(spawn_or_deadline_error) => {
+            journal!("probe: git gave no answer: {spawn_or_deadline_error:#}");
+            ProbeClass::Inconclusive
+        }
+    }
 }
 
 /// The R6 decision for a `work` clone with its own remote: probe the work key, then every other key, and let
@@ -461,11 +432,13 @@ mod tests {
     use super::*;
 
     /// The `ssh -v` lines of a key the server never accepted, ending in the host's rejection.
-    const SSH_KEY_OFFERED_NOT_ACCEPTED: &str = "debug1: Offering public key: /k/id_work ED25519 SHA256:abc\n\
+    const SSH_KEY_OFFERED_NOT_ACCEPTED: &str =
+        "debug1: Offering public key: /k/id_work ED25519 SHA256:abc\n\
          debug1: Authentications that can continue: publickey\n\
          git@github.com: Permission denied (publickey).\n\
          fatal: Could not read from remote repository.\n";
-    const SSH_KEY_ACCEPTED_THEN_NO_REPO: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_ACCEPTED_THEN_NO_REPO: &str =
+        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
          ERROR: Repository not found.\n\
          fatal: Could not read from remote repository.\n";
@@ -480,15 +453,18 @@ mod tests {
         "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
 
     /// An offered key and then a connection that dropped is no verdict: the host never said no.
-    const SSH_KEY_OFFERED_THEN_CONNECTION_RESET: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_OFFERED_THEN_CONNECTION_RESET: &str =
+        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          Connection reset by 192.0.2.1 port 22\n\
          fatal: Could not read from remote repository.\n";
-    const SSH_KEY_ACCEPTED_THEN_UNRECOGNISED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_ACCEPTED_THEN_UNRECOGNISED: &str =
+        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
          something no table has ever seen\n";
 
     /// The server took the key and the session then failed for another reason: the key was not the problem.
-    const SSH_KEY_ACCEPTED_THEN_SESSION_FAILED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_ACCEPTED_THEN_SESSION_FAILED: &str =
+        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
          git@github.com: Permission denied (publickey).\n";
 
@@ -710,7 +686,7 @@ mod tests {
     // S5b tests: the pure rows for the four logic functions and the warning reader. The real probes are exercised by
     // hand against every configured host and are not tested here. Tests that count probe calls use a `RefCell`: the
     // probe is a shared `Fn`, so a counter cannot be a plain `let mut`.
-    use crate::sync::files::{ClonePaths, SyncState, write_state};
+    use crate::sync::files::{write_state, ClonePaths, SyncState};
     use std::cell::RefCell;
 
     const GITHUB_HTTPS: &str = "https://github.com/HidekiAI/llm-lessons.git";

@@ -1072,7 +1072,8 @@ mod tests {
     fn a_variable_taken_out_with_without_env_never_reaches_git() {
         let temp_dir = tempfile::tempdir().unwrap();
         // An alias that prints the variable git was started with.
-        let show_canary: [&str; 3] = ["-c", "alias.canary=!echo \"[$LESSONS_CANARY]\"", "canary"];
+        let show_canary: Vec<&str> =
+            vec!["-c", "alias.canary=!echo \"[$LESSONS_CANARY]\"", "canary"];
         let with_canary = GitRunner::new(temp_dir.path(), "ssh").with_env("LESSONS_CANARY", "set");
         assert_eq!(
             with_canary.run_checked(&show_canary).unwrap().trim(),
