@@ -266,69 +266,67 @@ impl GitRunner {
     /// Like `run`, but the git process is killed and the result is an error when it has not finished within `deadline`:
     /// git has no connect timeout of its own, so a black-holed host would otherwise hold the caller for minutes.
     pub fn run_with_deadline(&self, args: &[&str], deadline: Duration) -> Result<GitOutput> {
-        // TODO(human): begin block 1/3
         // The deadline is wall-clock: the child is polled, killed when it is over, and the caller gets an error naming the
         // command. Both pipes are drained on their own threads, or a chatty git would block on a full pipe while this waits.
         // After a kill the readers are left to end by themselves: a grandchild (ssh) may still hold the pipes open.
-        // journal!(
-        //     "git {} (in {}, deadline {deadline:?})",
-        //     redact_credentials(&args.join(" ")),
-        //     self.working_dir.display()
-        // );
-        // // A generic helper: a closure cannot take `impl Read`. The reader threads end by themselves when the pipe closes.
-        // fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-        //     std::thread::spawn(move || {
-        //         let mut mut_text: Vec<u8> = Vec::new();
-        //         if let Some(mut mut_pipe) = pipe {
-        //             drop(mut_pipe.read_to_end(&mut mut_text));
-        //         }
-        //         mut_text
-        //     })
-        // }
-        // let mut mut_child: Child = self
-        //     .command_for(args)
-        //     .stdin(Stdio::null())
-        //     .stdout(Stdio::piped())
-        //     .stderr(Stdio::piped())
-        //     .spawn()
-        //     .with_context(|| {
-        //         format!(
-        //             "git {}: could not start git in {}",
-        //             redact_credentials(&args.join(" ")),
-        //             self.working_dir.display()
-        //         )
-        //     })?;
-        // let stdout_reader = drain(mut_child.stdout.take());
-        // let stderr_reader = drain(mut_child.stderr.take());
-        // let started: Instant = Instant::now();
-        // let status: ExitStatus = loop {
-        //     match mut_child.try_wait().context("wait for git")? {
-        //         Some(finished) => break finished,
-        //         None if started.elapsed() >= deadline => {
-        //             // The readers are left to end on their own: a grandchild (ssh) may still hold the pipes open.
-        //             drop(mut_child.kill());
-        //             drop(mut_child.wait());
-        //             bail!(
-        //                 "git {}: did not finish within {deadline:?}, killed",
-        //                 redact_credentials(&args.join(" "))
-        //             )
-        //         }
-        //         None => std::thread::sleep(DEADLINE_POLL),
-        //     }
-        // };
-        // let git_output = GitOutput {
-        //     exit_ok: status.success(),
-        //     stdout: String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned(),
-        //     stderr: String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned(),
-        // };
-        // journal!(
-        //     "git {}: exit_ok={} stderr={:?}",
-        //     redact_credentials(&args.join(" ")),
-        //     git_output.exit_ok,
-        //     redact_credentials(git_output.stderr.trim())
-        // );
-        // Ok(git_output)
-        // TODO(human): end block 1/3
+        journal!(
+            "git {} (in {}, deadline {deadline:?})",
+            redact_credentials(&args.join(" ")),
+            self.working_dir.display()
+        );
+        // A generic helper: a closure cannot take `impl Read`. The reader threads end by themselves when the pipe closes.
+        fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut mut_text: Vec<u8> = Vec::new();
+                if let Some(mut mut_pipe) = pipe {
+                    drop(mut_pipe.read_to_end(&mut mut_text));
+                }
+                mut_text
+            })
+        }
+        let mut mut_child: Child = self
+            .command_for(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "git {}: could not start git in {}",
+                    redact_credentials(&args.join(" ")),
+                    self.working_dir.display()
+                )
+            })?;
+        let stdout_reader = drain(mut_child.stdout.take());
+        let stderr_reader = drain(mut_child.stderr.take());
+        let started: Instant = Instant::now();
+        let status: ExitStatus = loop {
+            match mut_child.try_wait().context("wait for git")? {
+                Some(finished) => break finished,
+                None if started.elapsed() >= deadline => {
+                    // The readers are left to end on their own: a grandchild (ssh) may still hold the pipes open.
+                    drop(mut_child.kill());
+                    drop(mut_child.wait());
+                    bail!(
+                        "git {}: did not finish within {deadline:?}, killed",
+                        redact_credentials(&args.join(" "))
+                    )
+                }
+                None => std::thread::sleep(DEADLINE_POLL),
+            }
+        };
+        let git_output = GitOutput {
+            exit_ok: status.success(),
+            stdout: String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned(),
+        };
+        journal!(
+            "git {}: exit_ok={} stderr={:?}",
+            redact_credentials(&args.join(" ")),
+            git_output.exit_ok,
+            redact_credentials(git_output.stderr.trim())
+        );
+        Ok(git_output)
     }
 
     /// Like `run`, but a failure is an error naming the command and its stderr, and the result is stdout.
