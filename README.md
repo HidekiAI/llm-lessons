@@ -155,8 +155,8 @@ When `work` shares a repo with `personal` or `shared`, sync notes once per sync 
 
 - **The leak.** One database with a `domain` column keeps every lesson on every machine, so a work lesson (a server name, a customer, a ticket) would sit on your home machine.
 - **The missing file.** Three files fix that: a machine that never has `work.db` cannot expose it. Your home machine holds `personal.db` and `shared.db`; your work machine holds `work.db` and `shared.db`.
-- **The sync.** Each file syncs to its own private repo, or all three share one repo. Work lessons can go to a repo your work account can read, while personal ones never leave your own account (see the first FAQ entry).
-- **The search.** `lessons search --in work,shared` reads only the files you name, so a home search never touches work data.
+- **The sync.** Each file syncs to its own private repo, or all three share one. Keep `work` in a repo of its own: with one shared repo, everyone who can read it can read all three (see [how to share lessons](#how-do-i-share-my-sqlite-db-lessons-so-that-lessons-learned-at-work-can-be-applied-to-home-and-vice-versa)).
+- **The search.** `lessons search --in personal,shared` reads only the files you name. A machine without `work.db` cannot search it at all.
 
 ### Why does git store JSON lines, and never the `.db` itself?
 
