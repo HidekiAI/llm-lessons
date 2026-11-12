@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::files::{read_state, ClonePaths, SyncState};
-use super::git::{identity_agent_of, redact_credentials, ssh_command, GitRunner};
+use super::files::{ClonePaths, SyncState, read_state};
+use super::git::{GitRunner, identity_agent_of, redact_credentials, ssh_command};
 use crate::config::CloneSpec;
 use crate::journal;
 
@@ -432,13 +432,11 @@ mod tests {
     use super::*;
 
     /// The `ssh -v` lines of a key the server never accepted, ending in the host's rejection.
-    const SSH_KEY_OFFERED_NOT_ACCEPTED: &str =
-        "debug1: Offering public key: /k/id_work ED25519 SHA256:abc\n\
+    const SSH_KEY_OFFERED_NOT_ACCEPTED: &str = "debug1: Offering public key: /k/id_work ED25519 SHA256:abc\n\
          debug1: Authentications that can continue: publickey\n\
          git@github.com: Permission denied (publickey).\n\
          fatal: Could not read from remote repository.\n";
-    const SSH_KEY_ACCEPTED_THEN_NO_REPO: &str =
-        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_ACCEPTED_THEN_NO_REPO: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
          ERROR: Repository not found.\n\
          fatal: Could not read from remote repository.\n";
@@ -453,18 +451,15 @@ mod tests {
         "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
 
     /// An offered key and then a connection that dropped is no verdict: the host never said no.
-    const SSH_KEY_OFFERED_THEN_CONNECTION_RESET: &str =
-        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_OFFERED_THEN_CONNECTION_RESET: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          Connection reset by 192.0.2.1 port 22\n\
          fatal: Could not read from remote repository.\n";
-    const SSH_KEY_ACCEPTED_THEN_UNRECOGNISED: &str =
-        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_ACCEPTED_THEN_UNRECOGNISED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
          something no table has ever seen\n";
 
     /// The server took the key and the session then failed for another reason: the key was not the problem.
-    const SSH_KEY_ACCEPTED_THEN_SESSION_FAILED: &str =
-        "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
+    const SSH_KEY_ACCEPTED_THEN_SESSION_FAILED: &str = "debug1: Offering public key: /k/id_other ED25519 SHA256:abc\n\
          debug1: Server accepts key: /k/id_other ED25519 SHA256:abc\n\
          git@github.com: Permission denied (publickey).\n";
 
@@ -686,7 +681,7 @@ mod tests {
     // S5b tests: the pure rows for the four logic functions and the warning reader. The real probes are exercised by
     // hand against every configured host and are not tested here. Tests that count probe calls use a `RefCell`: the
     // probe is a shared `Fn`, so a counter cannot be a plain `let mut`.
-    use crate::sync::files::{write_state, ClonePaths, SyncState};
+    use crate::sync::files::{ClonePaths, SyncState, write_state};
     use std::cell::RefCell;
 
     const GITHUB_HTTPS: &str = "https://github.com/HidekiAI/llm-lessons.git";
@@ -1177,5 +1172,25 @@ mod tests {
             env_value(&command, "GIT_HTTP_LOW_SPEED_TIME"),
             Some(PROBE_TIMEOUT_SECS.to_string().as_str())
         );
+    }
+    #[test]
+    fn a_runner_sets_the_probe_environment_then_removes_what_must_not_be_inherited() {
+        // Set and removed in one command: removal runs after setting, so the variable never reaches git.
+        let command = ProbeCommand {
+            ssh_command: "ssh".to_string(),
+            env: vec![
+                ("LESSONS_KEPT".to_string(), "kept".to_string()),
+                ("LESSONS_DROPPED".to_string(), "dropped".to_string()),
+            ],
+            env_remove: vec!["LESSONS_DROPPED".to_string()],
+            git_args: Vec::new(),
+        };
+        let show_canary: Vec<&str> = vec![
+            "-c",
+            "alias.canary=!echo \"[$LESSONS_KEPT][$LESSONS_DROPPED]\"",
+            "canary",
+        ];
+        let shown: String = runner_for(&command).run_checked(&show_canary).unwrap();
+        assert_eq!(shown.trim(), "[kept][]");
     }
 }
