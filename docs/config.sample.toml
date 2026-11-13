@@ -15,8 +15,9 @@ max_results = 5
 domains = ["work", "shared"]
 max_results = 5
 
-# allowed, but every lessons command then warns (see the README caution), except for a run that syncs `work`: a clone that
-# carries `work` is refused while its remote reads public.
+# Sync: one section per domain this machine should sync, through a git repo. Keep work repos private. A public repo is
+# allowed for `personal` and `shared`, but every lessons command but `init` then warns (see the README caution); a run that
+# syncs `work` is refused while its remote reads public, and a work-only remote must be an ssh remote (`git@host:path`).
 # All three may name the same repo; domains that share a repo must use the same ssh_key on one machine (one clone, one key).
 # ssh_key is a private key file, or a .pub whose private key an agent holds.
 # remote must use the real host (git@github.com:...), not a ~/.ssh/config Host alias: sync runs ssh with -F /dev/null

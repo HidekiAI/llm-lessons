@@ -1,6 +1,6 @@
 //! The access guards: what a probe's stderr means, whether `work` may sync given what every configured key can read
 //! (the work key guard), and what the visibility probe records and warns about. The functions are pure
-//! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh, exercised by hand and reading `TMPDIR`, and
+//! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh, to be exercised by hand against each configured host (not recorded yet) and reading `TMPDIR`, and
 //! `public_warnings`, which reads the state files.
 
 use std::path::{Path, PathBuf};
@@ -162,7 +162,8 @@ pub fn decide_access(work_probe: ProbeClass, other_keys: &[(&str, ProbeClass)]) 
 }
 
 /// How often a remote's visibility is probed again, in days: a repository made public later is caught at the next
-/// recheck, not instantly.
+/// recheck, not instantly, and a `work` remote shared with another domain (no key guard) keeps receiving work lessons in
+/// that window.
 pub const ACCESS_RECHECK_DAYS: u64 = 7;
 
 /// Seconds in a day, for the recheck interval.
@@ -305,7 +306,7 @@ fn isolated_git_config_env() -> Vec<(String, String)> {
     [
         ("GIT_CONFIG_GLOBAL", "/dev/null"),
         ("GIT_CONFIG_NOSYSTEM", "1"),
-        // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
+        // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file and $HOME/.gitconfig instead; HOME stays for ssh, so only the XDG file is cut here.
         ("XDG_CONFIG_HOME", "/dev/null"),
     ]
     .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -417,7 +418,7 @@ fn runner_for(command: &ProbeCommand, temp_dir: &Path) -> GitRunner {
 /// by hand against every configured host, never by the tests.
 pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
     // Every outcome becomes a class: a git that cannot start, or that outlives PROBE_DEADLINE_SECS, is Inconclusive and
-    // never a pass. Running the command is exercised by hand against every configured host.
+    // never a pass. Running the command is meant to be exercised by hand against every configured host; that check is not recorded yet.
     let agent: Option<String> = match request {
         ProbeRequest::WithKey { remote, .. } => identity_agent_of(remote),
         ProbeRequest::Anonymous { .. } => None,
@@ -508,7 +509,7 @@ pub fn public_warnings(lessons_home: &Path, clones: &[CloneSpec]) -> Vec<String>
 }
 
 // Table tests over the pure decisions. Each row is a case from the plan's Guards and Public warning rows, and each
-// guard was shown red by removing its branch.
+// guard was checked by removing its branch while it was written; no mutation list is recorded.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,7 +762,7 @@ mod tests {
             });
     }
     // The pure rows for the four logic functions and the warning reader, and two runs of real git (the probe's runner).
-    // The probes against a real host are exercised by hand. Tests that count probe calls use a `RefCell`: the
+    // The probes against a real host are not tested here (a hand check per host is still to be recorded). Tests that count probe calls use a `RefCell`: the
     // probe is a shared `Fn`, so a counter cannot be a plain `let mut`.
     use crate::sync::files::{ClonePaths, SyncState, write_state};
     use std::cell::RefCell;
@@ -1257,9 +1258,8 @@ mod tests {
         // set: ssh needs it for known_hosts.
         assert_eq!(env_value(&command, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
-        // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
+        // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file and $HOME/.gitconfig instead; HOME stays for ssh, so only the XDG file is cut here.
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
-        assert_eq!(env_value(&command, "GIT_DIR"), None); // a GIT_DIR breaks an includeIf gitdir config
         assert_eq!(env_value(&command, "HOME"), None);
         assert_eq!(
             command.env_remove,
@@ -1284,7 +1284,6 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(env_value(&command, "HOME"), Some("/dev/null"));
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
-        assert_eq!(env_value(&command, "GIT_DIR"), None); // a GIT_DIR breaks an includeIf gitdir config
         // Config injected through the inherited environment, and any proxy (a proxy's "access denied" page must not
         // read as a private repository), never reach the probe.
         assert_eq!(

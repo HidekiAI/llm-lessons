@@ -237,9 +237,9 @@ pub struct SyncState {
     pub last_pull_unix_secs: Option<u64>,
     /// Failed cycles in a row, for the backoff; a successful cycle resets it.
     pub consecutive_failures: u32,
-    /// What the last visibility probe found for the remote: `public` makes every command warn.
+    /// What the last visibility probe found for the remote: `public` makes every command warn, and a run that syncs `work` refuse.
     pub visibility: Visibility,
-    /// When the visibility was last probed conclusively, in seconds since the Unix epoch, for the recheck interval.
+    /// When the visibility was last probed conclusively, in seconds since the Unix epoch, for the recheck interval; none after an inconclusive forced recheck of a public `work` remote.
     pub last_access_check_unix_secs: Option<u64>,
 }
 

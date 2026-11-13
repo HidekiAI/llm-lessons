@@ -192,6 +192,13 @@ fn the_mcp_server_and_sync_keep_the_warning_off_stdout() {
         "sync warns on stderr: {}",
         text_of(&synced.stderr)
     );
+    // Once, after the sync: a warning before it as well would print the line twice.
+    assert_eq!(
+        text_of(&synced.stderr).matches("is PUBLIC").count(),
+        1,
+        "{}",
+        text_of(&synced.stderr)
+    );
 }
 
 #[test]

@@ -1219,6 +1219,39 @@ mod tests {
             "the child did not run the test body"
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_outlives_its_deadline_leaves_no_running_git() {
+        const GONE_WITHIN_MS: u64 = 1_000;
+        const GONE_POLL_MS: u64 = 20;
+        // The alias shell is git's child, so its parent id is git's own: the file holds the process that must be killed.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pid_file: PathBuf = temp_dir.path().join("git.pid");
+        let alias: String = format!(
+            "alias.hang=!echo $PPID > '{}'; sleep {SLOW_SSH_SLEEP_SECS}",
+            pid_file.display()
+        );
+        let result = no_global_config_runner(temp_dir.path(), "ssh").run_with_deadline(
+            &["-c", &alias, "hang"],
+            Duration::from_millis(SHORT_DEADLINE_MS),
+        );
+        assert!(result.is_err(), "the run outlived its deadline");
+        let git_pid: String = fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        let started = Instant::now();
+        let fn_git_is_running = || {
+            Command::new("kill")
+                .args(["-0", &git_pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        while fn_git_is_running() && started.elapsed() < Duration::from_millis(GONE_WITHIN_MS) {
+            std::thread::sleep(Duration::from_millis(GONE_POLL_MS));
+        }
+        assert!(!fn_git_is_running(), "git {git_pid} was left running");
+    }
+
     #[test]
     fn a_descendant_holding_the_pipes_after_git_exits_does_not_hold_the_caller() {
         // git prints and exits at once, but its background `sleep` keeps stdout open for SLOW_SSH_SLEEP_SECS seconds.
