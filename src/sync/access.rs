@@ -255,31 +255,67 @@ fn anonymous_probe_env() -> Vec<(String, String)> {
     // No stored login can make a private repository look public: no askpass, no global, system or XDG git config (an
     // `insteadOf` there could turn this into an authenticated read) and no HOME (a netrc). Git's low-speed limits end a
     // stalled transfer.
-    [
+    let low_speed_limit: String = PROBE_LOW_SPEED_BYTES_PER_SEC.to_string();
+    let low_speed_time: String = PROBE_TIMEOUT_SECS.to_string();
+    let own_env: Vec<(&str, &str)> = vec![
         ("GIT_ASKPASS", ""),
-        ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_CONFIG_NOSYSTEM", "1"),
         // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
         ("XDG_CONFIG_HOME", "/dev/null"),
         ("HOME", "/dev/null"),
-        (
-            "GIT_HTTP_LOW_SPEED_LIMIT",
-            &PROBE_LOW_SPEED_BYTES_PER_SEC.to_string(),
-        ),
-        ("GIT_HTTP_LOW_SPEED_TIME", &PROBE_TIMEOUT_SECS.to_string()),
+        ("GIT_HTTP_LOW_SPEED_LIMIT", &low_speed_limit),
+        ("GIT_HTTP_LOW_SPEED_TIME", &low_speed_time),
+    ];
+    isolated_git_config_env()
+        .into_iter()
+        .chain(
+            own_env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+        .collect()
+}
+
+/// Git must read no global and no system config: an `insteadOf` there could send a probe to another URL, read with other
+/// credentials. Shared by both probes.
+fn isolated_git_config_env() -> Vec<(String, String)> {
+    [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
     ]
-    .iter()
     .map(|(name, value)| (name.to_string(), value.to_string()))
-    .collect()
+    .to_vec()
+}
+
+/// Variables that inject git config (an `insteadOf`, a proxy) from the calling process. Both probes drop them.
+fn injected_config_vars() -> Vec<String> {
+    ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Proxy variables: a proxy's "access denied" page must not read as a private repository, so the anonymous probe drops
+/// them (a host reachable only through a proxy then reads as unknown, the safe direction).
+fn proxy_vars() -> Vec<String> {
+    [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 /// The key probe: `remote` read with `key` alone, through `ssh_probe_command`.
 fn key_probe_command(remote: &str, key: &Path, identity_agent: Option<&str>) -> ProbeCommand {
-    // The key probe keeps the user's environment: only the ssh command isolates it, and nothing is removed.
+    // The key probe must really use the key: git config is isolated and nothing injected through the environment reaches
+    // it. HOME stays (ssh needs it for known_hosts) and so does the agent socket.
     ProbeCommand {
         ssh_command: ssh_probe_command(key, identity_agent),
-        env: Vec::new(),
-        env_remove: Vec::new(),
+        env: isolated_git_config_env(),
+        env_remove: injected_config_vars(),
         git_args: ["ls-remote", "--", remote, "HEAD"]
             .map(String::from)
             .to_vec(),
@@ -295,9 +331,7 @@ fn anonymous_probe_command(url: &str) -> ProbeCommand {
     ProbeCommand {
         ssh_command: "ssh".to_string(), // never run: the URL is https
         env: anonymous_probe_env(),
-        env_remove: ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]
-            .map(String::from)
-            .to_vec(),
+        env_remove: [injected_config_vars(), proxy_vars()].concat(),
         git_args: [
             "-c",
             "credential.helper=",

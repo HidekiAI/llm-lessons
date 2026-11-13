@@ -5,9 +5,10 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::journal;
 
@@ -165,6 +166,9 @@ pub struct GitOutput {
 /// How often `run_with_deadline` looks at the child it waits for.
 const DEADLINE_POLL: Duration = Duration::from_millis(20);
 
+/// The least a pipe reader is waited for after git exited, so output already on its way is not dropped.
+const COLLECT_GRACE: Duration = Duration::from_millis(200);
+
 /// Runs git for one sync clone. Every call has `GIT_TERMINAL_PROMPT=0` and the clone's ssh command, and is journalled;
 /// `extra_env` is for tests, which point git at their own global config.
 #[derive(Debug, Clone)]
@@ -266,24 +270,11 @@ impl GitRunner {
     /// Like `run`, but the git process is killed and the result is an error when it has not finished within `deadline`:
     /// git has no connect timeout of its own, so a black-holed host would otherwise hold the caller for minutes.
     pub fn run_with_deadline(&self, args: &[&str], deadline: Duration) -> Result<GitOutput> {
-        // The deadline is wall-clock: the child is polled, killed when it is over, and the caller gets an error naming the
-        // command. Both pipes are drained on their own threads, or a chatty git would block on a full pipe while this waits.
-        // After a kill the readers are left to end by themselves: a grandchild (ssh) may still hold the pipes open.
         journal!(
             "git {} (in {}, deadline {deadline:?})",
             redact_credentials(&args.join(" ")),
             self.working_dir.display()
         );
-        // A generic helper: a closure cannot take `impl Read`. The reader threads end by themselves when the pipe closes.
-        fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-            std::thread::spawn(move || {
-                let mut mut_text: Vec<u8> = Vec::new();
-                if let Some(mut mut_pipe) = pipe {
-                    drop(mut_pipe.read_to_end(&mut mut_text));
-                }
-                mut_text
-            })
-        }
         let mut mut_child: Child = self
             .command_for(args)
             .stdin(Stdio::null())
@@ -300,25 +291,13 @@ impl GitRunner {
         let stdout_reader = drain(mut_child.stdout.take());
         let stderr_reader = drain(mut_child.stderr.take());
         let started: Instant = Instant::now();
-        let status: ExitStatus = loop {
-            match mut_child.try_wait().context("wait for git")? {
-                Some(finished) => break finished,
-                None if started.elapsed() >= deadline => {
-                    // The readers are left to end on their own: a grandchild (ssh) may still hold the pipes open.
-                    drop(mut_child.kill());
-                    drop(mut_child.wait());
-                    bail!(
-                        "git {}: did not finish within {deadline:?}, killed",
-                        redact_credentials(&args.join(" "))
-                    )
-                }
-                None => std::thread::sleep(DEADLINE_POLL),
-            }
-        };
+        let status: ExitStatus = wait_for_exit(&mut mut_child, deadline)
+            .with_context(|| format!("git {}", redact_credentials(&args.join(" "))))?;
+        let remaining: Duration = deadline.saturating_sub(started.elapsed());
         let git_output = GitOutput {
             exit_ok: status.success(),
-            stdout: String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned(),
+            stdout: collect(&stdout_reader, remaining),
+            stderr: collect(&stderr_reader, remaining),
         };
         journal!(
             "git {}: exit_ok={} stderr={:?}",
@@ -342,6 +321,55 @@ impl GitRunner {
             )
         }
     }
+}
+
+/// Reads `pipe` to its end on its own thread and sends what it read when it ends. The receiver is the only handle: a
+/// reader whose pipe a descendant keeps open ends by itself when that descendant does. Generic because a closure
+/// cannot take `impl Read`.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut mut_text: Vec<u8> = Vec::new();
+        if let Some(mut mut_pipe) = pipe {
+            drop(mut_pipe.read_to_end(&mut mut_text));
+        }
+        drop(sender.send(mut_text)); // the receiver may have given up already
+    });
+    receiver
+}
+
+/// Kills `child` and reaps it, so no zombie is left. Returns the exit status when the child had in fact already ended on
+/// its own (a git that finished at the very deadline is not thrown away), and none when the kill is what ended it.
+fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
+    drop(child.kill());
+    child.wait().ok().filter(|status| status.code().is_some())
+}
+
+/// Waits for `child` to exit, polling, for at most `deadline`. On the deadline or on a failed wait the child is killed and
+/// reaped, so every path leaves neither a running process nor a zombie.
+fn wait_for_exit(child: &mut Child, deadline: Duration) -> Result<ExitStatus> {
+    let started: Instant = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() < deadline => std::thread::sleep(DEADLINE_POLL),
+            Ok(None) => {
+                return kill_and_reap(child)
+                    .ok_or_else(|| anyhow!("did not finish within {deadline:?}, killed"));
+            }
+            Err(wait_error) => {
+                let _status_of_a_failed_wait: Option<ExitStatus> = kill_and_reap(child); // nothing to report: the wait itself failed
+                return Err(wait_error).context("wait for git");
+            }
+        }
+    }
+}
+
+/// What a pipe reader sent, waiting at most `remaining` (and never less than `COLLECT_GRACE`, for output that is already
+/// on its way): a descendant that keeps the pipe open after git exited gives an empty text, not a hang.
+fn collect(reader: &Receiver<Vec<u8>>, remaining: Duration) -> String {
+    let patience: Duration = remaining.max(COLLECT_GRACE);
+    String::from_utf8_lossy(&reader.recv_timeout(patience).unwrap_or_default()).into_owned()
 }
 
 /// The remote's default branch, or `SYNC_FALLBACK_BRANCH` when the remote is empty. Run from any directory: it asks
@@ -1138,5 +1166,21 @@ mod tests {
         let status = child.wait().unwrap();
         drop(held_open);
         assert!(status.success(), "git read the caller's stdin and blocked");
+    }
+    #[test]
+    fn a_descendant_holding_the_pipes_after_git_exits_does_not_hold_the_caller() {
+        // git prints and exits at once, but its background `sleep` keeps stdout open for SLOW_SSH_SLEEP_SECS seconds.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let alias: String = format!("alias.lingering=!sleep {SLOW_SSH_SLEEP_SECS} & echo done");
+        let started = Instant::now();
+        drop(runner.run_with_deadline(
+            &["-c", &alias, "lingering"],
+            Duration::from_millis(SHORT_DEADLINE_MS),
+        )); // with what it had or with an error: either way it must not hang
+        assert!(
+            started.elapsed() < Duration::from_secs(SLOW_SSH_SLEEP_SECS - 1),
+            "the caller got control back at the deadline, not when the lingering process ended"
+        );
     }
 }
