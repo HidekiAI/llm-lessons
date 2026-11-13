@@ -171,7 +171,7 @@ const SECS_PER_DAY: u64 = 86_400;
 /// One probe to run: a `git ls-remote` that answers with a `ProbeClass`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeRequest {
-    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the work key probes.
+    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the key probes of the work key guard, one per configured key.
     WithKey { remote: String, key: PathBuf },
     /// The anonymous HTTPS `url` read with no identity and no prompt: the public-visibility probe.
     Anonymous { url: String },
@@ -243,8 +243,8 @@ pub fn access_check_due(last_check_unix_secs: Option<u64>, now_secs: u64) -> boo
     })
 }
 
-/// Seconds a probe may take to connect (ssh `ConnectTimeout`) or to move any data (git's low-speed time): a black-holed
-/// host must fail the probe, not hold the clone lock.
+/// Seconds a probe may take to connect (ssh `ConnectTimeout` on a key probe) or, on the anonymous probe only, to move any
+/// data (git's low-speed time): a black-holed host must fail the probe, not hold the clone lock.
 pub const PROBE_TIMEOUT_SECS: u64 = 10;
 
 /// The wall-clock limit of one probe, in seconds: git has no connect timeout of its own, so a black-holed host would hold

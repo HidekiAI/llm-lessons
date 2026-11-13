@@ -154,8 +154,9 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
     let probed_state: SyncState =
         visibility_after_probe(state_to_probe, job.remote, job.probe, now_secs);
     // A host that serves a public repository only to registered users rejects every other key, so the key guard alone
-    // would allow a public work remote. Any clone that carries `work`, alone or shared with another domain, is refused
-    // once the visibility probe reads its remote as public; a clone without `work` keeps the warning.
+    // would allow a public work remote. A run that syncs `work` (the clone carries it, alone or shared with another
+    // domain, and the run is not limited to another `--domain`) is refused once the visibility probe reads its remote
+    // as public; a run without `work` pushes no work lessons and keeps the warning.
     let guard_result: Result<()> =
         guard_result.and_then(|()| match (carries_work, probed_state.visibility) {
             (true, Visibility::Public) => {
@@ -2055,6 +2056,41 @@ mod tests {
         );
         let state = read_state(&machine.paths(WORK_SSH_REMOTE).state_file());
         assert_eq!(state.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn access_a_work_clone_recorded_private_still_runs_the_key_guard() {
+        // A remote recorded private says nothing about another key that can read it: the key guard must still run.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let state_path: PathBuf = machine.paths(WORK_SSH_REMOTE).state_file();
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let recent_private = SyncState {
+            visibility: Visibility::Private,
+            last_access_check_unix_secs: Some(SOME_NOW),
+            ..SyncState::default()
+        };
+        write_state(&state_path, &recent_private).unwrap();
+        let alias_env = alias_env_for(&machine, &remote);
+        let key_calls = Cell::new(0);
+        let fn_probe = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &key_calls);
+        let job = CloneJob {
+            probe: &fn_probe,
+            work_guard: Some(work_guard_for_tests()),
+            domains: WORK_ONLY,
+            ..work_job(&machine, &alias_env)
+        };
+        let message = format!(
+            "{:#}",
+            sync_clone(&job, &|_| Ok(()), SOME_NOW + 1).unwrap_err()
+        );
+        assert!(
+            message.contains("personal"),
+            "the key guard refused: {message}"
+        );
+        assert_eq!(key_calls.get(), KEYS_PROBED, "both keys were probed");
     }
 
     #[test]

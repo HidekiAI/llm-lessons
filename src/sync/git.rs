@@ -1174,6 +1174,8 @@ mod tests {
     /// Marks the child process of the stdin test below.
     const STDIN_CHILD_ENV: &str = "LESSONS_TEST_STDIN_CHILD";
     const STDIN_CHILD_MARKER: &str = "stdin-child-ran-the-test-body";
+    /// How long the stdin test lets `cat` run: it ends at once when its stdin is closed, so this only bounds a failure.
+    const STDIN_TEST_DEADLINE_SECS: u64 = 5;
 
     #[test]
     fn a_run_with_a_deadline_never_hands_git_the_callers_stdin() {
@@ -1185,7 +1187,7 @@ mod tests {
             let output = no_global_config_runner(temp_dir.path(), "ssh")
                 .run_with_deadline(
                     &["-c", "alias.slurp=!cat", "slurp"],
-                    Duration::from_secs(SLOW_SSH_SLEEP_SECS),
+                    Duration::from_secs(STDIN_TEST_DEADLINE_SECS),
                 )
                 .unwrap();
             assert!(output.exit_ok);
@@ -1236,7 +1238,7 @@ mod tests {
     #[test]
     fn a_descendant_holding_both_pipes_costs_one_deadline_not_two() {
         // Both pipes stay open after git exits, and the two collects share what is left of one deadline.
-        const LINGERING_DEADLINE_MS: u64 = 1_000;
+        const LINGERING_DEADLINE_MS: u64 = 2_000; // a margin over a loaded machine: one deadline passes, two would not
         const DEADLINE_SHARE_LIMIT: f64 = 1.5; // one deadline plus slack, well short of two
         let temp_dir = tempfile::tempdir().unwrap();
         let runner = no_global_config_runner(temp_dir.path(), "ssh");
@@ -1266,15 +1268,15 @@ mod tests {
 
     #[test]
     fn a_run_with_a_deadline_waits_for_late_output_while_time_is_left() {
-        // git exits at once; a background shell keeps the pipe and writes one second later, well inside the deadline.
+        // git exits at once; a background shell keeps the pipe and writes LATE_OUTPUT_DELAY_SECS later, well inside the
+        // deadline.
+        const LATE_OUTPUT_DELAY_SECS: u64 = 1;
+        let later_alias: String =
+            format!("alias.later=!(sleep {LATE_OUTPUT_DELAY_SECS}; echo late) & echo now");
         let temp_dir = tempfile::tempdir().unwrap();
         let output = no_global_config_runner(temp_dir.path(), "ssh")
             .run_with_deadline(
-                &[
-                    "-c",
-                    "alias.later=!(sleep 1; echo late) & echo now",
-                    "later",
-                ],
+                &["-c", &later_alias, "later"],
                 Duration::from_secs(GENEROUS_DEADLINE_SECS),
             )
             .unwrap();

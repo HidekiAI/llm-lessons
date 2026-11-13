@@ -334,8 +334,9 @@ fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
             drop(writeln!(std::io::stderr(), "{warning_line}"));
         }),
         // Without a readable config no remote is known, so no warning can be given; saying so on stderr keeps the
-        // silence from reading as "nothing is public". The config error already redacts the remote it quotes; redacting
-        // here again is defence in depth, so keep it. A closed stderr must not turn this caution into a panic.
+        // silence from reading as "nothing is public". A TOML parse error quotes the raw config line, token included, so
+        // this redaction is the only thing keeping a token out of the line: do not remove it. A closed stderr must not
+        // turn this caution into a panic (the journal line is the exception: it prints only with LESSONS_LOG=1).
         Err(skipped) => {
             let reason: String = sync::redact_credentials(&format!("{skipped:#}"));
             journal!("public warning skipped: {reason}");
