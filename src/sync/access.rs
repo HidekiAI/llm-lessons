@@ -252,7 +252,7 @@ fn ssh_probe_command(key: &Path, identity_agent: Option<&str>) -> String {
 /// The environment of an anonymous probe: no askpass, no global, system or XDG git config, no home directory (so no
 /// netrc), and git's low-speed limits so a stalled transfer ends.
 fn anonymous_probe_env() -> Vec<(String, String)> {
-    // TODO(human): begin block 7/8
+    // TODO(human): begin block 8/9
     // No stored login can make a private repository look public: the shared git-config isolation first, then no askpass, no
     // XDG config and no HOME (a netrc). Git's low-speed limits end a stalled transfer.
     // was: [
@@ -289,7 +289,7 @@ fn anonymous_probe_env() -> Vec<(String, String)> {
     //             .map(|(name, value)| (name.to_string(), value.to_string())),
     //     )
     //     .collect()
-    // TODO(human): end block 7/8
+    // TODO(human): end block 8/9
 }
 
 /// Git must read no global and no system config: an `insteadOf` there could send a probe to another URL, read with other
@@ -327,7 +327,7 @@ fn proxy_vars() -> Vec<String> {
 
 /// The key probe: `remote` read with `key` alone, through `ssh_probe_command`.
 fn key_probe_command(remote: &str, key: &Path, identity_agent: Option<&str>) -> ProbeCommand {
-    // TODO(human): begin block 6/8
+    // TODO(human): begin block 7/9
     // The key probe must really use the key: git config is isolated and nothing injected through the environment reaches it.
     // HOME stays (ssh needs it for known_hosts) and so does the agent socket.
     // was: ProbeCommand {
@@ -346,13 +346,13 @@ fn key_probe_command(remote: &str, key: &Path, identity_agent: Option<&str>) -> 
     //         .map(String::from)
     //         .to_vec(),
     // }
-    // TODO(human): end block 6/8
+    // TODO(human): end block 7/9
 }
 
 /// The anonymous probe: `url` read with no identity, no credential helper, no redirect and no config injected through
 /// the environment (an `insteadOf` or a proxy there must not reach it).
 fn anonymous_probe_command(url: &str) -> ProbeCommand {
-    // TODO(human): begin block 8/8
+    // TODO(human): begin block 9/9
     // The anonymous probe is isolated three ways: its environment (anonymous_probe_env), the variables it must not inherit
     // (injected git config and every proxy: a proxy's access-denied page must not read as a private repository) and git's own
     // switches (no credential helper, no redirect: a renamed repository stays unknown, the safe direction).
@@ -392,7 +392,7 @@ fn anonymous_probe_command(url: &str) -> ProbeCommand {
     //     .map(String::from)
     //     .to_vec(),
     // }
-    // TODO(human): end block 8/8
+    // TODO(human): end block 9/9
 }
 
 /// The command of one probe, built without running anything so its isolation and its timeouts can be tested.
