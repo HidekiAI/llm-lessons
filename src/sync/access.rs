@@ -252,44 +252,26 @@ fn ssh_probe_command(key: &Path, identity_agent: Option<&str>) -> String {
 /// The environment of an anonymous probe: no askpass, no global, system or XDG git config, no home directory (so no
 /// netrc), and git's low-speed limits so a stalled transfer ends.
 fn anonymous_probe_env() -> Vec<(String, String)> {
-    // TODO(human): begin block 8/9
     // No stored login can make a private repository look public: the shared git-config isolation first, then no askpass, no
     // XDG config and no HOME (a netrc). Git's low-speed limits end a stalled transfer.
-    // was: [
-    // was:     ("GIT_ASKPASS", ""),
-    // was:     ("GIT_CONFIG_GLOBAL", "/dev/null"),
-    // was:     ("GIT_CONFIG_NOSYSTEM", "1"),
-    // was:     // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
-    // was:     ("XDG_CONFIG_HOME", "/dev/null"),
-    // was:     ("HOME", "/dev/null"),
-    // was:     (
-    // was:         "GIT_HTTP_LOW_SPEED_LIMIT",
-    // was:         &PROBE_LOW_SPEED_BYTES_PER_SEC.to_string(),
-    // was:     ),
-    // was:     ("GIT_HTTP_LOW_SPEED_TIME", &PROBE_TIMEOUT_SECS.to_string()),
-    // was: ]
-    // was: .iter()
-    // was: .map(|(name, value)| (name.to_string(), value.to_string()))
-    // was: .collect()
-    // let low_speed_limit: String = PROBE_LOW_SPEED_BYTES_PER_SEC.to_string();
-    // let low_speed_time: String = PROBE_TIMEOUT_SECS.to_string();
-    // let own_env: Vec<(&str, &str)> = vec![
-    //     ("GIT_ASKPASS", ""),
-    //     // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
-    //     ("XDG_CONFIG_HOME", "/dev/null"),
-    //     ("HOME", "/dev/null"),
-    //     ("GIT_HTTP_LOW_SPEED_LIMIT", &low_speed_limit),
-    //     ("GIT_HTTP_LOW_SPEED_TIME", &low_speed_time),
-    // ];
-    // isolated_git_config_env()
-    //     .into_iter()
-    //     .chain(
-    //         own_env
-    //             .iter()
-    //             .map(|(name, value)| (name.to_string(), value.to_string())),
-    //     )
-    //     .collect()
-    // TODO(human): end block 8/9
+    let low_speed_limit: String = PROBE_LOW_SPEED_BYTES_PER_SEC.to_string();
+    let low_speed_time: String = PROBE_TIMEOUT_SECS.to_string();
+    let own_env: Vec<(&str, &str)> = vec![
+        ("GIT_ASKPASS", ""),
+        // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
+        ("XDG_CONFIG_HOME", "/dev/null"),
+        ("HOME", "/dev/null"),
+        ("GIT_HTTP_LOW_SPEED_LIMIT", &low_speed_limit),
+        ("GIT_HTTP_LOW_SPEED_TIME", &low_speed_time),
+    ];
+    isolated_git_config_env()
+        .into_iter()
+        .chain(
+            own_env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+        .collect()
 }
 
 /// Git must read no global and no system config: an `insteadOf` there could send a probe to another URL, read with other
@@ -327,72 +309,41 @@ fn proxy_vars() -> Vec<String> {
 
 /// The key probe: `remote` read with `key` alone, through `ssh_probe_command`.
 fn key_probe_command(remote: &str, key: &Path, identity_agent: Option<&str>) -> ProbeCommand {
-    // TODO(human): begin block 7/9
     // The key probe must really use the key: git config is isolated and nothing injected through the environment reaches it.
     // HOME stays (ssh needs it for known_hosts) and so does the agent socket.
-    // was: ProbeCommand {
-    // was:     ssh_command: ssh_probe_command(key, identity_agent),
-    // was:     env: Vec::new(),
-    // was:     env_remove: Vec::new(),
-    // was:     git_args: ["ls-remote", "--", remote, "HEAD"]
-    // was:         .map(String::from)
-    // was:         .to_vec(),
-    // was: }
-    // ProbeCommand {
-    //     ssh_command: ssh_probe_command(key, identity_agent),
-    //     env: isolated_git_config_env(),
-    //     env_remove: injected_config_vars(),
-    //     git_args: ["ls-remote", "--", remote, "HEAD"]
-    //         .map(String::from)
-    //         .to_vec(),
-    // }
-    // TODO(human): end block 7/9
+    ProbeCommand {
+        ssh_command: ssh_probe_command(key, identity_agent),
+        env: isolated_git_config_env(),
+        env_remove: injected_config_vars(),
+        git_args: ["ls-remote", "--", remote, "HEAD"]
+            .map(String::from)
+            .to_vec(),
+    }
 }
 
 /// The anonymous probe: `url` read with no identity, no credential helper, no redirect and no config injected through
 /// the environment (an `insteadOf` or a proxy there must not reach it).
 fn anonymous_probe_command(url: &str) -> ProbeCommand {
-    // TODO(human): begin block 9/9
     // The anonymous probe is isolated three ways: its environment (anonymous_probe_env), the variables it must not inherit
     // (injected git config and every proxy: a proxy's access-denied page must not read as a private repository) and git's own
     // switches (no credential helper, no redirect: a renamed repository stays unknown, the safe direction).
-    // was: ProbeCommand {
-    // was:     ssh_command: "ssh".to_string(), // never run: the URL is https
-    // was:     env: anonymous_probe_env(),
-    // was:     env_remove: ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"]
-    // was:         .map(String::from)
-    // was:         .to_vec(),
-    // was:     git_args: [
-    // was:         "-c",
-    // was:         "credential.helper=",
-    // was:         "-c",
-    // was:         "http.followRedirects=false",
-    // was:         "ls-remote",
-    // was:         "--",
-    // was:         url,
-    // was:         "HEAD",
-    // was:     ]
-    // was:     .map(String::from)
-    // was:     .to_vec(),
-    // was: }
-    // ProbeCommand {
-    //     ssh_command: "ssh".to_string(), // never run: the URL is https
-    //     env: anonymous_probe_env(),
-    //     env_remove: [injected_config_vars(), proxy_vars()].concat(),
-    //     git_args: [
-    //         "-c",
-    //         "credential.helper=",
-    //         "-c",
-    //         "http.followRedirects=false",
-    //         "ls-remote",
-    //         "--",
-    //         url,
-    //         "HEAD",
-    //     ]
-    //     .map(String::from)
-    //     .to_vec(),
-    // }
-    // TODO(human): end block 9/9
+    ProbeCommand {
+        ssh_command: "ssh".to_string(), // never run: the URL is https
+        env: anonymous_probe_env(),
+        env_remove: [injected_config_vars(), proxy_vars()].concat(),
+        git_args: [
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.followRedirects=false",
+            "ls-remote",
+            "--",
+            url,
+            "HEAD",
+        ]
+        .map(String::from)
+        .to_vec(),
+    }
 }
 
 /// The command of one probe, built without running anything so its isolation and its timeouts can be tested.
