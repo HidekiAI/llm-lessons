@@ -188,6 +188,9 @@ pub struct WorkGuard {
     pub other_keys: Vec<(String, PathBuf)>,
 }
 
+/// The default ssh port written after a host (`ssh://host:22/path`): it names the same host as no port.
+const DEFAULT_SSH_PORT_SUFFIX: &str = ":22";
+
 /// The anonymous `https://<host>/<path>` of a remote, or none when it cannot be derived (an ssh alias, a custom port).
 pub fn https_url_of_remote(remote: &str) -> Option<String> {
     // Credentials are stripped, and a custom port or a host with no dot is refused: the anonymous probe must not carry a
@@ -202,17 +205,36 @@ pub fn https_url_of_remote(remote: &str) -> Option<String> {
             .then(|| format!("https://{host}/{}", path.trim_start_matches('/')))
     };
     match remote.split_once("://") {
-        Some(("https" | "ssh", rest)) => rest
+        // https://host/path: already the anonymous form. A port stays in the authority and is refused, because a custom
+        // port names a private server, not a public host.
+        Some(("https", rest)) => rest
             .split_once('/')
             .and_then(|(authority, path)| fn_host_and_path(authority, path)),
+        // ssh://host/path in any of the three spellings git accepts (the ones `ssh_host_of` also reads): the same host
+        // and path serve https. The default port `:22` is dropped first, since it names the same host as no port; any
+        // other port still reaches `fn_host_and_path` and is refused there.
+        Some(("ssh" | "git+ssh" | "ssh+git", rest)) => {
+            rest.split_once('/').and_then(|(authority, path)| {
+                fn_host_and_path(
+                    authority
+                        .strip_suffix(DEFAULT_SSH_PORT_SUFFIX)
+                        .unwrap_or(authority),
+                    path,
+                )
+            })
+        }
+        // Any other scheme (file://, git://, ftp://) has no https form to derive.
         Some(_) => None,
+        // No scheme: scp-like `user@host:path`. A local path with a colon in it reaches `fn_host_and_path` too, and is
+        // refused there because its "host" holds a '/'.
         None => remote
             .split_once(':')
             .and_then(|(authority, path)| fn_host_and_path(authority, path)),
     }
 }
 
-/// Whether the visibility is due for a probe: never checked, or the last check is `ACCESS_RECHECK_DAYS` old or more.
+/// Whether the visibility is due for a probe: never checked, a check time in the future (a clock that ran ahead), or the
+/// last check is `ACCESS_RECHECK_DAYS` old or more.
 pub fn access_check_due(last_check_unix_secs: Option<u64>, now_secs: u64) -> bool {
     // An interval old or older is due, and so is a check time in the future (a stamp written while the clock ran ahead):
     // it must not hide the check until the real clock catches up, and the probe that follows re-stamps the time.
@@ -364,10 +386,13 @@ pub fn probe_command_of(request: &ProbeRequest, identity_agent: Option<&str>) ->
 fn probe_working_dir_of(temp_dir: &Path) -> PathBuf {
     // Git reads the config of a repository it finds from the working directory upward, so a temp directory inside a
     // repository would lend that repository's config to the probe; the root of the temp directory has no repository.
-    temp_dir
-        .ancestors()
-        .last()
-        .map_or_else(|| temp_dir.to_path_buf(), Path::to_path_buf)
+    // A relative temp directory (`TMPDIR=tmp`) has no root of its own until it is made absolute; without that its last
+    // ancestor is an empty path and every probe fails to start.
+    // The root is found by path, not by following symlinks: a `/tmp` that is a link still gives `/`.
+    std::path::absolute(temp_dir)
+        .ok()
+        .and_then(|absolute_dir| absolute_dir.ancestors().last().map(Path::to_path_buf))
+        .unwrap_or_else(|| temp_dir.to_path_buf())
 }
 
 /// A git runner for `command`, started from the root of `temp_dir`: its ssh command and environment set, the variables it
@@ -771,6 +796,11 @@ mod tests {
             ),
             (
                 "ssh://git@github.com:22/HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            // Credentials that hold a colon do not hide the default port from the strip.
+            (
+                "ssh://git:token@github.com:22/HidekiAI/llm-lessons.git",
                 Some(GITHUB_HTTPS),
             ),
             // A custom port, an ssh alias (a host with no dot) and a local path have no https form.

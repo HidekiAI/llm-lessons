@@ -141,24 +141,35 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
     // public, so it is still warned about. The refusal reason and a change of visibility reach the journal, so a refused
     // cycle or a new PUBLIC warning can be traced from the journal alone. The remote is redacted: it may carry a token.
     let visibility_before: Visibility = state.visibility;
-    let probed_state: SyncState = visibility_after_probe(state, job.remote, job.probe, now_secs);
+    let carries_work: bool = job.domains.contains(&Domain::Work);
+    // A work clone recorded public is probed again on every cycle, so a refusal clears as soon as the owner makes the
+    // repository private instead of waiting out the recheck interval. The other domains keep the interval.
+    let state_to_probe: SyncState = match (carries_work, state.visibility) {
+        (true, Visibility::Public) => SyncState {
+            last_access_check_unix_secs: None,
+            ..state
+        },
+        (true, Visibility::Private | Visibility::Unknown) | (false, _) => state,
+    };
+    let probed_state: SyncState =
+        visibility_after_probe(state_to_probe, job.remote, job.probe, now_secs);
     // A host that serves a public repository only to registered users rejects every other key, so the key guard alone
-    // would allow a public work remote; a work clone is refused once the visibility probe reads its remote as public.
-    // The other domains keep the warning.
+    // would allow a public work remote. Any clone that carries `work`, alone or shared with another domain, is refused
+    // once the visibility probe reads its remote as public; a clone without `work` keeps the warning.
     let guard_result: Result<()> =
-        guard_result.and_then(|()| match (&job.work_guard, probed_state.visibility) {
-            (Some(_), Visibility::Public) => {
+        guard_result.and_then(|()| match (carries_work, probed_state.visibility) {
+            (true, Visibility::Public) => {
                 bail!("work is refused: the remote is public, so anyone can read it")
             }
-            (Some(_), Visibility::Private | Visibility::Unknown) | (None, _) => Ok(()),
+            (true, Visibility::Private | Visibility::Unknown) | (false, _) => Ok(()),
         });
     journal!(
-        "access {}: work key guard {}, visibility {visibility_before:?} -> {:?}",
+        "access {}: work {}, visibility {visibility_before:?} -> {:?}",
         redact_credentials(job.remote),
         match (&job.work_guard, &guard_result) {
-            (None, _) => "not applicable".to_string(),
+            (None, Ok(())) => "not applicable".to_string(),
             (Some(_), Ok(())) => "allowed".to_string(),
-            (Some(_), Err(refusal)) => format!("refused ({refusal:#})"),
+            (_, Err(refusal)) => format!("refused ({refusal:#})"),
         },
         probed_state.visibility
     );
@@ -1883,6 +1894,7 @@ mod tests {
         let job = CloneJob {
             probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
+            domains: WORK_ONLY,
             ..work_job(&machine, &alias_env)
         };
         let fetched = Cell::new(false);
@@ -1912,6 +1924,8 @@ mod tests {
 
     /// A clone that carries `work` with another domain: it has no work key guard (its remote is shared), but its data is work data too.
     const WORK_AND_SHARED: &[Domain] = &[Domain::Work, Domain::Shared];
+    /// A clone that carries `work` alone: the one that also has the work key guard.
+    const WORK_ONLY: &[Domain] = &[Domain::Work];
 
     #[test]
     fn access_a_public_remote_shared_by_work_and_another_domain_is_refused() {
@@ -1965,6 +1979,7 @@ mod tests {
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
         machine.add("first");
+        drop(open(&Domain::Work.file_path(&machine.home), OpenMode::Create).unwrap()); // the cycle syncs work, so its database exists
         write_recent_public_state(&machine);
         let alias_env = alias_env_for(&machine, &remote);
         let anonymous_calls = Cell::new(0);
@@ -1981,6 +1996,7 @@ mod tests {
         let job = CloneJob {
             probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
+            domains: WORK_ONLY,
             ..work_job(&machine, &alias_env)
         };
         assert_eq!(

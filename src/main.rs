@@ -321,7 +321,7 @@ fn main() -> Result<ExitCode> {
 }
 
 /// Prints the PUBLIC warning of every configured clone whose recorded visibility is public. A config that cannot be read
-/// only goes to the journal: this must never make a command fail.
+/// is said on stderr and in the journal: this must never make a command fail.
 fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
     let warnings: Result<Vec<String>> = fn_lessons_home().and_then(|lessons_home| {
         let config: config::Config = config::load(&lessons_home)?;
@@ -333,10 +333,17 @@ fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
             // A closed stderr (a hook whose reader went away) must not turn a caution into a panic.
             drop(writeln!(std::io::stderr(), "{warning_line}"));
         }),
-        Err(skipped) => journal!(
-            "public warning skipped: {}",
-            sync::redact_credentials(&format!("{skipped:#}")) // a config parse error may quote a remote with a token
-        ),
+        // Without a readable config no remote is known, so no warning can be given; saying so on stderr keeps the
+        // silence from reading as "nothing is public". The config error already redacts the remote it quotes; redacting
+        // here again is defence in depth, so keep it. A closed stderr must not turn this caution into a panic.
+        Err(skipped) => {
+            let reason: String = sync::redact_credentials(&format!("{skipped:#}"));
+            journal!("public warning skipped: {reason}");
+            drop(writeln!(
+                std::io::stderr(),
+                "WARNING: public-remote check skipped: {reason}"
+            ));
+        }
     }
 }
 
