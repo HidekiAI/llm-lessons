@@ -1173,6 +1173,7 @@ mod tests {
 
     /// Marks the child process of the stdin test below.
     const STDIN_CHILD_ENV: &str = "LESSONS_TEST_STDIN_CHILD";
+    const STDIN_CHILD_MARKER: &str = "stdin-child-ran-the-test-body";
 
     #[test]
     fn a_run_with_a_deadline_never_hands_git_the_callers_stdin() {
@@ -1188,23 +1189,33 @@ mod tests {
                 )
                 .unwrap();
             assert!(output.exit_ok);
+            println!("{STDIN_CHILD_MARKER}");
             return;
         }
         let mut mut_child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
+                "--nocapture",
                 "sync::git::tests::a_run_with_a_deadline_never_hands_git_the_callers_stdin",
             ])
             .env(STDIN_CHILD_ENV, "1")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let held_open = mut_child.stdin.take(); // `wait` would close it; keep the pipe open until the child is done
-        let status = mut_child.wait().unwrap();
+        let child_output = mut_child.wait_with_output().unwrap();
         drop(held_open);
-        assert!(status.success(), "git read the caller's stdin and blocked");
+        assert!(
+            child_output.status.success(),
+            "git read the caller's stdin and blocked"
+        );
+        // A renamed test would make the child run no test and exit 0: only the marker proves the body ran.
+        assert!(
+            String::from_utf8_lossy(&child_output.stdout).contains(STDIN_CHILD_MARKER),
+            "the child did not run the test body"
+        );
     }
     #[test]
     fn a_descendant_holding_the_pipes_after_git_exits_does_not_hold_the_caller() {

@@ -1805,18 +1805,19 @@ mod tests {
         let alias_env = alias_env_for(&machine, &remote);
         machine.add("first");
         let refused_calls = Cell::new(0);
-        let refusing = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &refused_calls);
+        let fn_refusing =
+            probe_answering(ProbeClass::Readable, ProbeClass::Readable, &refused_calls);
         let refused_job = CloneJob {
-            probe: &refusing,
+            probe: &fn_refusing,
             work_guard: Some(work_guard_for_tests()),
             ..work_job(&machine, &alias_env)
         };
         assert!(sync_clone(&refused_job, &|_| Ok(()), SOME_NOW).is_err());
         let allowed_calls = Cell::new(0);
-        let allowing =
+        let fn_allowing =
             probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &allowed_calls);
         let allowed_job = CloneJob {
-            probe: &allowing,
+            probe: &fn_allowing,
             work_guard: Some(work_guard_for_tests()),
             ..work_job(&machine, &alias_env)
         };
@@ -1907,6 +1908,113 @@ mod tests {
         );
         let state = read_state(&machine.paths(WORK_SSH_REMOTE).state_file());
         assert_eq!(state.visibility, Visibility::Public, "and it is recorded");
+    }
+
+    /// A clone that carries `work` with another domain: it has no work key guard (its remote is shared), but its data is work data too.
+    const WORK_AND_SHARED: &[Domain] = &[Domain::Work, Domain::Shared];
+
+    #[test]
+    fn access_a_public_remote_shared_by_work_and_another_domain_is_refused() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let alias_env = alias_env_for(&machine, &remote);
+        let fn_probe = |request: &ProbeRequest| match request {
+            ProbeRequest::Anonymous { .. } => ProbeClass::Readable,
+            ProbeRequest::WithKey { .. } => ProbeClass::Inconclusive,
+        };
+        let job = CloneJob {
+            probe: &fn_probe,
+            work_guard: None,
+            domains: WORK_AND_SHARED,
+            ..work_job(&machine, &alias_env)
+        };
+        let fetched = Cell::new(false);
+        let outcome = sync_clone(
+            &job,
+            &|_| {
+                fetched.set(true);
+                Ok(())
+            },
+            SOME_NOW,
+        );
+        let message = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            message.contains("public"),
+            "the refusal says why: {message}"
+        );
+        assert!(!fetched.get(), "no cycle step ran");
+    }
+
+    /// The state of a clone recorded `public` and checked a moment ago, so a recheck is not due for days.
+    fn write_recent_public_state(machine: &Machine) {
+        let state_path: PathBuf = machine.paths(WORK_SSH_REMOTE).state_file();
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let recent_public = SyncState {
+            visibility: Visibility::Public,
+            last_access_check_unix_secs: Some(SOME_NOW),
+            ..SyncState::default()
+        };
+        write_state(&state_path, &recent_public).unwrap();
+    }
+
+    #[test]
+    fn access_a_work_remote_recorded_public_is_probed_again_every_cycle_so_a_refusal_can_clear() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        write_recent_public_state(&machine);
+        let alias_env = alias_env_for(&machine, &remote);
+        let anonymous_calls = Cell::new(0);
+        let fn_probe = |request: &ProbeRequest| match request {
+            ProbeRequest::Anonymous { .. } => {
+                anonymous_calls.set(anonymous_calls.get() + 1);
+                ProbeClass::AuthDenied // the owner made the repository private
+            }
+            ProbeRequest::WithKey { key, .. } if key == &PathBuf::from("/k/work") => {
+                ProbeClass::Readable
+            }
+            ProbeRequest::WithKey { .. } => ProbeClass::AuthDenied,
+        };
+        let job = CloneJob {
+            probe: &fn_probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..work_job(&machine, &alias_env)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW + 1).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(anonymous_calls.get(), 1, "probed despite the recent check");
+        let state = read_state(&machine.paths(WORK_SSH_REMOTE).state_file());
+        assert_eq!(state.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn access_a_public_remote_of_another_domain_is_not_probed_again_inside_the_interval() {
+        // The forced recheck is for a work clone only: for the other domains the public warning is a caution.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        write_recent_public_state(&machine);
+        let alias_env = alias_env_for(&machine, &remote);
+        let anonymous_calls = Cell::new(0);
+        let fn_probe = |_request: &ProbeRequest| {
+            anonymous_calls.set(anonymous_calls.get() + 1);
+            ProbeClass::AuthDenied
+        };
+        let job = CloneJob {
+            probe: &fn_probe,
+            ..work_job(&machine, &alias_env)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW + 1).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(anonymous_calls.get(), 0, "inside the interval: no probe");
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! The access guards: what a probe's stderr means, whether `work` may sync given what every
-//! configured key can read (the work key guard), and what the visibility probe records and warns about. The functions are pure
-//! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh and is exercised by hand, `runner_for`, which
-//! reads `TMPDIR`, and `public_warnings`, which reads the state files.
+//! The access guards: what a probe's stderr means, whether `work` may sync given what every configured key can read
+//! (the work key guard), and what the visibility probe records and warns about. The functions are pure
+//! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh, exercised by hand and reading `TMPDIR`, and
+//! `public_warnings`, which reads the state files.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,7 +31,8 @@ pub enum ProbeClass {
 pub enum Visibility {
     Public,
     Private,
-    /// Not probed yet, or the probe was inconclusive: prints nothing and is probed again at the next recheck.
+    /// Not probed yet, or a first probe was inconclusive: prints nothing and is probed again at the next recheck. An
+    /// inconclusive recheck keeps the old verdict.
     #[default]
     #[serde(other)]
     // a value a newer version wrote reads as unknown, not as a corrupt state file
@@ -733,8 +734,8 @@ mod tests {
                 );
             });
     }
-    // The pure rows for the four logic functions and the warning reader. The real probes are exercised by
-    // hand against every configured host and are not tested here. Tests that count probe calls use a `RefCell`: the
+    // The pure rows for the four logic functions and the warning reader, and two runs of real git (the probe's runner).
+    // The probes against a real host are exercised by hand. Tests that count probe calls use a `RefCell`: the
     // probe is a shared `Fn`, so a counter cannot be a plain `let mut`.
     use crate::sync::files::{ClonePaths, SyncState, write_state};
     use std::cell::RefCell;
@@ -757,6 +758,19 @@ mod tests {
             // Credentials never reach the anonymous probe.
             (
                 "https://hideki:token@github.com/HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            // The other ssh scheme spellings git accepts, and the default ssh port written out, derive the same URL.
+            (
+                "git+ssh://git@github.com/HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            (
+                "ssh+git://git@github.com/HidekiAI/llm-lessons.git",
+                Some(GITHUB_HTTPS),
+            ),
+            (
+                "ssh://git@github.com:22/HidekiAI/llm-lessons.git",
                 Some(GITHUB_HTTPS),
             ),
             // A custom port, an ssh alias (a host with no dot) and a local path have no https form.
@@ -1280,10 +1294,12 @@ mod tests {
     fn a_probe_runs_from_the_filesystem_root_of_the_temp_directory() {
         // A temp directory inside a repository (or one that is a repository root) must not lend its config to a probe.
         const FILESYSTEM_ROOT: &str = "/";
+        // A relative TMPDIR (`tmp`) has no root of its own, so it is made absolute first.
         let cases: &[&str] = &[
             "/tmp",
             "/var/folders/ab/T",
             "/repo/work/tmp",
+            "tmp",
             FILESYSTEM_ROOT,
         ];
         cases.iter().for_each(|temp_dir| {
@@ -1343,6 +1359,8 @@ mod tests {
             env: vec![
                 ("LESSONS_KEPT".to_string(), "kept".to_string()),
                 ("LESSONS_DROPPED".to_string(), "dropped".to_string()),
+                ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()), // no developer gitconfig in a test
+                ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
             ],
             env_remove: vec!["LESSONS_DROPPED".to_string()],
             git_args: Vec::new(),

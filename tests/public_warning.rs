@@ -193,3 +193,38 @@ fn the_mcp_server_and_sync_keep_the_warning_off_stdout() {
         text_of(&synced.stderr)
     );
 }
+
+#[test]
+fn a_config_that_cannot_be_read_says_on_stderr_that_the_public_check_was_skipped() {
+    // The state file still records the remote as public, but the same remote under two different keys is refused by
+    // the config reader: the command goes on, and the missing warning is explained instead of silent.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (lessons_home, remote) = home_recording_a_public_remote(temp_dir.path());
+    let other_key_path: PathBuf = temp_dir.path().join("other-key");
+    fs::write(&other_key_path, "not a real key either").expect("write the second key file");
+    let config_path: PathBuf = lessons_home.join("config.toml");
+    let first_key_line: String = fs::read_to_string(&config_path)
+        .expect("read config.toml")
+        .lines()
+        .find(|line| line.starts_with("ssh_key"))
+        .expect("the ssh_key line")
+        .to_string();
+    fs::write(
+        &config_path,
+        format!(
+            "[sync.shared]\nremote = \"{remote}\"\n{first_key_line}\n\n[sync.personal]\nremote = \"{remote}\"\nssh_key = \"{}\"\n",
+            other_key_path.display()
+        ),
+    )
+    .expect("break config.toml");
+    let output: Output = run_lessons(&lessons_home, &["list"]);
+    assert!(
+        text_of(&output.stderr).contains("public-remote check skipped"),
+        "{}",
+        text_of(&output.stderr)
+    );
+    assert!(
+        !text_of(&output.stdout).contains("skipped"),
+        "stdout stays clean"
+    );
+}
