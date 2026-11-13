@@ -1,5 +1,5 @@
-//! The access guards (plan steps S5a and S5b): what a probe's stderr means, whether `work` may sync given what every
-//! configured key can read (R6), and what the visibility probe records and warns about (R13). The functions are pure
+//! The access guards: what a probe's stderr means, whether `work` may sync given what every
+//! configured key can read (the work key guard), and what the visibility probe records and warns about. The functions are pure
 //! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh and is exercised by hand, `runner_for`, which
 //! reads `TMPDIR`, and `public_warnings`, which reads the state files.
 
@@ -36,7 +36,7 @@ pub enum Visibility {
     Unknown,
 }
 
-/// The verdict of the R6 guard for the `work` domain.
+/// The verdict of the work key guard for the `work` domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDecision {
     Allow,
@@ -46,7 +46,7 @@ pub enum AccessDecision {
 
 /// Lower-case stderr fragments of an anonymous HTTPS probe that was turned away. Only a probe with no `ssh -v` lines
 /// may read these: as plain words in ssh output (a proxy, a local filter) they say nothing about the host's verdict.
-/// Fragments for other hosts join this list only once S5 has seen them by hand.
+/// Fragments for other hosts join this list only once they have been seen by hand against that host.
 const ANONYMOUS_HTTPS_REFUSALS: &[&str] = &[
     "repository not found",
     "access denied",
@@ -73,7 +73,7 @@ const SIGNING_FAILURES: &[&str] = &["signing failed", "agent refused operation"]
 /// message is never `AuthDenied`.
 pub fn classify_probe(exit_ok: bool, stderr: &str) -> ProbeClass {
     // Order matters: a signing failure outranks a refusal, and anything unrecognised falls to Inconclusive, so a new
-    // host's wording can never turn an unknown into a pass of the R6 guard. The wording that counts as a refusal
+    // host's wording can never turn an unknown into a pass of the work key guard. The wording that counts as a refusal
     // depends on the probe: ssh output (it has `debug1:` lines) needs the key offered and rejected, or accepted and
     // then refused by the host; an anonymous HTTPS probe has no key and reads the plain refusal messages.
     let lowered_stderr: String = stderr.to_lowercase();
@@ -114,7 +114,7 @@ pub fn visibility_from_probe(class: ProbeClass, url_derivable: bool) -> Visibili
 /// The caution printed on stderr by every command that touches a domain whose remote is recorded `public`, or none.
 /// `remote` may carry credentials; they never reach the line.
 pub fn public_warning(remote: &str, visibility: Visibility) -> Option<String> {
-    // Only a recorded `public` warns: `private` and `unknown` print nothing (R13, a caution and never a constraint).
+    // Only a recorded `public` warns: `private` and `unknown` print nothing (a caution and never a constraint).
     match visibility {
         Visibility::Public => Some(format!(
             concat!(
@@ -127,7 +127,7 @@ pub fn public_warning(remote: &str, visibility: Visibility) -> Option<String> {
     }
 }
 
-/// The R6 guard for a `work` domain that has a remote of its own. `work_probe` is what the WORK key can do against that
+/// The work key guard for a `work` domain that has a remote of its own. `work_probe` is what the WORK key can do against that
 /// remote; `other_keys` is every other configured key, by name, with what it can do. Fail closed: the work key must be
 /// able to read (else the guard cannot judge), and no other key may read or be unjudged.
 pub fn decide_access(work_probe: ProbeClass, other_keys: &[(&str, ProbeClass)]) -> AccessDecision {
@@ -168,16 +168,16 @@ const SECS_PER_DAY: u64 = 86_400;
 /// One probe to run: a `git ls-remote` that answers with a `ProbeClass`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeRequest {
-    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the R6 probes.
+    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the work key probes.
     WithKey { remote: String, key: PathBuf },
-    /// The anonymous HTTPS `url` read with no identity and no prompt: the R13 visibility probe.
+    /// The anonymous HTTPS `url` read with no identity and no prompt: the public-visibility probe.
     Anonymous { url: String },
 }
 
 /// Runs a probe. The cycle takes it as a parameter so tests feed fake answers and never touch the network.
 pub type ProbeFn<'probe> = &'probe dyn Fn(&ProbeRequest) -> ProbeClass;
 
-/// The R6 inputs of a clone that carries `work` with a remote of its own: the work key, and every other configured
+/// The work key guard inputs of a clone that carries `work` with a remote of its own: the work key, and every other configured
 /// key by the name of its domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkGuard {
@@ -379,7 +379,7 @@ fn runner_for(command: &ProbeCommand) -> GitRunner {
 }
 
 /// The real probe: `git ls-remote` as the request says, its exit status and stderr read by `classify_probe`. Exercised
-/// by hand against every configured host (S5), never by the tests.
+/// by hand against every configured host, never by the tests.
 pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
     // Every outcome becomes a class: a git that cannot start, or that outlives PROBE_DEADLINE_SECS, is Inconclusive and
     // never a pass. Running the command is exercised by hand against every configured host.
@@ -400,7 +400,7 @@ pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
     }
 }
 
-/// The R6 decision for a `work` clone with its own remote: probe the work key, then every other key, and let
+/// The work key guard decision for a `work` clone with its own remote: probe the work key, then every other key, and let
 /// `decide_access` judge.
 pub fn work_guard_decision(work_remote: &str, guard: &WorkGuard, probe: ProbeFn) -> AccessDecision {
     // Probe the work key first, then every other key, and let decide_access judge: the guard fails closed, so nothing here
@@ -719,7 +719,7 @@ mod tests {
                 );
             });
     }
-    // S5b tests: the pure rows for the four logic functions and the warning reader. The real probes are exercised by
+    // The pure rows for the four logic functions and the warning reader. The real probes are exercised by
     // hand against every configured host and are not tested here. Tests that count probe calls use a `RefCell`: the
     // probe is a shared `Fn`, so a counter cannot be a plain `let mut`.
     use crate::sync::files::{ClonePaths, SyncState, write_state};
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
-        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // the cwd's own repository config is not read either
+        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // no repository config either
         assert_eq!(env_value(&command, "HOME"), None);
         assert_eq!(
             command.env_remove,
@@ -1198,7 +1198,7 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(env_value(&command, "HOME"), Some("/dev/null"));
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
-        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // the cwd's own repository config is not read either
+        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // no repository config either
         // Config injected through the inherited environment, and any proxy (a proxy's "access denied" page must not
         // read as a private repository), never reach the probe.
         assert_eq!(

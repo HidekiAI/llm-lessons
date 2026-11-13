@@ -1,4 +1,4 @@
-//! End-to-end rows of the R13 PUBLIC warning: the real `lessons` binary, a local bare repository as the sync remote, and
+//! End-to-end rows of the PUBLIC warning: the real `lessons` binary, a local bare repository as the sync remote, and
 //! a state file that records the remote as public. The warning is a stderr line for every command but `init`, and it
 //! never reaches stdout (MCP stdout is JSON-RPC and the hook's stdout carries only lessons).
 

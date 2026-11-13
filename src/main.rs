@@ -262,7 +262,7 @@ fn main() -> Result<ExitCode> {
 
     // Every command but `sync` ends in success or in an error (exit 1); `sync` also has an exit code of its own.
     let fn_done = |result: Result<()>| result.map(|()| ExitCode::SUCCESS);
-    // R13: a remote recorded public is warned about on stderr by every command but `init`, from one place and from the
+    // A remote recorded public is warned about on stderr by every command but `init`, from one place and from the
     // state files alone (no network). The warning is a caution: nothing here can fail or change a command. `sync` is
     // warned about AFTER it ran, because a cycle can be the first to find a remote public.
     if !matches!(cli.command, Command::Init { .. } | Command::Sync { .. }) {

@@ -66,7 +66,7 @@ pub struct CloneJob<'job> {
     pub git_env: &'job [(String, String)],
     /// Runs the access probes; tests feed fake answers.
     pub probe: ProbeFn<'job>,
-    /// The R6 inputs, set only for a clone that carries `work` with a remote of its own (R11).
+    /// The work key guard inputs, set only for a clone that carries `work` with a remote of its own.
     pub work_guard: Option<WorkGuard>,
 }
 
@@ -123,32 +123,33 @@ pub fn sync_clone(
     }
 }
 
-/// The access step of one cycle (plan step S5): the R6 guard for a clone with its own `work` remote, then the R13
-/// visibility probe. A refused guard is an error naming why; the returned state carries the visibility the probe found.
+/// The access step of one cycle: the work key guard for a clone with its own `work` remote, then the public-visibility
+/// probe. A refused guard is an error naming why; the returned state carries the visibility the probe found.
 fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, Result<()>) {
-    // R6 compares ssh keys, and over https or a local path no key is ever used, so every key would read the same: such a
-    // work remote is refused without a probe instead of being judged by a verdict that means nothing there.
+    // The work key guard compares ssh keys, and over https or a local path no key is ever used, so every key would read
+    // the same: such a work remote is refused without a probe instead of being judged by a verdict that means nothing there.
     let guard_result: Result<()> = job.work_guard.as_ref().map_or(Ok(()), |guard| {
         ssh_host_of(job.remote).map_or_else(
-            || bail!("work is refused: R6 needs an ssh remote, and this remote has no ssh form"), // whatta heck is R6?!?!
+            || bail!("work is refused: the work key guard needs an ssh remote, and this remote has no ssh form"),
             |_ssh_host| match work_guard_decision(job.remote, guard, job.probe) {
                 AccessDecision::Allow => Ok(()),
                 AccessDecision::Refuse(reason) => bail!("work is refused: {reason}"),
             },
         )
     });
-    // R13 never depends on R6: a remote that is public and refused is still recorded public, so it is still warned about.
-    // The refusal reason and a change of visibility reach the journal, so a refused cycle or a new PUBLIC warning can be
+    // The visibility probe never depends on the work key guard: a remote that is public and refused is still recorded
+    // public, so it is still warned about. The refusal reason and a change of visibility reach the journal, so a refused cycle or a new PUBLIC warning can be
     // traced from the journal alone. The remote is redacted: it may carry a token.
     let visibility_before: Visibility = state.visibility;
     let probed_state: SyncState = visibility_after_probe(state, job.remote, job.probe, now_secs);
     journal!(
-        "access {}: R6 {}, visibility {visibility_before:?} -> {:?}",
+        "access {}: work key guard {}, visibility {visibility_before:?} -> {:?}",
         redact_credentials(job.remote),
-        guard_result.as_ref().map_or_else(
-            |refusal| format!("refused ({refusal:#})"),
-            |_allowed| "allowed".to_string()
-        ),
+        match (&job.work_guard, &guard_result) {
+            (None, _) => "not applicable".to_string(),
+            (Some(_), Ok(())) => "allowed".to_string(),
+            (Some(_), Err(refusal)) => format!("refused ({refusal:#})"),
+        },
         probed_state.visibility
     );
     (probed_state, guard_result)
@@ -474,7 +475,7 @@ fn write_clone_files(cycle: &Cycle, domain: Domain, plan: &DomainPlan) -> Result
         })
 }
 
-/// The R6 inputs for `clone`, or none: only a clone that carries `work` alone has a remote of its own (R11); when `work`
+/// The work key guard inputs for `clone`, or none: only a clone that carries `work` alone has a remote of its own; when `work`
 /// shares its remote with another domain the guard is skipped and the other domains' keys are the same key. Every
 /// other clone's key that differs from the work key is probed, named by the domains it serves.
 fn work_guard_of(clone: &CloneSpec, clones: &[CloneSpec]) -> Option<WorkGuard> {
@@ -1602,7 +1603,7 @@ mod tests {
         );
     }
 
-    // S5b cycle rows (the `access_` prefix is what `cargo test access` matches): the guard runs under the lock, before
+    // Cycle rows for the access step (the `access_` prefix is what `cargo test access` matches): the guard runs under the lock, before
     // anything is fetched, and a refusal is never remembered.
     /// The work key and the one other key of `work_guard_for_tests`.
     const KEYS_PROBED: usize = 2;
@@ -1751,7 +1752,7 @@ mod tests {
             sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
             CycleOutcome::Synced
         );
-        assert_eq!(calls.get(), 0, "a shared remote runs no R6 probe");
+        assert_eq!(calls.get(), 0, "a shared remote runs no work key probe");
     }
 
     #[test]
@@ -1871,7 +1872,7 @@ mod tests {
         };
         let message = format!("{:#}", sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap_err());
         assert!(
-            message.contains("R6 needs an ssh remote"),
+            message.contains("the work key guard needs an ssh remote"),
             "the refusal says why: {message}"
         );
         assert_eq!(key_calls.get(), 0, "no key was probed over https");
@@ -1971,7 +1972,7 @@ mod tests {
         assert_eq!(
             work_guard_of(&shared_work, &[shared_work.clone(), home_clone.clone()]),
             None,
-            "R11: a remote shared with another domain skips the guard"
+            "a remote shared with another domain skips the guard"
         );
         assert_eq!(
             work_guard_of(&home_clone, &[shared_work, home_clone.clone()]),
@@ -1981,7 +1982,7 @@ mod tests {
     }
     #[test]
     fn access_a_refused_work_clone_still_records_its_visibility() {
-        // R13 never depends on R6: a work remote that is public AND refused must still be warned about.
+        // The visibility probe never depends on the work key guard: a work remote that is public AND refused must still be warned about.
         const HTTPS_REMOTE: &str = "https://example.com/o/work.git";
         let temp_dir = tempfile::tempdir().unwrap();
         let machine = Machine::new(temp_dir.path(), "only");
