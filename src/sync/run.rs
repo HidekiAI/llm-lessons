@@ -142,8 +142,9 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
     // cycle or a new PUBLIC warning can be traced from the journal alone. The remote is redacted: it may carry a token.
     let visibility_before: Visibility = state.visibility;
     let carries_work: bool = job.domains.contains(&Domain::Work);
-    // A work clone recorded public is probed again on every cycle, so a refusal clears as soon as the owner makes the
-    // repository private instead of waiting out the recheck interval. The other domains keep the interval.
+    // A run that syncs `work` on a remote recorded public probes it again on every cycle, so a refusal clears as soon
+    // as the owner makes the repository private instead of waiting out the recheck interval. A run without `work`
+    // keeps the interval.
     let state_to_probe: SyncState = match (carries_work, state.visibility) {
         (true, Visibility::Public) => SyncState {
             last_access_check_unix_secs: None,
@@ -169,7 +170,7 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
         redact_credentials(job.remote),
         match (&job.work_guard, &guard_result) {
             (None, Ok(())) if carries_work =>
-                "no key guard (shared remote), remote not public".to_string(),
+                "no key guard (shared remote), remote not recorded public".to_string(),
             (None, Ok(())) => "not applicable".to_string(),
             (Some(_), Ok(())) => "allowed".to_string(),
             (_, Err(refusal)) => format!("refused ({refusal:#})"),
@@ -1962,6 +1963,12 @@ mod tests {
             "the refusal says why: {message}"
         );
         assert!(!fetched.get(), "no cycle step ran");
+        let state = read_state(&machine.paths(WORK_SSH_REMOTE).state_file());
+        assert_eq!(
+            state.visibility,
+            Visibility::Public,
+            "the refused cycle still records the visibility"
+        );
     }
 
     /// The state of a clone recorded `public` and checked a moment ago, so a recheck is not due for days.
@@ -2013,7 +2020,7 @@ mod tests {
 
     #[test]
     fn access_a_public_remote_of_another_domain_is_not_probed_again_inside_the_interval() {
-        // The forced recheck is for a work clone only: for the other domains the public warning is a caution.
+        // The forced recheck is for a run that syncs `work` only: for the other domains the public warning is a caution.
         let temp_dir = tempfile::tempdir().unwrap();
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");

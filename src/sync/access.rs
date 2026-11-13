@@ -172,7 +172,7 @@ const SECS_PER_DAY: u64 = 86_400;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeRequest {
     /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the key probes of the
-    /// work key guard, the work key first and then each other distinct key.
+    /// work key guard, the work key first, then each other distinct key only when the work key can read.
     WithKey { remote: String, key: PathBuf },
     /// The anonymous HTTPS `url` read with no identity and no prompt: the public-visibility probe.
     Anonymous { url: String },
@@ -181,8 +181,8 @@ pub enum ProbeRequest {
 /// Runs a probe. The cycle takes it as a parameter so tests feed fake answers and never touch the network.
 pub type ProbeFn<'probe> = &'probe dyn Fn(&ProbeRequest) -> ProbeClass;
 
-/// The work key guard inputs of a clone that carries `work` with a remote of its own: the work key, and every other configured
-/// key by the name of its domain.
+/// The work key guard inputs of a clone that carries `work` with a remote of its own: the work key, and each other configured
+/// distinct key, named by every domain it serves joined with `+`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkGuard {
     pub work_key: PathBuf,
