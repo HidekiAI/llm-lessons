@@ -1,6 +1,7 @@
 //! The access guards (plan steps S5a and S5b): what a probe's stderr means, whether `work` may sync given what every
 //! configured key can read (R6), and what the visibility probe records and warns about (R13). The functions are pure
-//! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh and is exercised by hand.
+//! (no git, no ssh, no clock) except `probe_remote`, which runs git and ssh and is exercised by hand, `runner_for`, which
+//! reads `TMPDIR`, and `public_warnings`, which reads the state files.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -719,7 +720,6 @@ mod tests {
 
     const GITHUB_HTTPS: &str = "https://github.com/HidekiAI/llm-lessons.git";
     const NOW_SECS: u64 = 1_762_000_000;
-    const ONE_DAY_SECS: u64 = 86_400;
 
     #[test]
     fn the_anonymous_url_is_derived_from_every_remote_form_or_not_at_all() {
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn the_visibility_recheck_is_due_when_never_checked_or_a_full_interval_old() {
-        let interval_secs: u64 = ACCESS_RECHECK_DAYS * ONE_DAY_SECS;
+        let interval_secs: u64 = ACCESS_RECHECK_DAYS * SECS_PER_DAY;
         let cases: &[(Option<u64>, bool, &str)] = &[
             (None, true, "never checked"),
             (Some(NOW_SECS), false, "just checked"),
@@ -771,10 +771,11 @@ mod tests {
                 true,
                 "past the interval",
             ),
-            // A clock that moved back must not make every cycle probe, nor hide a check for ever.
+            // A check time in the future (a stamp written while the clock ran ahead) must not hide the check until the
+            // real clock catches up: it is due, and the probe that follows re-stamps the time.
             (
-                Some(NOW_SECS + ONE_DAY_SECS),
-                false,
+                Some(NOW_SECS + SECS_PER_DAY),
+                true,
                 "a check time in the future",
             ),
         ];
@@ -977,7 +978,7 @@ mod tests {
 
     #[test]
     fn the_visibility_step_does_not_probe_when_not_due_or_with_no_url() {
-        let recent = state_with(Visibility::Public, Some(NOW_SECS - ONE_DAY_SECS));
+        let recent = state_with(Visibility::Public, Some(NOW_SECS - SECS_PER_DAY));
         let asked = RefCell::new(Vec::new());
         let fn_probe = |request: &ProbeRequest| {
             asked.borrow_mut().push(request.clone());
@@ -1005,7 +1006,7 @@ mod tests {
     fn a_due_recheck_replaces_an_old_verdict_and_a_failed_one_keeps_the_old_verdict_and_time() {
         let old = state_with(
             Visibility::Private,
-            Some(NOW_SECS - ACCESS_RECHECK_DAYS * ONE_DAY_SECS),
+            Some(NOW_SECS - ACCESS_RECHECK_DAYS * SECS_PER_DAY),
         );
         let went_public = visibility_after_probe(
             old.clone(),
@@ -1032,7 +1033,7 @@ mod tests {
         let public_then_unjudged = visibility_after_probe(
             state_with(
                 Visibility::Public,
-                Some(NOW_SECS - ACCESS_RECHECK_DAYS * ONE_DAY_SECS),
+                Some(NOW_SECS - ACCESS_RECHECK_DAYS * SECS_PER_DAY),
             ),
             GITHUB_HTTPS,
             &|_: &ProbeRequest| ProbeClass::Inconclusive,

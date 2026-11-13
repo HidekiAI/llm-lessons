@@ -1595,6 +1595,41 @@ mod tests {
     /// The work key and the one other key of `work_guard_for_tests`.
     const KEYS_PROBED: usize = 2;
 
+    /// A work remote in ssh form, which the key guard needs; `alias_env_for` points git at a local bare repository for it.
+    const WORK_SSH_REMOTE: &str = "git@work.example:o/work.git";
+
+    /// The machine's git environment plus an `insteadOf` that sends `WORK_SSH_REMOTE` to `bare`, so no network is touched.
+    fn alias_env_for(machine: &Machine, bare: &str) -> Vec<(String, String)> {
+        machine
+            .git_env
+            .iter()
+            .cloned()
+            .chain([
+                ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+                (
+                    "GIT_CONFIG_KEY_0".to_string(),
+                    format!("url.{bare}.insteadOf"),
+                ),
+                (
+                    "GIT_CONFIG_VALUE_0".to_string(),
+                    WORK_SSH_REMOTE.to_string(),
+                ),
+            ])
+            .collect()
+    }
+
+    /// A job for `WORK_SSH_REMOTE` that runs git under `alias_env`.
+    fn work_job<'job>(
+        machine: &'job Machine,
+        alias_env: &'job [(String, String)],
+    ) -> CloneJob<'job> {
+        CloneJob {
+            normalized_remote: WORK_SSH_REMOTE,
+            git_env: alias_env,
+            ..machine.job(WORK_SSH_REMOTE)
+        }
+    }
+
     fn work_guard_for_tests() -> WorkGuard {
         WorkGuard {
             work_key: PathBuf::from("/k/work"),
@@ -1602,21 +1637,22 @@ mod tests {
         }
     }
 
-    /// A probe that says `work_answer` for the work key, `home_answer` for the other key, and counts its calls.
+    /// A probe that says `work_answer` for the work key, `home_answer` for the other key, and counts the key probes.
     fn probe_answering<'answers>(
         work_answer: ProbeClass,
         home_answer: ProbeClass,
         calls: &'answers Cell<usize>,
     ) -> impl Fn(&ProbeRequest) -> ProbeClass + 'answers {
-        move |request| {
-            calls.set(calls.get() + 1);
-            match request {
-                ProbeRequest::WithKey { key, .. } if key == &PathBuf::from("/k/work") => {
-                    work_answer
-                }
-                ProbeRequest::WithKey { .. } => home_answer,
-                ProbeRequest::Anonymous { .. } => ProbeClass::Inconclusive,
+        move |request| match request {
+            ProbeRequest::WithKey { key, .. } if key == &PathBuf::from("/k/work") => {
+                calls.set(calls.get() + 1);
+                work_answer
             }
+            ProbeRequest::WithKey { .. } => {
+                calls.set(calls.get() + 1);
+                home_answer
+            }
+            ProbeRequest::Anonymous { .. } => ProbeClass::Inconclusive,
         }
     }
 
@@ -1625,13 +1661,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
+        let alias_env = alias_env_for(&machine, &remote);
         machine.add("first");
         let calls = Cell::new(0);
         let fn_probe = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &calls);
         let job = CloneJob {
             probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
-            ..machine.job(&remote)
+            ..work_job(&machine, &alias_env)
         };
         let fetched = Cell::new(false);
         let outcome = sync_clone(
@@ -1654,7 +1691,7 @@ mod tests {
             "nothing was pushed"
         );
         assert_eq!(
-            read_state(&machine.paths(&remote).state_file()).consecutive_failures,
+            read_state(&machine.paths(WORK_SSH_REMOTE).state_file()).consecutive_failures,
             1,
             "the refusal counts as a failed cycle"
         );
@@ -1665,13 +1702,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
+        let alias_env = alias_env_for(&machine, &remote);
         machine.add("first");
         let calls = Cell::new(0);
         let fn_probe = probe_answering(ProbeClass::Readable, ProbeClass::AuthDenied, &calls);
         let job = CloneJob {
             probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
-            ..machine.job(&remote)
+            ..work_job(&machine, &alias_env)
         };
         assert_eq!(
             sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
@@ -1680,7 +1718,7 @@ mod tests {
         assert_eq!(
             calls.get(),
             KEYS_PROBED,
-            "the work key and the one other key, nothing anonymous for a local path"
+            "the work key and the one other key (the anonymous probe is not counted)"
         );
     }
 
@@ -1709,7 +1747,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
-        let lock_path: PathBuf = machine.paths(&remote).lock_file();
+        let alias_env = alias_env_for(&machine, &remote);
+        let lock_path: PathBuf = machine.paths(WORK_SSH_REMOTE).lock_file();
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let held = fs::OpenOptions::new()
             .create(true)
@@ -1723,7 +1762,7 @@ mod tests {
         let job = CloneJob {
             probe: &fn_probe,
             work_guard: Some(work_guard_for_tests()),
-            ..machine.job(&remote)
+            ..work_job(&machine, &alias_env)
         };
         assert_eq!(
             sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
@@ -1741,13 +1780,14 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
+        let alias_env = alias_env_for(&machine, &remote);
         machine.add("first");
         let refused_calls = Cell::new(0);
         let refusing = probe_answering(ProbeClass::Readable, ProbeClass::Readable, &refused_calls);
         let refused_job = CloneJob {
             probe: &refusing,
             work_guard: Some(work_guard_for_tests()),
-            ..machine.job(&remote)
+            ..work_job(&machine, &alias_env)
         };
         assert!(sync_clone(&refused_job, &|_| Ok(()), SOME_NOW).is_err());
         let allowed_calls = Cell::new(0);
@@ -1756,7 +1796,7 @@ mod tests {
         let allowed_job = CloneJob {
             probe: &allowing,
             work_guard: Some(work_guard_for_tests()),
-            ..machine.job(&remote)
+            ..work_job(&machine, &alias_env)
         };
         assert_eq!(
             sync_clone(&allowed_job, &|_| Ok(()), SOME_NOW).unwrap(),
@@ -1775,12 +1815,54 @@ mod tests {
         let remote = bare_remote(temp_dir.path());
         let machine = Machine::new(temp_dir.path(), "only");
         machine.add("first");
-        machine.sync(&remote);
+        let probe_calls = Cell::new(0);
+        let fn_probe = |_request: &ProbeRequest| {
+            probe_calls.set(probe_calls.get() + 1);
+            ProbeClass::Readable // a probe that would stamp a verdict if it were ever asked
+        };
+        let job = CloneJob {
+            probe: &fn_probe,
+            ..machine.job(&remote)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::Synced
+        );
+        assert_eq!(probe_calls.get(), 0, "no https form, so no probe was asked");
         let state = read_state(&machine.paths(&remote).state_file());
         assert_eq!(
             state.last_access_check_unix_secs, None,
-            "no https form, so nothing was probed or recorded"
+            "and nothing was recorded"
         );
+    }
+
+    #[test]
+    fn access_a_work_remote_without_ssh_is_refused_unprobed() {
+        // The key guard compares ssh keys, and over https no key is ever used, so every key would read the same.
+        const HTTPS_REMOTE: &str = "https://example.com/o/work.git";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let key_calls = Cell::new(0);
+        let fn_probe = |request: &ProbeRequest| match request {
+            ProbeRequest::WithKey { .. } => {
+                key_calls.set(key_calls.get() + 1);
+                ProbeClass::Readable
+            }
+            ProbeRequest::Anonymous { .. } => ProbeClass::Inconclusive,
+        };
+        let job = CloneJob {
+            normalized_remote: HTTPS_REMOTE,
+            probe: &fn_probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..machine.job(HTTPS_REMOTE)
+        };
+        let message = format!("{:#}", sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap_err());
+        assert!(
+            message.contains("R6 needs an ssh remote"),
+            "the refusal says why: {message}"
+        );
+        assert_eq!(key_calls.get(), 0, "no key was probed over https");
     }
 
     #[test]

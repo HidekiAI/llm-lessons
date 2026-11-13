@@ -355,7 +355,9 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
 }
 
 /// Kills `child` and reaps it, so no zombie is left. Returns the exit status when the child had in fact already ended on
-/// its own (a git that finished at the very deadline is not thrown away), and none when the kill is what ended it.
+/// its own (a git that finished at the very deadline is not thrown away), and none when the kill is what ended it. On
+/// Windows a killed child still has an exit code, so it reads as an ordinary failed exit; a probe classifies that
+/// `Inconclusive` as well, so the guards stay closed.
 fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
     drop(child.kill());
     child.wait().ok().filter(|status| status.code().is_some())
@@ -1167,7 +1169,7 @@ mod tests {
             assert!(output.exit_ok);
             return;
         }
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut mut_child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "sync::git::tests::a_run_with_a_deadline_never_hands_git_the_callers_stdin",
@@ -1178,8 +1180,8 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let held_open = child.stdin.take(); // `wait` would close it; keep the pipe open until the child is done
-        let status = child.wait().unwrap();
+        let held_open = mut_child.stdin.take(); // `wait` would close it; keep the pipe open until the child is done
+        let status = mut_child.wait().unwrap();
         drop(held_open);
         assert!(status.success(), "git read the caller's stdin and blocked");
     }
@@ -1197,6 +1199,25 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(SLOW_SSH_SLEEP_SECS - 1),
             "the caller got control back at the deadline, not when the lingering process ended"
+        );
+    }
+    #[test]
+    fn a_descendant_holding_both_pipes_costs_one_deadline_not_two() {
+        // Both pipes stay open after git exits, and the two collects share what is left of one deadline.
+        const LINGERING_DEADLINE_MS: u64 = 1_000;
+        const DEADLINE_SHARE_LIMIT: f64 = 1.5; // one deadline plus slack, well short of two
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let alias: String = format!(
+            "alias.lingering=!sleep {SLOW_SSH_SLEEP_SECS} >&2 & sleep {SLOW_SSH_SLEEP_SECS} & echo done"
+        );
+        let deadline = Duration::from_millis(LINGERING_DEADLINE_MS);
+        let started = Instant::now();
+        drop(runner.run_with_deadline(&["-c", &alias, "lingering"], deadline));
+        assert!(
+            started.elapsed() < deadline.mul_f64(DEADLINE_SHARE_LIMIT),
+            "one probe took {:?}, the limit is one deadline",
+            started.elapsed()
         );
     }
     #[test]
