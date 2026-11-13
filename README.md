@@ -171,9 +171,24 @@ When `work` shares a repo with `personal` or `shared`, sync notes once per sync 
 
 An SQLite file is binary: a sequence of fixed-size pages holding B-trees. One new lesson can rewrite bytes in several pages, so git sees an opaque blob. It cannot show a readable diff, git cannot merge two machines' versions (one side has to be picked), and a commit can store a whole new copy, so the history can grow by the size of the database each time.
 
-So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commits that text. The merge itself never runs in git: `lessons sync` merges in-process, field by field, three ways (against the version both machines last agreed on), then commits the result on top of the repo's latest commit, so every push is a plain fast-forward and there are no merge commits. The local `.db` is rebuilt from the merged result.
+So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commits that text. The merge itself never runs in git: `lessons sync` merges in-process, field by field, three ways (against the version both machines last agreed on), then commits the result on top of the repo's latest commit, so every push is a plain fast-forward and there are no merge commits. The local `.db` is then updated with the merged rows.
+
+**Is rebuilding SQLite from text not wasted CPU?** Only sync reads the JSON lines, and sync is its own step. Every command reads and writes the SQLite file directly, so no search, add or prompt hook parses a line. A cycle writes only the rows that changed (an unchanged lesson is not rewritten, and `hits` is a value, not a sum), so its cost follows your edits, not the size of the database. A full build from the lines happens once, on a machine that has no `.db` yet, which is how a fresh machine gets its lessons. The text is also cheap at this size: a thousand lessons is about a megabyte, and a line parses in microseconds. Once the background trigger lands (`update = "live"`), a burst of searches still costs one pull, because a read pulls at most once every `pull_every_minutes` (10 by default). What the text buys is what a binary cannot give: a readable diff per lesson, a per-field merge between machines, and history that grows by the lessons you changed rather than by another copy of the whole database. One realistic lesson is about 1 KB, so a gigabyte would be a million lessons; if a database ever does reach tens of megabytes, the fix is to shard the file by year, not to go back to a binary.
 
 What pays off is syncing often (`update = "live"`, once background sync is built; until then run `lessons sync` often): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
+
+**Why not CSV, or a `sqlite3` dump?** Because neither is loadable *and* mergeable, and the file has to be both:
+
+| Format | `sqlite3` can load it | One lesson per line | Named fields, so a per-field merge |
+| --- | --- | --- | --- |
+| `<domain>.jsonl` (ours) | no, `lessons sync` rebuilds the database from it | yes | yes |
+| `sqlite3 db .dump` (SQL) | yes, it is SQL | yes | no: `INSERT INTO lesson VALUES (...)` is positional, so one added column silently misplaces every old line, and one lesson is still one line, so two machines editing different fields of it conflict |
+| `.mode json` (one array) | no, `sqlite3` has no JSON importer | no: the whole file is one line, so any change rewrites it | no |
+| CSV (`.import`) | yes, CSV or ASCII only, never JSON (checked on 3.51.2) | only until a field holds a newline, which quoted log text in `problem` does | no: `.import` cannot spell NULL, so `None` and `''` collapse and a machine manufactures a change and a conflict |
+
+A CSV import also does not produce a database `lessons` will use: `.import` creates a table of TEXT columns with no search index, no triggers and `user_version = 0`, so the schema rebuild refuses it. The supported restore is `lessons sync`, which rebuilds schema, index and triggers from the code and fills them from the JSON lines.
+
+CSV is still a fine place to *export* to, for a human with a spreadsheet; that belongs in an `export` command, not in the stored format. Today one `jq` gets you there: `jq -r '[.id,.title,.problem] | @csv' shared.jsonl`.
 
 ### Why a git repo, and not a gist or a cloud drive?
 
