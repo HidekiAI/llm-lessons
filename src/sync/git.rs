@@ -173,7 +173,7 @@ const COLLECT_GRACE: Duration = Duration::from_millis(200);
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 
 /// Runs git for one sync clone. Every call has `GIT_TERMINAL_PROMPT=0` and the clone's ssh command, and is journalled;
-/// `extra_env` is for tests, which point git at their own global config.
+/// `with_env` adds variables: a test's own global config, or the isolation of a probe.
 #[derive(Debug, Clone)]
 pub struct GitRunner {
     working_dir: std::path::PathBuf,
@@ -283,17 +283,10 @@ impl GitRunner {
         let stdout_reader = drain(mut_child.stdout.take());
         let stderr_reader = drain(mut_child.stderr.take());
         let started: Instant = Instant::now();
-        // A probe killed at its deadline is the one a journal reader most needs the output of, so the stderr read so far
-        // is journalled before the error returns: it shows how far ssh got.
-        let command_text: String = redact_credentials(&args.join(" "));
-        let status: ExitStatus = wait_for_exit(&mut mut_child, deadline).map_err(|wait_error| {
-            let stderr_so_far: String = collect(&stderr_reader, Duration::ZERO);
-            journal!(
-                "git {command_text}: no result, stderr so far {:?}",
-                redact_credentials(stderr_so_far.trim())
-            );
-            wait_error.context(format!("git {command_text}"))
-        })?;
+        // A probe killed at its deadline has no output to journal: a reader sends only at the end of its stream, and a
+        // descendant of git (ssh, the https helper) still holds the pipe. The error names the command and the deadline.
+        let status: ExitStatus = wait_for_exit(&mut mut_child, deadline)
+            .with_context(|| format!("git {}", redact_credentials(&args.join(" "))))?;
 
         // Each pipe is collected with what is left of the one deadline at that moment, so the second pipe cannot wait a
         // second full deadline after the first one used it up.
@@ -398,7 +391,8 @@ fn wait_for_exit(child: &mut Child, deadline: Duration) -> Result<ExitStatus> {
 }
 
 /// What a pipe reader sent, waiting at most `remaining` (and never less than `COLLECT_GRACE`, for output that is already
-/// on its way): a descendant that keeps the pipe open after git exited gives an empty text, not a hang.
+/// on its way): a descendant that keeps the pipe open after git exited gives an empty text, not a hang. The floor means a
+/// probe can end a little after its deadline, never much.
 fn collect(reader: &Receiver<Vec<u8>>, remaining: Duration) -> String {
     let patience: Duration = remaining.max(COLLECT_GRACE);
     String::from_utf8_lossy(&reader.recv_timeout(patience).unwrap_or_default()).into_owned()
@@ -1065,6 +1059,14 @@ mod tests {
     const SHORT_DEADLINE_MS: u64 = 300;
     const GENEROUS_DEADLINE_SECS: u64 = 30;
 
+    /// A runner that reads no global and no system git config, so a test result never depends on the developer's own
+    /// `~/.gitconfig` (a malformed one, an `includeIf`, a signing setup).
+    fn no_global_config_runner(directory: &Path, ssh_command: &str) -> GitRunner {
+        GitRunner::new(directory, ssh_command)
+            .with_env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_env("GIT_CONFIG_NOSYSTEM", "1")
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_run_that_outlives_its_deadline_is_killed_and_is_an_error() {
@@ -1110,7 +1112,7 @@ mod tests {
     #[test]
     fn a_run_inside_its_deadline_returns_what_run_returns() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let runner = no_global_config_runner(temp_dir.path(), "ssh");
         let output = runner
             .run_with_deadline(&["--version"], Duration::from_secs(GENEROUS_DEADLINE_SECS))
             .unwrap();
@@ -1138,7 +1140,8 @@ mod tests {
         // An alias that prints the variable git was started with.
         let show_canary: Vec<&str> =
             vec!["-c", "alias.canary=!echo \"[$LESSONS_CANARY]\"", "canary"];
-        let with_canary = GitRunner::new(temp_dir.path(), "ssh").with_env("LESSONS_CANARY", "set");
+        let with_canary =
+            no_global_config_runner(temp_dir.path(), "ssh").with_env("LESSONS_CANARY", "set");
         assert_eq!(
             with_canary.run_checked(&show_canary).unwrap().trim(),
             "[set]"
@@ -1156,7 +1159,7 @@ mod tests {
     #[test]
     fn a_run_with_a_deadline_reads_output_larger_than_a_pipe_holds() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let runner = no_global_config_runner(temp_dir.path(), "ssh");
         let big_alias: String =
             format!("alias.big=!head -c {BIG_OUTPUT_BYTES} /dev/zero | tr '\\0' x");
         let output = runner
@@ -1178,7 +1181,7 @@ mod tests {
         // is an open pipe nobody writes to.
         if std::env::var_os(STDIN_CHILD_ENV).is_some() {
             let temp_dir = tempfile::tempdir().unwrap();
-            let output = GitRunner::new(temp_dir.path(), "ssh")
+            let output = no_global_config_runner(temp_dir.path(), "ssh")
                 .run_with_deadline(
                     &["-c", "alias.slurp=!cat", "slurp"],
                     Duration::from_secs(SLOW_SSH_SLEEP_SECS),
@@ -1207,7 +1210,7 @@ mod tests {
     fn a_descendant_holding_the_pipes_after_git_exits_does_not_hold_the_caller() {
         // git prints and exits at once, but its background `sleep` keeps stdout open for SLOW_SSH_SLEEP_SECS seconds.
         let temp_dir = tempfile::tempdir().unwrap();
-        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let runner = no_global_config_runner(temp_dir.path(), "ssh");
         let alias: String = format!("alias.lingering=!sleep {SLOW_SSH_SLEEP_SECS} & echo done");
         let started = Instant::now();
         drop(runner.run_with_deadline(
@@ -1225,7 +1228,7 @@ mod tests {
         const LINGERING_DEADLINE_MS: u64 = 1_000;
         const DEADLINE_SHARE_LIMIT: f64 = 1.5; // one deadline plus slack, well short of two
         let temp_dir = tempfile::tempdir().unwrap();
-        let runner = GitRunner::new(temp_dir.path(), "ssh");
+        let runner = no_global_config_runner(temp_dir.path(), "ssh");
         let alias: String = format!(
             "alias.lingering=!sleep {SLOW_SSH_SLEEP_SECS} >&2 & sleep {SLOW_SSH_SLEEP_SECS} & echo done"
         );
@@ -1241,7 +1244,7 @@ mod tests {
     #[test]
     fn a_run_with_a_deadline_captures_stderr_too() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let output = GitRunner::new(temp_dir.path(), "ssh")
+        let output = no_global_config_runner(temp_dir.path(), "ssh")
             .run_with_deadline(
                 &["-c", "alias.complain=!echo oops >&2", "complain"],
                 Duration::from_secs(GENEROUS_DEADLINE_SECS),
@@ -1254,7 +1257,7 @@ mod tests {
     fn a_run_with_a_deadline_waits_for_late_output_while_time_is_left() {
         // git exits at once; a background shell keeps the pipe and writes one second later, well inside the deadline.
         let temp_dir = tempfile::tempdir().unwrap();
-        let output = GitRunner::new(temp_dir.path(), "ssh")
+        let output = no_global_config_runner(temp_dir.path(), "ssh")
             .run_with_deadline(
                 &[
                     "-c",
@@ -1276,7 +1279,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let big_alias: String =
             format!("alias.huge=!head -c {OVER_THE_CAP_BYTES} /dev/zero | tr '\\0' x");
-        let output = GitRunner::new(temp_dir.path(), "ssh")
+        let output = no_global_config_runner(temp_dir.path(), "ssh")
             .run_with_deadline(
                 &["-c", &big_alias, "huge"],
                 Duration::from_secs(GENEROUS_DEADLINE_SECS),

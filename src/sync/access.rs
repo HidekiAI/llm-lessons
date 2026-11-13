@@ -33,6 +33,8 @@ pub enum Visibility {
     Private,
     /// Not probed yet, or the probe was inconclusive: prints nothing and is probed again at the next recheck.
     #[default]
+    #[serde(other)]
+    // a value a newer version wrote reads as unknown, not as a corrupt state file
     Unknown,
 }
 
@@ -111,7 +113,7 @@ pub fn visibility_from_probe(class: ProbeClass, url_derivable: bool) -> Visibili
     }
 }
 
-/// The caution printed on stderr by every command that touches a domain whose remote is recorded `public`, or none.
+/// The caution printed on stderr by every command but `init`, once for each configured remote recorded `public`, or none.
 /// `remote` may carry credentials; they never reach the line.
 pub fn public_warning(remote: &str, visibility: Visibility) -> Option<String> {
     // Only a recorded `public` warns: `private` and `unknown` print nothing (a caution and never a constraint).
@@ -145,10 +147,10 @@ pub fn decide_access(work_probe: ProbeClass, other_keys: &[(&str, ProbeClass)]) 
     ) {
         (ProbeClass::Readable, None, None) => AccessDecision::Allow,
         (ProbeClass::Readable, Some(key_name), _) => {
-            AccessDecision::Refuse(format!("key {key_name} can read the work remote"))
+            AccessDecision::Refuse(format!("the key for {key_name} can read the work remote"))
         }
         (ProbeClass::Readable, None, Some(key_name)) => AccessDecision::Refuse(format!(
-            "could not tell whether key {key_name} can read the work remote"
+            "could not tell whether the key for {key_name} can read the work remote"
         )),
         (ProbeClass::AuthDenied | ProbeClass::Inconclusive, _, _) => {
             AccessDecision::Refuse(format!(
@@ -363,6 +365,12 @@ pub fn probe_command_of(request: &ProbeRequest, identity_agent: Option<&str>) ->
     }
 }
 
+/// The directory a probe runs in. Git looks for a repository in the working directory and above it, and reads that
+/// repository's own config; the filesystem root of the temp directory is where no repository is expected.
+fn probe_working_dir_of(temp_dir: &Path) -> PathBuf {
+    temp_dir.to_path_buf()
+}
+
 /// A git runner for `command`: its ssh command and environment set, the variables it must not inherit removed.
 fn runner_for(command: &ProbeCommand) -> GitRunner {
     // The runner carries the command's ssh command and environment, then drops the variables the probe must not inherit.
@@ -467,7 +475,7 @@ pub fn public_warnings(lessons_home: &Path, clones: &[CloneSpec]) -> Vec<String>
 }
 
 // Table tests over the pure decisions. Each row is a case from the plan's Guards and Public warning rows, and each
-// guard was shown red by removing its branch (recorded in the step result).
+// guard was shown red by removing its branch.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +909,33 @@ mod tests {
     }
 
     #[test]
+    fn the_work_guard_stops_at_a_work_key_that_cannot_read_and_probes_no_other_key() {
+        // Whatever the other keys would say, the answer is already a refusal, and every probe holds the clone lock.
+        const WORK_REMOTE: &str = "git@gitlab.example.com:org/work.git";
+        [ProbeClass::AuthDenied, ProbeClass::Inconclusive]
+            .iter()
+            .for_each(|work_answer| {
+                let asked = RefCell::new(Vec::new());
+                let answers = [("/k/work", *work_answer), ("/k/home", ProbeClass::Readable)];
+                let fn_probe = answering_by_key(&answers, &asked);
+                let decision = work_guard_decision(
+                    WORK_REMOTE,
+                    &guard_with(&[("home", "/k/home")]),
+                    &fn_probe,
+                );
+                assert!(
+                    matches!(decision, AccessDecision::Refuse(_)),
+                    "{work_answer:?}: {decision:?}"
+                );
+                assert_eq!(
+                    asked.borrow().len(),
+                    1,
+                    "{work_answer:?}: only the work key was probed"
+                );
+            });
+    }
+
+    #[test]
     fn a_refusal_names_the_key_that_can_read_work() {
         let asked = RefCell::new(Vec::new());
         let fn_probe = answering_by_key(
@@ -1173,7 +1208,7 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
-        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // no repository config either
+        assert_eq!(env_value(&command, "GIT_DIR"), None); // a GIT_DIR breaks an includeIf gitdir config
         assert_eq!(env_value(&command, "HOME"), None);
         assert_eq!(
             command.env_remove,
@@ -1198,7 +1233,7 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(env_value(&command, "HOME"), Some("/dev/null"));
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
-        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // no repository config either
+        assert_eq!(env_value(&command, "GIT_DIR"), None); // a GIT_DIR breaks an includeIf gitdir config
         // Config injected through the inherited environment, and any proxy (a proxy's "access denied" page must not
         // read as a private repository), never reach the probe.
         assert_eq!(
@@ -1235,6 +1270,25 @@ mod tests {
             Some(PROBE_TIMEOUT_SECS.to_string().as_str())
         );
     }
+    #[test]
+    fn a_probe_runs_from_the_filesystem_root_of_the_temp_directory() {
+        // A temp directory inside a repository (or one that is a repository root) must not lend its config to a probe.
+        const FILESYSTEM_ROOT: &str = "/";
+        let cases: &[&str] = &[
+            "/tmp",
+            "/var/folders/ab/T",
+            "/repo/work/tmp",
+            FILESYSTEM_ROOT,
+        ];
+        cases.iter().for_each(|temp_dir| {
+            assert_eq!(
+                probe_working_dir_of(Path::new(temp_dir)),
+                PathBuf::from(FILESYSTEM_ROOT),
+                "{temp_dir}"
+            );
+        });
+    }
+
     #[test]
     fn a_runner_sets_the_probe_environment_then_removes_what_must_not_be_inherited() {
         // Set and removed in one command: removal runs after setting, so the variable never reaches git.

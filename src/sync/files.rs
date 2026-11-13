@@ -593,6 +593,22 @@ mod tests {
     }
 
     #[test]
+    fn a_visibility_from_a_newer_version_reads_as_unknown_and_keeps_the_rest_of_the_state() {
+        // Reading it as a corrupt file would drop the last synced commit, and the next merge would bring back lessons
+        // deleted since.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_path: PathBuf = temp_dir.path().join("x.state");
+        fs::write(
+            &state_path,
+            format!("{{\"last_synced_commit\":\"{SOME_COMMIT}\",\"visibility\":\"internal\"}}"),
+        )
+        .unwrap();
+        let state = read_state(&state_path);
+        assert_eq!(state.last_synced_commit.as_deref(), Some(SOME_COMMIT));
+        assert_eq!(state.visibility, Visibility::Unknown);
+    }
+
+    #[test]
     fn an_unreadable_state_path_reads_as_the_default() {
         let temp_dir = tempfile::tempdir().unwrap();
         assert_eq!(

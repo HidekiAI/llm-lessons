@@ -304,11 +304,10 @@ fn main() -> Result<ExitCode> {
         )),
         Command::Retire { id, by } => fn_done(run_retire(&fn_lessons_home()?, &id, &by)),
         Command::Move { id, to } => fn_done(run_move(&fn_lessons_home()?, &id, to)),
-        Command::Sync { domain } => {
-            let sync_exit: Result<ExitCode> = run_sync(&fn_lessons_home()?, domain);
-            warn_public_remotes(&fn_lessons_home);
-            sync_exit
-        }
+        Command::Sync { domain } => run_then_warn(
+            || run_sync(&fn_lessons_home()?, domain),
+            || warn_public_remotes(&fn_lessons_home),
+        ),
         Command::Mcp => fn_done(mcp::serve(
             &fn_lessons_home()?,
             std::io::stdin().lock(),
@@ -339,6 +338,14 @@ fn warn_public_remotes(fn_lessons_home: &impl Fn() -> Result<PathBuf>) {
             sync::redact_credentials(&format!("{skipped:#}")) // a config parse error may quote a remote with a token
         ),
     }
+}
+
+/// Runs the command, then the warning, and returns the command's result: a warning read before the command would miss a
+/// remote the command itself found to be public.
+fn run_then_warn<T>(run_command: impl FnOnce() -> T, warn: impl FnOnce()) -> T {
+    let command_result: T = run_command();
+    warn();
+    command_result
 }
 
 /// Syncs the configured clones (all of them, or the ones carrying `--domain`) and exits as `sync::exit_for` says.
@@ -778,4 +785,25 @@ fn run_move(lessons_home: &Path, lesson_id: &str, target_domain: Domain) -> Resu
         target_domain.as_str()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn the_warning_follows_the_command_and_the_result_is_the_commands() {
+        const COMMAND_RESULT: &str = "synced";
+        let order: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let result: &str = run_then_warn(
+            || {
+                order.borrow_mut().push("command");
+                COMMAND_RESULT
+            },
+            || order.borrow_mut().push("warning"),
+        );
+        assert_eq!(result, COMMAND_RESULT);
+        assert_eq!(*order.borrow(), vec!["command", "warning"]);
+    }
 }

@@ -1657,13 +1657,12 @@ mod tests {
         calls: &'answers Cell<usize>,
     ) -> impl Fn(&ProbeRequest) -> ProbeClass + 'answers {
         move |request| match request {
-            ProbeRequest::WithKey { key, .. } if key == &PathBuf::from("/k/work") => {
+            ProbeRequest::WithKey { key, .. } => {
                 calls.set(calls.get() + 1);
-                work_answer
-            }
-            ProbeRequest::WithKey { .. } => {
-                calls.set(calls.get() + 1);
-                home_answer
+                match key == &PathBuf::from("/k/work") {
+                    true => work_answer,
+                    false => home_answer,
+                }
             }
             ProbeRequest::Anonymous { .. } => ProbeClass::Inconclusive,
         }
@@ -1850,6 +1849,81 @@ mod tests {
     }
 
     #[test]
+    fn access_a_public_work_remote_is_refused_before_anything_is_fetched() {
+        // Another key is rejected on a host that serves a public repository only to registered users, so the key guard
+        // alone would allow it: the anonymous probe is what shows that anyone can read the work remote.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let alias_env = alias_env_for(&machine, &remote);
+        let key_calls = Cell::new(0);
+        let fn_probe = |request: &ProbeRequest| match request {
+            ProbeRequest::WithKey { key, .. } if key == &PathBuf::from("/k/work") => {
+                key_calls.set(key_calls.get() + 1);
+                ProbeClass::Readable
+            }
+            ProbeRequest::WithKey { .. } => {
+                key_calls.set(key_calls.get() + 1);
+                ProbeClass::AuthDenied
+            }
+            ProbeRequest::Anonymous { .. } => ProbeClass::Readable,
+        };
+        let job = CloneJob {
+            probe: &fn_probe,
+            work_guard: Some(work_guard_for_tests()),
+            ..work_job(&machine, &alias_env)
+        };
+        let fetched = Cell::new(false);
+        let outcome = sync_clone(
+            &job,
+            &|_| {
+                fetched.set(true);
+                Ok(())
+            },
+            SOME_NOW,
+        );
+        let message = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            message.contains("public"),
+            "the refusal says why: {message}"
+        );
+        assert!(!fetched.get(), "no cycle step ran");
+        assert_eq!(key_calls.get(), KEYS_PROBED, "the key guard still ran");
+        assert_eq!(
+            remote_commit_count(temp_dir.path(), &remote),
+            0,
+            "nothing was pushed"
+        );
+        let state = read_state(&machine.paths(WORK_SSH_REMOTE).state_file());
+        assert_eq!(state.visibility, Visibility::Public, "and it is recorded");
+    }
+
+    #[test]
+    fn access_a_public_remote_without_a_work_guard_still_syncs() {
+        // Only a work clone refuses: for the other domains the public warning stays a caution.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let remote = bare_remote(temp_dir.path());
+        let machine = Machine::new(temp_dir.path(), "only");
+        machine.add("first");
+        let alias_env = alias_env_for(&machine, &remote);
+        let fn_probe = |request: &ProbeRequest| match request {
+            ProbeRequest::Anonymous { .. } => ProbeClass::Readable,
+            ProbeRequest::WithKey { .. } => ProbeClass::Inconclusive,
+        };
+        let job = CloneJob {
+            probe: &fn_probe,
+            ..work_job(&machine, &alias_env)
+        };
+        assert_eq!(
+            sync_clone(&job, &|_| Ok(()), SOME_NOW).unwrap(),
+            CycleOutcome::Synced
+        );
+        let state = read_state(&machine.paths(WORK_SSH_REMOTE).state_file());
+        assert_eq!(state.visibility, Visibility::Public);
+    }
+
+    #[test]
     fn access_a_work_remote_without_ssh_is_refused_unprobed() {
         // The key guard compares ssh keys, and over https no key is ever used, so every key would read the same.
         const HTTPS_REMOTE: &str = "https://example.com/o/work.git";
@@ -1996,7 +2070,7 @@ mod tests {
         };
         assert!(
             sync_clone(&job, &|_| Ok(()), SOME_NOW).is_err(),
-            "every key reads work: refused"
+            "an https work remote has no ssh key to judge: refused"
         );
         let state = read_state(&machine.paths(HTTPS_REMOTE).state_file());
         assert_eq!(
