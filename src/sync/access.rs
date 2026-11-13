@@ -361,8 +361,8 @@ pub fn probe_command_of(request: &ProbeRequest, identity_agent: Option<&str>) ->
 /// The directory a probe runs in. Git looks for a repository in the working directory and above it, and reads that
 /// repository's own config; the filesystem root of the temp directory is where no repository is expected.
 fn probe_working_dir_of(temp_dir: &Path) -> PathBuf {
-    // Git reads the config of a repository it finds from the working directory upward, and a `GIT_DIR` that names no
-    // repository breaks configs that use `includeIf "gitdir:"`; the root of the temp directory has no repository.
+    // Git reads the config of a repository it finds from the working directory upward, so a temp directory inside a
+    // repository would lend that repository's config to the probe; the root of the temp directory has no repository.
     temp_dir
         .ancestors()
         .last()
@@ -449,8 +449,8 @@ pub fn visibility_after_probe(
         None => state,
         Some(url) => {
             let class: ProbeClass = probe(&ProbeRequest::Anonymous { url });
-            // One match decides both fields, so the verdict and its check time cannot disagree about whether the probe
-            // judged anything.
+            // One match decides both fields: an inconclusive probe keeps the old verdict and check time, a verdict
+            // replaces both.
             let (visibility, last_check): (Visibility, Option<u64>) = match class {
                 ProbeClass::Inconclusive => (state.visibility, state.last_access_check_unix_secs),
                 ProbeClass::Readable | ProbeClass::AuthDenied => {

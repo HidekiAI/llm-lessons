@@ -144,16 +144,14 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
     let probed_state: SyncState = visibility_after_probe(state, job.remote, job.probe, now_secs);
     // A host that serves a public repository only to registered users rejects every other key, so the key guard alone
     // would allow a public work remote; a work clone is refused once the visibility probe reads its remote as public.
-    // The other domains keep the warning only.
+    // The other domains keep the warning.
     let guard_result: Result<()> =
-        guard_result.and_then(
-            |()| match (job.work_guard.is_some(), probed_state.visibility) {
-                (true, Visibility::Public) => {
-                    bail!("work is refused: the remote is public, so anyone can read it")
-                }
-                (true, Visibility::Private | Visibility::Unknown) | (false, _) => Ok(()),
-            },
-        );
+        guard_result.and_then(|()| match (&job.work_guard, probed_state.visibility) {
+            (Some(_), Visibility::Public) => {
+                bail!("work is refused: the remote is public, so anyone can read it")
+            }
+            (Some(_), Visibility::Private | Visibility::Unknown) | (None, _) => Ok(()),
+        });
     journal!(
         "access {}: work key guard {}, visibility {visibility_before:?} -> {:?}",
         redact_credentials(job.remote),
