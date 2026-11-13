@@ -160,7 +160,7 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
     let guard_result: Result<()> =
         guard_result.and_then(|()| match (carries_work, probed_state.visibility) {
             (true, Visibility::Public) => {
-                bail!("work is refused: the remote is public, so anyone can read it")
+                bail!("work is refused: the remote is public, so anyone can read it, and this run syncs work")
             }
             (true, Visibility::Private | Visibility::Unknown) | (false, _) => Ok(()),
         });
@@ -168,6 +168,8 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
         "access {}: work {}, visibility {visibility_before:?} -> {:?}",
         redact_credentials(job.remote),
         match (&job.work_guard, &guard_result) {
+            (None, Ok(())) if carries_work =>
+                "no key guard (shared remote), remote not public".to_string(),
             (None, Ok(())) => "not applicable".to_string(),
             (Some(_), Ok(())) => "allowed".to_string(),
             (_, Err(refusal)) => format!("refused ({refusal:#})"),

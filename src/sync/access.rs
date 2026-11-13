@@ -171,7 +171,8 @@ const SECS_PER_DAY: u64 = 86_400;
 /// One probe to run: a `git ls-remote` that answers with a `ProbeClass`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeRequest {
-    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the key probes of the work key guard, one per configured key.
+    /// `remote` read with `key` only (ssh `-v`, so the output says how far authentication got): the key probes of the
+    /// work key guard, the work key first and then each other distinct key.
     WithKey { remote: String, key: PathBuf },
     /// The anonymous HTTPS `url` read with no identity and no prompt: the public-visibility probe.
     Anonymous { url: String },

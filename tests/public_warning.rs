@@ -231,19 +231,15 @@ fn a_config_that_cannot_be_read_says_on_stderr_that_the_public_check_was_skipped
 
 #[test]
 fn the_skipped_check_line_never_shows_a_token_from_the_remote() {
-    // The config error quotes the remote it refused, and a remote may carry a token: the line must redact it.
+    // A TOML parse error quotes the raw config line, token included, and nothing but the redaction in the skipped line
+    // keeps it out of stderr: the remote below is followed by junk so the file does not parse.
     const SECRET_TOKEN: &str = "secret-token-value";
     let temp_dir = tempfile::tempdir().unwrap();
     let (lessons_home, _remote) = home_recording_a_public_remote(temp_dir.path());
-    let other_key_path: PathBuf = temp_dir.path().join("other-key");
-    fs::write(&other_key_path, "not a real key either").expect("write the second key file");
-    let first_key_path: PathBuf = temp_dir.path().join("key");
     fs::write(
         lessons_home.join("config.toml"),
         format!(
-            "[sync.shared]\nremote = \"https://user:{SECRET_TOKEN}@example.com/o/r.git\"\nssh_key = \"{}\"\n\n[sync.personal]\nremote = \"https://user:{SECRET_TOKEN}@example.com/o/r.git\"\nssh_key = \"{}\"\n",
-            first_key_path.display(),
-            other_key_path.display()
+            "[sync.shared]\nremote = \"https://user:{SECRET_TOKEN}@example.com/o/r.git\" junk\n"
         ),
     )
     .expect("break config.toml");
