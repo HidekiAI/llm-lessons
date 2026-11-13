@@ -283,13 +283,27 @@ impl GitRunner {
         let stdout_reader = drain(mut_child.stdout.take());
         let stderr_reader = drain(mut_child.stderr.take());
         let started: Instant = Instant::now();
-        let status: ExitStatus = wait_for_exit(&mut mut_child, deadline)
-            .with_context(|| format!("git {}", redact_credentials(&args.join(" "))))?;
-        let remaining: Duration = deadline.saturating_sub(started.elapsed());
+        // A probe killed at its deadline is the one a journal reader most needs the output of, so the stderr read so far
+        // is journalled before the error returns: it shows how far ssh got.
+        let command_text: String = redact_credentials(&args.join(" "));
+        let status: ExitStatus = wait_for_exit(&mut mut_child, deadline).map_err(|wait_error| {
+            let stderr_so_far: String = collect(&stderr_reader, Duration::ZERO);
+            journal!(
+                "git {command_text}: no result, stderr so far {:?}",
+                redact_credentials(stderr_so_far.trim())
+            );
+            wait_error.context(format!("git {command_text}"))
+        })?;
+
+        // Each pipe is collected with what is left of the one deadline at that moment, so the second pipe cannot wait a
+        // second full deadline after the first one used it up.
+        let fn_time_left = || deadline.saturating_sub(started.elapsed());
+        let stdout: String = collect(&stdout_reader, fn_time_left());
+        let stderr: String = collect(&stderr_reader, fn_time_left());
         let git_output = GitOutput {
             exit_ok: status.success(),
-            stdout: collect(&stdout_reader, remaining),
-            stderr: collect(&stderr_reader, remaining),
+            stdout,
+            stderr,
         };
         journal!(
             "git {}: exit_ok={} stderr={:?}",
@@ -1082,6 +1096,10 @@ mod tests {
         assert!(
             error_text.contains("deadline") || error_text.contains("did not finish"),
             "{error_text}"
+        );
+        assert!(
+            error_text.contains("git ls-remote -- ssh://example.invalid/o/r.git HEAD"), // the user part of the URL is redacted
+            "the error names the command that was killed: {error_text}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(SLOW_SSH_SLEEP_SECS - 1),

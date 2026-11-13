@@ -211,10 +211,10 @@ pub fn https_url_of_remote(remote: &str) -> Option<String> {
 
 /// Whether the visibility is due for a probe: never checked, or the last check is `ACCESS_RECHECK_DAYS` old or more.
 pub fn access_check_due(last_check_unix_secs: Option<u64>, now_secs: u64) -> bool {
-    // An interval old or older is due; a check time in the future (a clock that moved back) is not, so a wrong clock cannot
-    // make every cycle probe.
+    // An interval old or older is due, and so is a check time in the future (a stamp written while the clock ran ahead):
+    // it must not hide the check until the real clock catches up, and the probe that follows re-stamps the time.
     last_check_unix_secs.is_none_or(|last_check| {
-        now_secs.saturating_sub(last_check) >= ACCESS_RECHECK_DAYS * SECS_PER_DAY
+        last_check > now_secs || now_secs - last_check >= ACCESS_RECHECK_DAYS * SECS_PER_DAY
     })
 }
 
@@ -273,6 +273,10 @@ fn anonymous_probe_env() -> Vec<(String, String)> {
         .collect()
 }
 
+/// A repository path that cannot exist, so git finds no repository for a probe even when the working directory is inside
+/// one: such a repository's own config (an `insteadOf`, an extra header) would otherwise be read.
+const NO_REPOSITORY_DIR: &str = "/dev/null/no-repository";
+
 /// Git must read no global and no system config: an `insteadOf` there could send a probe to another URL, read with other
 /// credentials. Shared by both probes.
 fn isolated_git_config_env() -> Vec<(String, String)> {
@@ -281,6 +285,9 @@ fn isolated_git_config_env() -> Vec<(String, String)> {
         ("GIT_CONFIG_NOSYSTEM", "1"),
         // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
         ("XDG_CONFIG_HOME", "/dev/null"),
+        // A probe runs in the temp directory, which can sit inside a repository; git would then read that repository's
+        // config, so no repository is named at all.
+        ("GIT_DIR", NO_REPOSITORY_DIR),
     ]
     .map(|(name, value)| (name.to_string(), value.to_string()))
     .to_vec()
@@ -1166,6 +1173,7 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
+        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // the cwd's own repository config is not read either
         assert_eq!(env_value(&command, "HOME"), None);
         assert_eq!(
             command.env_remove,
@@ -1190,6 +1198,7 @@ mod tests {
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
         assert_eq!(env_value(&command, "HOME"), Some("/dev/null"));
         assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
+        assert_eq!(env_value(&command, "GIT_DIR"), Some(NO_REPOSITORY_DIR)); // the cwd's own repository config is not read either
         // Config injected through the inherited environment, and any proxy (a proxy's "access denied" page must not
         // read as a private repository), never reach the probe.
         assert_eq!(

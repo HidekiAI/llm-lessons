@@ -3,7 +3,7 @@
 //! top of the fetched remote tip, so there is no `git pull` and no `git merge` here. The decisions it takes are the
 //! pure functions of `cycle.rs`; this file is the order of the steps and the effects.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,7 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use super::access::{
-    AccessDecision, ProbeFn, WorkGuard, probe_remote, visibility_after_probe, work_guard_decision,
+    AccessDecision, ProbeFn, Visibility, WorkGuard, probe_remote, visibility_after_probe,
+    work_guard_decision,
 };
 use super::cycle::{
     AfterPush, CycleOutcome, CycleResult, DomainInputs, DomainPlan, base_from_shown,
@@ -24,7 +25,7 @@ use super::files::{
 };
 use super::git::{
     GitRunner, PushOutcome, classify_push, detect_default_branch, ensure_clone, identity_agent_of,
-    redact_credentials, ssh_command,
+    redact_credentials, ssh_command, ssh_host_of,
 };
 use super::{Conflict, group_key};
 use crate::config::{CloneSpec, SyncSection, clone_specs, sync_warnings};
@@ -125,17 +126,32 @@ pub fn sync_clone(
 /// The access step of one cycle (plan step S5): the R6 guard for a clone with its own `work` remote, then the R13
 /// visibility probe. A refused guard is an error naming why; the returned state carries the visibility the probe found.
 fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, Result<()>) {
+    // R6 compares ssh keys, and over https or a local path no key is ever used, so every key would read the same: such a
+    // work remote is refused without a probe instead of being judged by a verdict that means nothing there.
     let guard_result: Result<()> = job.work_guard.as_ref().map_or(Ok(()), |guard| {
-        match work_guard_decision(job.remote, guard, job.probe) {
-            AccessDecision::Allow => Ok(()),
-            AccessDecision::Refuse(reason) => bail!("work is refused: {reason}"),
-        }
+        ssh_host_of(job.remote).map_or_else(
+            || bail!("work is refused: R6 needs an ssh remote, and this remote has no ssh form"), // whatta heck is R6?!?!
+            |_ssh_host| match work_guard_decision(job.remote, guard, job.probe) {
+                AccessDecision::Allow => Ok(()),
+                AccessDecision::Refuse(reason) => bail!("work is refused: {reason}"),
+            },
+        )
     });
     // R13 never depends on R6: a remote that is public and refused is still recorded public, so it is still warned about.
-    (
-        visibility_after_probe(state, job.remote, job.probe, now_secs),
-        guard_result,
-    )
+    // The refusal reason and a change of visibility reach the journal, so a refused cycle or a new PUBLIC warning can be
+    // traced from the journal alone. The remote is redacted: it may carry a token.
+    let visibility_before: Visibility = state.visibility;
+    let probed_state: SyncState = visibility_after_probe(state, job.remote, job.probe, now_secs);
+    journal!(
+        "access {}: R6 {}, visibility {visibility_before:?} -> {:?}",
+        redact_credentials(job.remote),
+        guard_result.as_ref().map_or_else(
+            |refusal| format!("refused ({refusal:#})"),
+            |_allowed| "allowed".to_string()
+        ),
+        probed_state.visibility
+    );
+    (probed_state, guard_result)
 }
 
 /// Takes the clone lock without waiting: the lock is the open file, so the operating system frees it when the process
@@ -462,30 +478,26 @@ fn write_clone_files(cycle: &Cycle, domain: Domain, plan: &DomainPlan) -> Result
 /// shares its remote with another domain the guard is skipped and the other domains' keys are the same key. Every
 /// other clone's key that differs from the work key is probed, named by the domains it serves.
 fn work_guard_of(clone: &CloneSpec, clones: &[CloneSpec]) -> Option<WorkGuard> {
-    // One entry per distinct other key, named by every domain it serves, so a key shared by two clones is probed once.
-    let distinct_other_keys: BTreeSet<&PathBuf> = clones
-        .iter()
-        .map(|other_clone| &other_clone.ssh_key)
-        .filter(|other_key| **other_key != clone.ssh_key)
-        .collect();
-    (clone.domains == [Domain::Work]).then(|| WorkGuard {
-        work_key: clone.ssh_key.clone(),
-        other_keys: distinct_other_keys
-            .into_iter()
-            .map(|other_key| {
-                (
-                    clones
-                        .iter()
-                        .filter(|other_clone| other_clone.ssh_key == *other_key)
-                        .flat_map(|other_clone| {
-                            other_clone.domains.iter().map(|domain| domain.as_str())
-                        })
-                        .collect::<Vec<&str>>()
-                        .join("+"),
-                    other_key.clone(),
-                )
-            })
-            .collect(),
+    // One entry per distinct other key, named by every domain it serves, so a key shared by two clones is probed once. The
+    // map is built only for a work clone, in one pass, instead of a set plus a rescan of every clone per key.
+    (clone.domains == [Domain::Work]).then(|| {
+        let domains_by_other_key: BTreeMap<&PathBuf, Vec<&str>> = clones
+            .iter()
+            .filter(|other_clone| other_clone.ssh_key != clone.ssh_key)
+            .fold(BTreeMap::new(), |mut mut_domains_by_key, other_clone| {
+                mut_domains_by_key
+                    .entry(&other_clone.ssh_key)
+                    .or_default()
+                    .extend(other_clone.domains.iter().map(|domain| domain.as_str()));
+                mut_domains_by_key
+            });
+        WorkGuard {
+            work_key: clone.ssh_key.clone(),
+            other_keys: domains_by_other_key
+                .into_iter()
+                .map(|(other_key, domain_names)| (domain_names.join("+"), other_key.clone()))
+                .collect(),
+        }
     })
 }
 
