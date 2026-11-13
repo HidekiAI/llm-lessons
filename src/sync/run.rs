@@ -138,10 +138,22 @@ fn check_access(job: &CloneJob, state: SyncState, now_secs: u64) -> (SyncState, 
         )
     });
     // The visibility probe never depends on the work key guard: a remote that is public and refused is still recorded
-    // public, so it is still warned about. The refusal reason and a change of visibility reach the journal, so a refused cycle or a new PUBLIC warning can be
-    // traced from the journal alone. The remote is redacted: it may carry a token.
+    // public, so it is still warned about. The refusal reason and a change of visibility reach the journal, so a refused
+    // cycle or a new PUBLIC warning can be traced from the journal alone. The remote is redacted: it may carry a token.
     let visibility_before: Visibility = state.visibility;
     let probed_state: SyncState = visibility_after_probe(state, job.remote, job.probe, now_secs);
+    // A host that serves a public repository only to registered users rejects every other key, so the key guard alone
+    // would allow a public work remote; a work clone is refused once the visibility probe reads its remote as public.
+    // The other domains keep the warning only.
+    let guard_result: Result<()> =
+        guard_result.and_then(
+            |()| match (job.work_guard.is_some(), probed_state.visibility) {
+                (true, Visibility::Public) => {
+                    bail!("work is refused: the remote is public, so anyone can read it")
+                }
+                (true, Visibility::Private | Visibility::Unknown) | (false, _) => Ok(()),
+            },
+        );
     journal!(
         "access {}: work key guard {}, visibility {visibility_before:?} -> {:?}",
         redact_credentials(job.remote),

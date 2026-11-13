@@ -275,10 +275,6 @@ fn anonymous_probe_env() -> Vec<(String, String)> {
         .collect()
 }
 
-/// A repository path that cannot exist, so git finds no repository for a probe even when the working directory is inside
-/// one: such a repository's own config (an `insteadOf`, an extra header) would otherwise be read.
-const NO_REPOSITORY_DIR: &str = "/dev/null/no-repository";
-
 /// Git must read no global and no system config: an `insteadOf` there could send a probe to another URL, read with other
 /// credentials. Shared by both probes.
 fn isolated_git_config_env() -> Vec<(String, String)> {
@@ -287,9 +283,6 @@ fn isolated_git_config_env() -> Vec<(String, String)> {
         ("GIT_CONFIG_NOSYSTEM", "1"),
         // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
         ("XDG_CONFIG_HOME", "/dev/null"),
-        // A probe runs in the temp directory, which can sit inside a repository; git would then read that repository's
-        // config, so no repository is named at all.
-        ("GIT_DIR", NO_REPOSITORY_DIR),
     ]
     .map(|(name, value)| (name.to_string(), value.to_string()))
     .to_vec()
@@ -368,14 +361,21 @@ pub fn probe_command_of(request: &ProbeRequest, identity_agent: Option<&str>) ->
 /// The directory a probe runs in. Git looks for a repository in the working directory and above it, and reads that
 /// repository's own config; the filesystem root of the temp directory is where no repository is expected.
 fn probe_working_dir_of(temp_dir: &Path) -> PathBuf {
-    temp_dir.to_path_buf()
+    // Git reads the config of a repository it finds from the working directory upward, and a `GIT_DIR` that names no
+    // repository breaks configs that use `includeIf "gitdir:"`; the root of the temp directory has no repository.
+    temp_dir
+        .ancestors()
+        .last()
+        .map_or_else(|| temp_dir.to_path_buf(), Path::to_path_buf)
 }
 
-/// A git runner for `command`: its ssh command and environment set, the variables it must not inherit removed.
-fn runner_for(command: &ProbeCommand) -> GitRunner {
+/// A git runner for `command`, started from the root of `temp_dir`: its ssh command and environment set, the variables it
+/// must not inherit removed.
+fn runner_for(command: &ProbeCommand, temp_dir: &Path) -> GitRunner {
     // The runner carries the command's ssh command and environment, then drops the variables the probe must not inherit.
     let runner_with_env: GitRunner = command.env.iter().fold(
-        GitRunner::new(&std::env::temp_dir(), &command.ssh_command),
+        // The probe starts where no repository is found, whatever the temp directory is.
+        GitRunner::new(&probe_working_dir_of(temp_dir), &command.ssh_command),
         |runner_so_far, (name, value)| runner_so_far.with_env(name, value),
     );
     command
@@ -397,7 +397,7 @@ pub fn probe_remote(request: &ProbeRequest) -> ProbeClass {
     };
     let command: ProbeCommand = probe_command_of(request, agent.as_deref());
     let git_args: Vec<&str> = command.git_args.iter().map(String::as_str).collect();
-    match runner_for(&command)
+    match runner_for(&command, &std::env::temp_dir())
         .run_with_deadline(&git_args, Duration::from_secs(PROBE_DEADLINE_SECS))
     {
         Ok(output) => classify_probe(output.exit_ok, &output.stderr),
@@ -420,11 +420,16 @@ pub fn work_guard_decision(work_remote: &str, guard: &WorkGuard, probe: ProbeFn)
         })
     };
     let work_probe: ProbeClass = fn_probe_with(&guard.work_key);
-    let other_probes: Vec<(&str, ProbeClass)> = guard
-        .other_keys
-        .iter()
-        .map(|(key_name, key)| (key_name.as_str(), fn_probe_with(key)))
-        .collect();
+    // The other keys are probed only when the work key can read: otherwise the answer is already a refusal whatever they
+    // say, and every probe holds the clone lock for up to the probe deadline.
+    let other_probes: Vec<(&str, ProbeClass)> = match work_probe {
+        ProbeClass::Readable => guard
+            .other_keys
+            .iter()
+            .map(|(key_name, key)| (key_name.as_str(), fn_probe_with(key)))
+            .collect(),
+        ProbeClass::AuthDenied | ProbeClass::Inconclusive => Vec::new(),
+    };
     decide_access(work_probe, &other_probes)
 }
 
@@ -444,16 +449,17 @@ pub fn visibility_after_probe(
         None => state,
         Some(url) => {
             let class: ProbeClass = probe(&ProbeRequest::Anonymous { url });
+            // One match decides both fields, so the verdict and its check time cannot disagree about whether the probe
+            // judged anything.
+            let (visibility, last_check): (Visibility, Option<u64>) = match class {
+                ProbeClass::Inconclusive => (state.visibility, state.last_access_check_unix_secs),
+                ProbeClass::Readable | ProbeClass::AuthDenied => {
+                    (visibility_from_probe(class, true), Some(now_secs))
+                }
+            };
             SyncState {
-                visibility: match class {
-                    ProbeClass::Inconclusive => state.visibility,
-                    ProbeClass::Readable | ProbeClass::AuthDenied => {
-                        visibility_from_probe(class, true)
-                    }
-                },
-                last_access_check_unix_secs: (class != ProbeClass::Inconclusive)
-                    .then_some(now_secs)
-                    .or(state.last_access_check_unix_secs),
+                visibility,
+                last_access_check_unix_secs: last_check,
                 ..state
             }
         }
@@ -1290,6 +1296,46 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_started_in_a_temp_directory_inside_a_repository_reads_no_config_of_that_repository()
+    {
+        // The repository's own config sends the probe's URL to a local bare repository; a probe that read it would
+        // succeed, one that ignores it tries the network, and the reserved `.invalid` host cannot answer.
+        const PROBED_URL: &str = "https://example.invalid/o/r.git";
+        let sandbox = tempfile::tempdir().unwrap();
+        let bare_repo: PathBuf = sandbox.path().join("bare.git");
+        let outer_repo: PathBuf = sandbox.path().join("outer");
+        let temp_inside_repo: PathBuf = outer_repo.join("tmp");
+        std::fs::create_dir_all(&temp_inside_repo).unwrap();
+        let fn_git_setup = |directory: &Path, args: &[&str]| {
+            let setup_status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap();
+            assert!(setup_status.success(), "git {args:?}");
+        };
+        fn_git_setup(sandbox.path(), &["init", "-q", "--bare", "bare.git"]);
+        fn_git_setup(&outer_repo, &["init", "-q"]);
+        let rewrite_key: String = format!("url.{}.insteadOf", bare_repo.display());
+        fn_git_setup(&outer_repo, &["config", &rewrite_key, PROBED_URL]);
+        let command: ProbeCommand = probe_command_of(
+            &ProbeRequest::Anonymous {
+                url: PROBED_URL.to_string(),
+            },
+            None,
+        );
+        let git_args: Vec<&str> = command.git_args.iter().map(String::as_str).collect();
+        let probe_output = runner_for(&command, &temp_inside_repo)
+            .run_with_deadline(&git_args, Duration::from_secs(PROBE_DEADLINE_SECS));
+        assert!(
+            probe_output.is_ok_and(|output| !output.exit_ok),
+            "the probe read the config of the repository around its temp directory"
+        );
+    }
+
+    #[test]
     fn a_runner_sets_the_probe_environment_then_removes_what_must_not_be_inherited() {
         // Set and removed in one command: removal runs after setting, so the variable never reaches git.
         let command = ProbeCommand {
@@ -1306,7 +1352,9 @@ mod tests {
             "alias.canary=!echo \"[$LESSONS_KEPT][$LESSONS_DROPPED]\"",
             "canary",
         ];
-        let shown: String = runner_for(&command).run_checked(&show_canary).unwrap();
+        let shown: String = runner_for(&command, &std::env::temp_dir())
+            .run_checked(&show_canary)
+            .unwrap();
         assert_eq!(shown.trim(), "[kept][]");
     }
 }
