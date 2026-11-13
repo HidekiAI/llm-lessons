@@ -169,6 +169,9 @@ const DEADLINE_POLL: Duration = Duration::from_millis(20);
 /// The least a pipe reader is waited for after git exited, so output already on its way is not dropped.
 const COLLECT_GRACE: Duration = Duration::from_millis(200);
 
+/// The most bytes a probe keeps of each output stream; the rest is read and thrown away.
+const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
+
 /// Runs git for one sync clone. Every call has `GIT_TERMINAL_PROMPT=0` and the clone's ssh command, and is journalled;
 /// `extra_env` is for tests, which point git at their own global config.
 #[derive(Debug, Clone)]
@@ -275,21 +278,19 @@ impl GitRunner {
             redact_credentials(&args.join(" ")),
             self.working_dir.display()
         );
-        // TODO(human): begin block 6/9
         // Spawn, drain both outputs on their own threads, wait under the deadline, then collect each with what is left of it.
-        // let mut mut_child: Child = self.spawn_piped(args)?;
-        // let stdout_reader = drain(mut_child.stdout.take());
-        // let stderr_reader = drain(mut_child.stderr.take());
-        // let started: Instant = Instant::now();
-        // let status: ExitStatus = wait_for_exit(&mut mut_child, deadline)
-        //     .with_context(|| format!("git {}", redact_credentials(&args.join(" "))))?;
-        // let remaining: Duration = deadline.saturating_sub(started.elapsed());
-        // let git_output = GitOutput {
-        //     exit_ok: status.success(),
-        //     stdout: collect(&stdout_reader, remaining),
-        //     stderr: collect(&stderr_reader, remaining),
-        // };
-        // TODO(human): end block 6/9
+        let mut mut_child: Child = self.spawn_piped(args)?;
+        let stdout_reader = drain(mut_child.stdout.take());
+        let stderr_reader = drain(mut_child.stderr.take());
+        let started: Instant = Instant::now();
+        let status: ExitStatus = wait_for_exit(&mut mut_child, deadline)
+            .with_context(|| format!("git {}", redact_credentials(&args.join(" "))))?;
+        let remaining: Duration = deadline.saturating_sub(started.elapsed());
+        let git_output = GitOutput {
+            exit_ok: status.success(),
+            stdout: collect(&stdout_reader, remaining),
+            stderr: collect(&stderr_reader, remaining),
+        };
         journal!(
             "git {}: exit_ok={} stderr={:?}",
             redact_credentials(&args.join(" ")),
@@ -301,22 +302,18 @@ impl GitRunner {
 
     /// Starts git with no stdin (it must never wait for the caller's) and both outputs piped.
     fn spawn_piped(&self, args: &[&str]) -> Result<Child> {
-        // TODO(human): begin block 5/9
-        // Start git with no stdin (it must never wait for the caller's) and both outputs piped; a git that cannot start is an error
-        // naming the redacted command.
-        // self.command_for(args)
-        //     .stdin(Stdio::null())
-        //     .stdout(Stdio::piped())
-        //     .stderr(Stdio::piped())
-        //     .spawn()
-        //     .with_context(|| {
-        //         format!(
-        //             "git {}: could not start git in {}",
-        //             redact_credentials(&args.join(" ")),
-        //             self.working_dir.display()
-        //         )
-        //     })
-        // TODO(human): end block 5/9
+        self.command_for(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "git {}: could not start git in {}",
+                    redact_credentials(&args.join(" ")),
+                    self.working_dir.display()
+                )
+            })
     }
 
     /// Like `run`, but a failure is an error naming the command and its stderr, and the result is stdout.
@@ -338,65 +335,57 @@ impl GitRunner {
 /// reader whose pipe a descendant keeps open ends by itself when that descendant does. Generic because a closure
 /// cannot take `impl Read`.
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Receiver<Vec<u8>> {
-    // TODO(human): begin block 1/9
-    // A thread reads the pipe to its end and sends the bytes: the receiver is the only handle, so a descendant that keeps
-    // the pipe open cannot hold the caller (it only holds this thread).
-    // let (sender, receiver) = mpsc::channel();
-    // std::thread::spawn(move || {
-    //     let mut mut_text: Vec<u8> = Vec::new();
-    //     if let Some(mut mut_pipe) = pipe {
-    //         drop(mut_pipe.read_to_end(&mut mut_text));
-    //     }
-    //     drop(sender.send(mut_text)); // the receiver may have given up already
-    // });
-    // receiver
-    // TODO(human): end block 1/9
+    // Only the first MAX_CAPTURE_BYTES are kept; the rest is read and thrown away, because git must never block on a
+    // full pipe and a probe must never hold unbounded memory.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut mut_text: Vec<u8> = Vec::new();
+        if let Some(mut mut_pipe) = pipe {
+            drop(
+                mut_pipe
+                    .by_ref()
+                    .take(MAX_CAPTURE_BYTES)
+                    .read_to_end(&mut mut_text),
+            );
+            drop(std::io::copy(&mut mut_pipe, &mut std::io::sink()));
+        }
+        drop(sender.send(mut_text)); // the receiver may have given up already
+    });
+    receiver
 }
 
 /// Kills `child` and reaps it, so no zombie is left. Returns the exit status when the child had in fact already ended on
 /// its own (a git that finished at the very deadline is not thrown away), and none when the kill is what ended it.
 fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
-    // TODO(human): begin block 2/9
-    // Kill, then wait, so no zombie is left. A child that had already ended on its own keeps its real status (a git that
-    // finished at the very deadline is not thrown away); one the kill ended has no exit code and gives none.
-    // drop(child.kill());
-    // child.wait().ok().filter(|status| status.code().is_some())
-    // TODO(human): end block 2/9
+    drop(child.kill());
+    child.wait().ok().filter(|status| status.code().is_some())
 }
 
 /// Waits for `child` to exit, polling, for at most `deadline`. On the deadline or on a failed wait the child is killed and
 /// reaped, so every path leaves neither a running process nor a zombie.
 fn wait_for_exit(child: &mut Child, deadline: Duration) -> Result<ExitStatus> {
-    // TODO(human): begin block 3/9
-    // Poll until the child exits or the deadline passes. The deadline and a failed wait both go through kill_and_reap, so
-    // every path leaves neither a running process nor a zombie.
-    // let started: Instant = Instant::now();
-    // loop {
-    //     match child.try_wait() {
-    //         Ok(Some(status)) => return Ok(status),
-    //         Ok(None) if started.elapsed() < deadline => std::thread::sleep(DEADLINE_POLL),
-    //         Ok(None) => {
-    //             return kill_and_reap(child)
-    //                 .ok_or_else(|| anyhow!("did not finish within {deadline:?}, killed"));
-    //         }
-    //         Err(wait_error) => {
-    //             let _status_of_a_failed_wait: Option<ExitStatus> = kill_and_reap(child); // nothing to report: the wait itself failed
-    //             return Err(wait_error).context("wait for git");
-    //         }
-    //     }
-    // }
-    // TODO(human): end block 3/9
+    let started: Instant = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() < deadline => std::thread::sleep(DEADLINE_POLL),
+            Ok(None) => {
+                return kill_and_reap(child)
+                    .ok_or_else(|| anyhow!("did not finish within {deadline:?}, killed"));
+            }
+            Err(wait_error) => {
+                kill_and_reap(child); // the wait itself failed, so there is no status to report
+                return Err(wait_error).context("wait for git");
+            }
+        }
+    }
 }
 
 /// What a pipe reader sent, waiting at most `remaining` (and never less than `COLLECT_GRACE`, for output that is already
 /// on its way): a descendant that keeps the pipe open after git exited gives an empty text, not a hang.
 fn collect(reader: &Receiver<Vec<u8>>, remaining: Duration) -> String {
-    // TODO(human): begin block 4/9
-    // Wait for the reader no longer than what is left of the deadline, and never less than COLLECT_GRACE, so output already
-    // on its way is kept and a lingering descendant gives an empty text instead of a hang.
-    // let patience: Duration = remaining.max(COLLECT_GRACE);
-    // String::from_utf8_lossy(&reader.recv_timeout(patience).unwrap_or_default()).into_owned()
-    // TODO(human): end block 4/9
+    let patience: Duration = remaining.max(COLLECT_GRACE);
+    String::from_utf8_lossy(&reader.recv_timeout(patience).unwrap_or_default()).into_owned()
 }
 
 /// The remote's default branch, or `SYNC_FALLBACK_BRANCH` when the remote is empty. Run from any directory: it asks
@@ -1208,6 +1197,56 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(SLOW_SSH_SLEEP_SECS - 1),
             "the caller got control back at the deadline, not when the lingering process ended"
+        );
+    }
+    #[test]
+    fn a_run_with_a_deadline_captures_stderr_too() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = GitRunner::new(temp_dir.path(), "ssh")
+            .run_with_deadline(
+                &["-c", "alias.complain=!echo oops >&2", "complain"],
+                Duration::from_secs(GENEROUS_DEADLINE_SECS),
+            )
+            .unwrap();
+        assert!(output.stderr.contains("oops"), "{}", output.stderr);
+    }
+
+    #[test]
+    fn a_run_with_a_deadline_waits_for_late_output_while_time_is_left() {
+        // git exits at once; a background shell keeps the pipe and writes one second later, well inside the deadline.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = GitRunner::new(temp_dir.path(), "ssh")
+            .run_with_deadline(
+                &[
+                    "-c",
+                    "alias.later=!(sleep 1; echo late) & echo now",
+                    "later",
+                ],
+                Duration::from_secs(GENEROUS_DEADLINE_SECS),
+            )
+            .unwrap();
+        assert!(output.stdout.contains("late"), "{}", output.stdout);
+    }
+
+    /// Past this much output a reader keeps draining but stops keeping: git must never block on a full pipe, and the
+    /// probe must never hold unbounded memory.
+    const OVER_THE_CAP_BYTES: usize = MAX_CAPTURE_BYTES as usize + 500_000;
+
+    #[test]
+    fn a_run_with_a_deadline_keeps_at_most_the_capture_cap_of_output() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let big_alias: String =
+            format!("alias.huge=!head -c {OVER_THE_CAP_BYTES} /dev/zero | tr '\\0' x");
+        let output = GitRunner::new(temp_dir.path(), "ssh")
+            .run_with_deadline(
+                &["-c", &big_alias, "huge"],
+                Duration::from_secs(GENEROUS_DEADLINE_SECS),
+            )
+            .unwrap();
+        assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES as usize);
+        assert!(
+            output.exit_ok,
+            "the reader kept draining past the cap, so git never saw a closed pipe"
         );
     }
 }
