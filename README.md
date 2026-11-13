@@ -177,6 +177,19 @@ So each sync turns every lesson into one JSON line (`<domain>.jsonl`) and commit
 
 What pays off is syncing often (`update = "live"`, once background sync is built; until then run `lessons sync` often): the less each machine changes between syncs, the smaller each commit, the sooner a lesson shows up on your other machines, and the rarer a real conflict, which only happens when two machines change the same field of the same lesson differently.
 
+**Why not CSV, or a `sqlite3` dump?** Because neither is loadable *and* mergeable, and the file has to be both:
+
+| Format | `sqlite3` can load it | One lesson per line | Named fields, so a per-field merge |
+| --- | --- | --- | --- |
+| `<domain>.jsonl` (ours) | no, `lessons sync` rebuilds the database from it | yes | yes |
+| `sqlite3 db .dump` (SQL) | yes, it is SQL | yes | no: `INSERT INTO lesson VALUES (...)` is positional, so one added column silently misplaces every old line, and one lesson is still one line, so two machines editing different fields of it conflict |
+| `.mode json` (one array) | no, `sqlite3` has no JSON importer | no: the whole file is one line, so any change rewrites it | no |
+| CSV (`.import`) | yes, CSV or ASCII only, never JSON (checked on 3.51.2) | only until a field holds a newline, which quoted log text in `problem` does | no: `.import` cannot spell NULL, so `None` and `''` collapse and a machine manufactures a change and a conflict |
+
+A CSV import also does not produce a database `lessons` will use: `.import` creates a table of TEXT columns with no search index, no triggers and `user_version = 0`, so the schema rebuild refuses it. The supported restore is `lessons sync`, which rebuilds schema, index and triggers from the code and fills them from the JSON lines.
+
+CSV is still a fine place to *export* to, for a human with a spreadsheet; that belongs in an `export` command, not in the stored format. Today one `jq` gets you there: `jq -r '[.id,.title,.problem] | @csv' shared.jsonl`.
+
 ### Why a git repo, and not a gist or a cloud drive?
 
 Because only a regular git repo takes pushes from all your accounts and gives `lessons sync` a shared history to merge against. A cloud drive does not merge; a gist is owner-only.
