@@ -258,8 +258,6 @@ fn anonymous_probe_env() -> Vec<(String, String)> {
     let low_speed_time: String = PROBE_TIMEOUT_SECS.to_string();
     let own_env: Vec<(&str, &str)> = vec![
         ("GIT_ASKPASS", ""),
-        // Older git ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
-        ("XDG_CONFIG_HOME", "/dev/null"),
         ("HOME", "/dev/null"),
         ("GIT_HTTP_LOW_SPEED_LIMIT", &low_speed_limit),
         ("GIT_HTTP_LOW_SPEED_TIME", &low_speed_time),
@@ -280,6 +278,8 @@ fn isolated_git_config_env() -> Vec<(String, String)> {
     [
         ("GIT_CONFIG_GLOBAL", "/dev/null"),
         ("GIT_CONFIG_NOSYSTEM", "1"),
+        // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
+        ("XDG_CONFIG_HOME", "/dev/null"),
     ]
     .map(|(name, value)| (name.to_string(), value.to_string()))
     .to_vec()
@@ -1163,6 +1163,8 @@ mod tests {
         // set: ssh needs it for known_hosts.
         assert_eq!(env_value(&command, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
         assert_eq!(env_value(&command, "GIT_CONFIG_NOSYSTEM"), Some("1"));
+        // Git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the XDG file instead.
+        assert_eq!(env_value(&command, "XDG_CONFIG_HOME"), Some("/dev/null"));
         assert_eq!(env_value(&command, "HOME"), None);
         assert_eq!(
             command.env_remove,
