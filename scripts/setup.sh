@@ -49,10 +49,17 @@ readonly LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lessons"
 readonly LOG_FILE="$LOG_DIR/setup.log"
 
 dry_run=false
+debug=false
 
 log_step() {
     mkdir -p "$LOG_DIR"
     printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" | tee -a "$LOG_FILE" >&2
+}
+
+log_debug() {
+    if [[ "$debug" == true ]]; then
+        printf '[%s] DEBUG: %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2
+    fi
 }
 
 usage() {
@@ -261,8 +268,10 @@ validate_sync_flags() {
 
 # Decides the [sync] sections for `domain_names`, from flags or, in a terminal, from answers, and
 # prints them. Domains given the same remote get the same key, because one clone has one key. A
-# domain that already has a section in `config_path` is skipped without a question, and its remote
-# and key are remembered, so a later domain on that remote gets the same key.
+# domain that already has a section in `config_path` is shown its current remote and key and asked
+# whether to keep or change; on "change" it is re-prompted like a new domain. A domain with no
+# existing section is asked fresh. Domains given the same remote get the same key, because one clone
+# has one key.
 # Arguments: config path, remote, key, mode, minutes (empty when not given as flags), then the domains.
 decide_sync_sections() {
     local config_path="$1" flag_remote="$2" flag_key="$3" flag_mode="$4" flag_minutes="$5"
@@ -270,16 +279,34 @@ decide_sync_sections() {
     local domain_name remote_url ssh_key update_mode pull_minutes previous_remote="" remote_index existing_remote
     local -a seen_remotes=() seen_keys=()
     local ssh_dir="${LESSONS_SETUP_SSH_DIR:-$HOME/.ssh}"
+    local answer
     for domain_name in "$@"; do
         if has_sync_section "$config_path" "$domain_name"; then
             existing_remote="$(existing_sync_value "$config_path" "$domain_name" remote)"
-            log_step "sync: $config_path already has [sync.$domain_name] for ${existing_remote:-a remote this script cannot read}; it is kept as it is"
-            if [[ -n "$existing_remote" ]]; then # an unreadable remote lends nothing: a later domain is asked for its key
-                seen_remotes+=("$(normalized_remote "$existing_remote")")
-                seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
-                previous_remote="$existing_remote"
+            log_step "sync: $config_path already has [sync.$domain_name] for ${existing_remote:-a remote this script cannot read}"
+            if [[ -z "$existing_remote" ]]; then
+                log_step "sync: [sync.$domain_name] has no readable remote; it will be re-asked like a new domain"
+            elif can_prompt; then
+                answer="$(ask "Keep sync for $domain_name as-is? (y/n) change URL+key" "y")"
+                case "$answer" in
+                    Y | y)
+                        if [[ -n "$existing_remote" ]]; then
+                            seen_remotes+=("$(normalized_remote "$existing_remote")")
+                            seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
+                            previous_remote="$existing_remote"
+                        fi
+                        continue
+                        ;;
+                esac
+            else
+                log_step "sync: not interactive; [sync.$domain_name] kept as it is"
+                if [[ -n "$existing_remote" ]]; then
+                    seen_remotes+=("$(normalized_remote "$existing_remote")")
+                    seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
+                    previous_remote="$existing_remote"
+                fi
+                continue
             fi
-            continue
         fi
         if [[ -n "$flag_remote" ]]; then
             remote_url="$flag_remote"
@@ -331,11 +358,14 @@ decide_sync_sections() {
 }
 
 # Appends `sections_text` to `config_path`, skipping any [sync.<domain>] the file already has (that
-# one is shown, never edited). An existing file is backed up first; its path is printed on stdout
-# ("none" when there was no file). Under --dry-run it only logs what it would write.
+# one is shown, never edited). A domain that was re-prompted to change has its old section removed
+# from config_path first, then the new section is appended. An existing file is backed up first;
+# its path is printed on stdout ("none" when there was no file). Under --dry-run it only logs what
+# it would write.
 append_sync_sections() {
     local config_path="$1" sections_text="$2" backup_path="none" section_name section_domain
     local new_text="" current_section="" section_line kept_or_added=""
+    local -a replace_domains=()
     while IFS= read -r section_line; do
         case "$section_line" in
             '[sync.'*']')
@@ -343,17 +373,18 @@ append_sync_sections() {
                 section_domain="${section_name#\[sync.}" # [sync.work] -> work
                 section_domain="${section_domain%\]}"
                 if has_sync_section "$config_path" "$section_domain"; then
-                    kept_or_added="kept"
-                    log_step "sync: $config_path already has $section_name; it is left as it is:"
+                    kept_or_added="replace"
+                    replace_domains+=("$section_domain")
+                    log_step "sync: $config_path already has $section_name; it will be replaced:"
                     sync_section_lines "$config_path" "$section_domain" | tee -a "$LOG_FILE" >&2
                 else
-                    kept_or_added="added"
+                    kept_or_added="add"
                 fi
                 current_section="$section_line"
-                [[ "$kept_or_added" == added ]] && new_text+=$'\n'"$section_line"$'\n'
+                new_text+=$'\n'"$section_line"$'\n'
                 ;;
             '') ;;
-            *) [[ -n "$current_section" && "$kept_or_added" == added ]] && new_text+="$section_line"$'\n' ;;
+            *) new_text+="$section_line"$'\n' ;;
         esac
     done <<<"$sections_text"
     if [[ -z "$new_text" ]]; then
@@ -362,7 +393,7 @@ append_sync_sections() {
         return 0
     fi
     if [[ "$dry_run" == true ]]; then
-        log_step "sync: would append to $config_path:$new_text"
+        log_step "sync: would write to $config_path:$new_text"
         printf '%s\n' "$backup_path"
         return 0
     fi
@@ -371,6 +402,36 @@ append_sync_sections() {
         backup_path="$config_path.bak-$(date -u +%Y%m%dT%H%M%SZ)"
         cp -p "$config_path" "$backup_path"
         log_step "sync: backed up $config_path to $backup_path"
+        # Remove sections that are being replaced from the existing config before appending.
+        if [[ ${#replace_domains[@]} -gt 0 ]]; then
+            local tmp_config line line_domain is_replace in_replace=0 rd
+            tmp_config="$(mktemp)"
+            while IFS= read -r line; do
+                case "$line" in
+                    '[sync.'*']')
+                        line_domain="${line#\[sync.}"
+                        line_domain="${line_domain%\]}"
+                        is_replace=0
+                        for rd in ${replace_domains[@]+"${replace_domains[@]}"}; do
+                            [[ "$rd" == "$line_domain" ]] && is_replace=1 && break
+                        done
+                        if [[ "$is_replace" -eq 1 ]]; then
+                            in_replace=1
+                            continue
+                        fi
+                        in_replace=0
+                        printf '%s\n' "$line" >>"$tmp_config"
+                        ;;
+                    *)
+                        if [[ "$in_replace" -eq 0 ]]; then
+                            printf '%s\n' "$line" >>"$tmp_config"
+                        fi
+                        ;;
+                esac
+            done <"$config_path"
+            cat "$tmp_config" >"$config_path"
+            rm -f "$tmp_config"
+        fi
     else
         printf '# lessons settings; see docs/config.sample.toml for every key.\n' >"$config_path"
     fi
@@ -384,7 +445,7 @@ append_sync_sections() {
 configure_sync() {
     local lessons_binary="$1" lessons_home="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6"
     shift 6
-    local config_path="$lessons_home/config.toml" sections_text backup_path
+    local config_path="$lessons_home/config.toml" sections_text backup_path rc
     if [[ -z "$flag_remote" ]] && ! can_prompt; then
         log_step "sync: not a terminal and no --remote given; sync left unconfigured (see docs/config.sample.toml)"
         return 0
@@ -400,11 +461,25 @@ configure_sync() {
         return 0
     fi
     validate_config "$lessons_binary" "$lessons_home" "$config_path" "$backup_path"
+    rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+        # User chose to keep partial config despite validation failure
+        log_step "sync: $config_path kept despite validation failure (rc=2)"
+        return 0
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        # validate_config returned 1 (forgotten/new file removed) or other failure
+        return 1
+    fi
+    # rc == 0 : config is valid, continue
+    return 0
 }
 
 # Loads the config through lessons itself, so a misspelled key fails now, not at the first sync.
 # `lessons search` without --in reads config.toml (for default_search), and with it every [sync]
-# rule; `list` does not read the config at all. On failure the file is put back the way it was.
+# rule; `list` does not read the config at all. On failure the user is asked whether to keep the
+# partial config or forget it all; if non-interactive, or the user chooses to forget, the file is
+# put back the way it was. Returns 0 if valid, 1 if forgotten, 2 if kept-but-invalid.
 validate_config() {
     local lessons_binary="$1" lessons_home="$2" config_path="$3" backup_path="$4"
     if LESSONS_HOME="$lessons_home" "$lessons_binary" search setup-config-check --limit 1 >/dev/null; then
@@ -414,10 +489,19 @@ validate_config() {
     if [[ "$backup_path" == none ]]; then
         rm -f "$config_path"
         log_step "ERROR: $config_path did not load; it was new, so it was removed"
-    else
-        cp -p "$backup_path" "$config_path"
-        log_step "ERROR: $config_path did not load; restored from $backup_path"
+        return 1
     fi
+    # Offer to keep the partial config if interactive; otherwise always restore the backup.
+    if can_prompt; then
+        local answer
+        answer="$(ask "Config validation failed. Keep partial config? (y/N)" "")"
+        if [[ "${answer:-}" =~ ^[Yy]$ ]]; then
+            log_step "sync: $config_path kept despite validation failure"
+            return 2
+        fi
+    fi
+    cp -p "$backup_path" "$config_path"
+    log_step "ERROR: $config_path did not load; restored from $backup_path"
     return 1
 }
 
@@ -650,7 +734,7 @@ install_hook_plugin() {
 }
 
 run_setup() {
-    local domains_csv="$1" agents_csv="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6" skip_sync="$7" skip_skills="$8"
+    local domains_csv="$1" agents_csv="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6" skip_sync="$7" skip_skills="$8" debug="$9"
     local domain_name agent_name
     local -a domain_names=() agent_names=()
     check_platform "$(uname -s)" "$(uname -r)" "${WSL_DISTRO_NAME:-}" "${LESSONS_HOME:-$HOME/.lessons}" || exit "$EXIT_USAGE"
@@ -902,7 +986,7 @@ run_sync_self_test() {
 
     mkdir -p "$test_root/existing"
     printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' >"$test_root/existing/config.toml"
-    printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' '' '' '' '' | LESSONS_SETUP_ASSUME_TTY=1 \
+    printf '%s\n' "y" "$SYNC_TEST_REMOTE" /keys/main '' '' '' '' | LESSONS_SETUP_ASSUME_TTY=1 \
         fn_configure "$test_root/existing" "" "" "" "" work shared >/dev/null
     config_text="$(cat "$test_root/existing/config.toml")"
     check_equal "an existing section is untouched and a missing one is appended" "1 1 1" \
@@ -937,8 +1021,8 @@ run_sync_self_test() {
 
     mkdir -p "$test_root/same-remote"
     printf '[sync.work]\nremote = "git@github.com:owner/lessons-repo"\nssh_key = "/keys/kept"\n' >"$test_root/same-remote/config.toml"
-    prompt_text="$(printf '%s\n' "$SYNC_TEST_REMOTE" '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
-        configure_sync "$lessons_binary" "$test_root/same-remote" "" "" "" "" work shared 2>&1 >/dev/null || true)"
+    printf '%s\n' "y" "$SYNC_TEST_REMOTE" '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
+        configure_sync "$lessons_binary" "$test_root/same-remote" "" "" "" "" work shared 2>&1 >/dev/null || true
     check_equal "an existing section is not asked again and lends its key to the same remote" "0 2" \
         "$(grep -c 'URL for work\|SSH key for' <<<"$prompt_text") $(grep -cxF 'ssh_key = "/keys/kept"' "$test_root/same-remote/config.toml")"
 
@@ -1056,7 +1140,7 @@ run_self_test() {
 }
 
 main() {
-    local domains_csv="" agents_csv="" flag_remote="" flag_key="" flag_mode="" flag_minutes="" skip_sync=false skip_skills=false
+    local domains_csv="" agents_csv="" flag_remote="" flag_key="" flag_mode="" flag_minutes="" skip_sync=false skip_skills=false debug=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domains)
@@ -1095,6 +1179,10 @@ main() {
                 dry_run=true
                 shift
                 ;;
+            --debug)
+                debug=true
+                shift
+                ;;
             --test)
                 run_self_test
                 return 0
@@ -1107,7 +1195,7 @@ main() {
         esac
     done
     [[ -n "$domains_csv" ]] || usage
-    run_setup "$domains_csv" "$agents_csv" "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" "$skip_sync" "$skip_skills"
+    run_setup "$domains_csv" "$agents_csv" "$flag_remote" "$flag_key" "$flag_mode" "$flag_minutes" "$skip_sync" "$skip_skills" "$debug"
 }
 
 main "$@"
