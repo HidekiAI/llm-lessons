@@ -67,7 +67,7 @@ usage() {
     exit "$EXIT_USAGE"
 }
 
-# --- Sync configuration (plan step S1b) -------------------------------------------------------
+# --- Sync configuration -----------------------------------------------------------------------
 
 # True when the script may ask questions: stdin is a terminal. --test sets LESSONS_SETUP_ASSUME_TTY=1
 # to drive the questions with piped answers.
@@ -280,6 +280,7 @@ decide_sync_sections() {
     local -a seen_remotes=() seen_keys=()
     local ssh_dir="${LESSONS_SETUP_SSH_DIR:-$HOME/.ssh}"
     local answer
+    log_debug "decide_sync_sections: config_path='$config_path' flags remote='$flag_remote' key='$flag_key' domains=$*"
     for domain_name in "$@"; do
         if has_sync_section "$config_path" "$domain_name"; then
             existing_remote="$(existing_sync_value "$config_path" "$domain_name" remote)"
@@ -446,6 +447,7 @@ configure_sync() {
     local lessons_binary="$1" lessons_home="$2" flag_remote="$3" flag_key="$4" flag_mode="$5" flag_minutes="$6"
     shift 6
     local config_path="$lessons_home/config.toml" sections_text backup_path rc
+    log_debug "configure_sync: flags remote='$flag_remote' key='$flag_key' mode='$flag_mode' minutes='$flag_minutes' domains=$*"
     if [[ -z "$flag_remote" ]] && ! can_prompt; then
         log_step "sync: not a terminal and no --remote given; sync left unconfigured (see docs/config.sample.toml)"
         return 0
@@ -456,7 +458,9 @@ configure_sync() {
         log_step "sync: no domain to sync"
         return 0
     fi
+    log_debug "configure_sync: sections_text to append:\n$sections_text"
     backup_path="$(append_sync_sections "$config_path" "$sections_text")" || return 1
+    log_debug "configure_sync: backup_path='$backup_path'"
     if [[ "$dry_run" == true ]]; then
         return 0
     fi
@@ -465,13 +469,16 @@ configure_sync() {
     if [[ "$rc" -eq 2 ]]; then
         # User chose to keep partial config despite validation failure
         log_step "sync: $config_path kept despite validation failure (rc=2)"
+        log_debug "configure_sync: kept partial config rc=2"
         return 0
     fi
     if [[ "$rc" -ne 0 ]]; then
         # validate_config returned 1 (forgotten/new file removed) or other failure
+        log_debug "configure_sync: validation failed rc=$rc"
         return 1
     fi
     # rc == 0 : config is valid, continue
+    log_debug "configure_sync: config valid rc=0"
     return 0
 }
 
@@ -484,11 +491,13 @@ validate_config() {
     local lessons_binary="$1" lessons_home="$2" config_path="$3" backup_path="$4"
     if LESSONS_HOME="$lessons_home" "$lessons_binary" search setup-config-check --limit 1 >/dev/null; then
         log_step "sync: $config_path loads"
+        log_debug "validate_config: loaded rc=0"
         return 0
     fi
     if [[ "$backup_path" == none ]]; then
         rm -f "$config_path"
         log_step "ERROR: $config_path did not load; it was new, so it was removed"
+        log_debug "validate_config: forgotten rc=1"
         return 1
     fi
     # Offer to keep the partial config if interactive; otherwise always restore the backup.
@@ -497,11 +506,13 @@ validate_config() {
         answer="$(ask "Config validation failed. Keep partial config? (y/N)" "")"
         if [[ "${answer:-}" =~ ^[Yy]$ ]]; then
             log_step "sync: $config_path kept despite validation failure"
+            log_debug "validate_config: kept-but-invalid rc=2"
             return 2
         fi
     fi
     cp -p "$backup_path" "$config_path"
     log_step "ERROR: $config_path did not load; restored from $backup_path"
+    log_debug "validate_config: restored backup rc=1"
     return 1
 }
 
