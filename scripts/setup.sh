@@ -397,7 +397,7 @@ append_sync_sections() {
         # is read as in sync_section_lines (CR, comment and blanks ignored); a line with a comma or an equals
         # sign, such as an array element, is never a header. awk also keeps a last line with no newline.
         if [[ ${#replace_domains[@]} -gt 0 ]]; then
-            local kept_text replaced_csv
+            local kept_text replaced_csv end_marker='__LESSONS_AWK_DONE__'
             replaced_csv="$(printf '%s,' "${replace_domains[@]}")"
             kept_text="$(
                 awk -v replaced_csv="$replaced_csv" '
@@ -409,12 +409,15 @@ append_sync_sections() {
                     {
                         header = $0
                         sub(/\r$/, "", header); sub(/[ \t]*#.*$/, "", header); sub(/^[ \t]+/, "", header); sub(/[ \t]+$/, "", header)
-                        if (header ~ /^\[[^][,=]+\]$/) skipping = (header in replaced_headers)
+                        if (header ~ /^\[\[?[^][,=]+\]\]?$/) skipping = (header in replaced_headers)
                     }
-                    !skipping { print }' "$config_path"
-                printf x
+                    !skipping { print }' "$config_path" && printf '%s' "$end_marker" # printed only when awk succeeded
             )"
-            printf '%s' "${kept_text%x}" >"$config_path" # the x keeps trailing newlines that $(...) would strip
+            if [[ "$kept_text" != *"$end_marker" ]]; then # awk failed: leave the config as it is rather than truncate it
+                log_step "ERROR: could not remove the replaced sections from $config_path; it was left as it is (backup: $backup_path)"
+                return 1
+            fi
+            printf '%s' "${kept_text%"$end_marker"}" >"$config_path" # the marker keeps trailing newlines that $(...) would strip
         fi
     else
         printf '# lessons settings; see docs/config.sample.toml for every key.\n' >"$config_path"
@@ -1034,6 +1037,16 @@ run_sync_self_test() {
     config_text="$(tr -d '\r' <"$test_root/change-edge/config.toml")"
     check_equal "n on a CRLF header with a comment: old gone, [mcp] kept, last line without newline kept" "1 0 1 1 1 1" \
         "$(grep -cxF 'remote = "git@github.com:owner/new.git"' <<<"$config_text") $(grep -cF 'owner/old.git' <<<"$config_text") $(grep -cE '^[[:space:]]*\[mcp\]' <<<"$config_text") $(grep -cxF 'domains = ["work"]' <<<"$config_text") $(grep -cxF '[hook]' <<<"$config_text") $(grep -cxF 'max_results = 5' <<<"$config_text")"
+
+    mkdir -p "$test_root/no-word" "$test_root/double-bracket"
+    printf '[sync.work]\nremote = "git@github.com:owner/old.git"\nssh_key = "/keys/old"\n' >"$test_root/no-word/config.toml"
+    printf '%s\n' no git@github.com:owner/new.git /keys/new '' '' | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/no-word" "" "" "" "" work >/dev/null
+    check_equal "no (the whole word) changes the section like n" "1" \
+        "$(grep -cxF 'remote = "git@github.com:owner/new.git"' "$test_root/no-word/config.toml")"
+    printf '[sync.work]\nremote = "git@github.com:owner/old.git"\nssh_key = "/keys/old"\n\n[[hook]]\nname = "keepme"\n\n\n' >"$test_root/double-bracket/config.toml"
+    printf '%s\n' n git@github.com:owner/new.git /keys/new '' '' | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/double-bracket" "" "" "" "" work >/dev/null
+    check_equal "a [[table]] ends the replaced section, and trailing blank lines are kept" "1 1 3" \
+        "$(grep -cxF '[[hook]]' "$test_root/double-bracket/config.toml") $(grep -cxF 'name = "keepme"' "$test_root/double-bracket/config.toml") $(grep -c '^$' "$test_root/double-bracket/config.toml")"
 
     mkdir -p "$test_root/yes-word"
     printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' >"$test_root/yes-word/config.toml"
