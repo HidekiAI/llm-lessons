@@ -393,21 +393,28 @@ append_sync_sections() {
         cp -p "$config_path" "$backup_path"
         log_step "sync: backed up $config_path to $backup_path"
         # Remove sections that are being replaced from the existing config before appending. A replaced
-        # section ends at the next table header of ANY kind, so a following [hook] or [mcp] is kept.
+        # section ends at the next table header of ANY kind, so a following [hook] or [mcp] is kept. A header
+        # is read as in sync_section_lines (CR, comment and blanks ignored); a line with a comma or an equals
+        # sign, such as an array element, is never a header. awk also keeps a last line with no newline.
         if [[ ${#replace_domains[@]} -gt 0 ]]; then
-            local kept_text="" config_line replaced_domain skipping=0
-            while IFS= read -r config_line; do
-                case "$config_line" in
-                    '['*']')
-                        skipping=0
-                        for replaced_domain in "${replace_domains[@]}"; do
-                            [[ "$config_line" == "[sync.$replaced_domain]" ]] && skipping=1 && break
-                        done
-                        ;;
-                esac
-                [[ "$skipping" -eq 1 ]] || kept_text+="$config_line"$'\n'
-            done <"$config_path"
-            printf '%s' "$kept_text" >"$config_path"
+            local kept_text replaced_csv
+            replaced_csv="$(printf '%s,' "${replace_domains[@]}")"
+            kept_text="$(
+                awk -v replaced_csv="$replaced_csv" '
+                    BEGIN {
+                        domain_count = split(replaced_csv, replaced_domains, ",")
+                        for (domain_index = 1; domain_index <= domain_count; domain_index++)
+                            if (replaced_domains[domain_index] != "") replaced_headers["[sync." replaced_domains[domain_index] "]"] = 1
+                    }
+                    {
+                        header = $0
+                        sub(/\r$/, "", header); sub(/[ \t]*#.*$/, "", header); sub(/^[ \t]+/, "", header); sub(/[ \t]+$/, "", header)
+                        if (header ~ /^\[[^][,=]+\]$/) skipping = (header in replaced_headers)
+                    }
+                    !skipping { print }' "$config_path"
+                printf x
+            )"
+            printf '%s' "${kept_text%x}" >"$config_path" # the x keeps trailing newlines that $(...) would strip
         fi
     else
         printf '# lessons settings; see docs/config.sample.toml for every key.\n' >"$config_path"
@@ -1020,6 +1027,13 @@ run_sync_self_test() {
     config_text="$(cat "$test_root/change/config.toml")"
     check_equal "n replaces only that section: new remote once, old gone, [mcp] and [sync.shared] kept" "1 0 1 1 1" \
         "$(grep -cxF 'remote = "git@github.com:owner/new.git"' <<<"$config_text") $(grep -cF 'owner/old.git' <<<"$config_text") $(grep -cxF '[mcp]' <<<"$config_text") $(grep -cxF 'remote = "git@github.com:owner/shared-kept.git"' <<<"$config_text") $(grep -cxF '[sync.work]' <<<"$config_text")"
+
+    mkdir -p "$test_root/change-edge"
+    printf '[sync.work] # note\r\nremote = "git@github.com:owner/old.git"\r\nssh_key = "/keys/old"\r\n\r\n  [mcp] # keep me\r\ndomains = ["work"]\r\n[hook]\r\nmax_results = 5' >"$test_root/change-edge/config.toml" # CRLF, comments, an indented header, no final newline
+    printf '%s\n' n git@github.com:owner/new.git /keys/new '' '' | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/change-edge" "" "" "" "" work >/dev/null
+    config_text="$(tr -d '\r' <"$test_root/change-edge/config.toml")"
+    check_equal "n on a CRLF header with a comment: old gone, [mcp] kept, last line without newline kept" "1 0 1 1 1 1" \
+        "$(grep -cxF 'remote = "git@github.com:owner/new.git"' <<<"$config_text") $(grep -cF 'owner/old.git' <<<"$config_text") $(grep -cE '^[[:space:]]*\[mcp\]' <<<"$config_text") $(grep -cxF 'domains = ["work"]' <<<"$config_text") $(grep -cxF '[hook]' <<<"$config_text") $(grep -cxF 'max_results = 5' <<<"$config_text")"
 
     mkdir -p "$test_root/yes-word"
     printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' >"$test_root/yes-word/config.toml"
