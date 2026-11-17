@@ -287,26 +287,19 @@ decide_sync_sections() {
             log_step "sync: $config_path already has [sync.$domain_name] for ${existing_remote:-a remote this script cannot read}"
             if [[ -z "$existing_remote" ]]; then
                 log_step "sync: [sync.$domain_name] has no readable remote; it will be re-asked like a new domain"
-            elif can_prompt; then
-                answer="$(ask "Keep sync for $domain_name as-is? (y/n) change URL+key" "y")"
+            else
+                answer="y" # not interactive: the existing section is kept
+                can_prompt && answer="$(ask "Keep sync for $domain_name as-is? (y = keep, n = change URL and key)" "y")"
                 case "$answer" in
-                    Y | y)
-                        if [[ -n "$existing_remote" ]]; then
-                            seen_remotes+=("$(normalized_remote "$existing_remote")")
-                            seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
-                            previous_remote="$existing_remote"
-                        fi
+                    N | n | [Nn][Oo]) ;; # fall through to the questions below, like a new domain
+                    *) # anything but a no keeps the section, so a typo never edits the config
+                        log_step "sync: [sync.$domain_name] kept as it is"
+                        seen_remotes+=("$(normalized_remote "$existing_remote")")
+                        seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
+                        previous_remote="$existing_remote"
                         continue
                         ;;
                 esac
-            else
-                log_step "sync: not interactive; [sync.$domain_name] kept as it is"
-                if [[ -n "$existing_remote" ]]; then
-                    seen_remotes+=("$(normalized_remote "$existing_remote")")
-                    seen_keys+=("$(existing_sync_value "$config_path" "$domain_name" ssh_key)")
-                    previous_remote="$existing_remote"
-                fi
-                continue
             fi
         fi
         if [[ -n "$flag_remote" ]]; then
@@ -365,7 +358,7 @@ decide_sync_sections() {
 # it would write.
 append_sync_sections() {
     local config_path="$1" sections_text="$2" backup_path="none" section_name section_domain
-    local new_text="" current_section="" section_line kept_or_added=""
+    local new_text="" section_line
     local -a replace_domains=()
     while IFS= read -r section_line; do
         case "$section_line" in
@@ -374,14 +367,10 @@ append_sync_sections() {
                 section_domain="${section_name#\[sync.}" # [sync.work] -> work
                 section_domain="${section_domain%\]}"
                 if has_sync_section "$config_path" "$section_domain"; then
-                    kept_or_added="replace"
                     replace_domains+=("$section_domain")
                     log_step "sync: $config_path already has $section_name; it will be replaced:"
                     sync_section_lines "$config_path" "$section_domain" | tee -a "$LOG_FILE" >&2
-                else
-                    kept_or_added="add"
                 fi
-                current_section="$section_line"
                 new_text+=$'\n'"$section_line"$'\n'
                 ;;
             '') ;;
@@ -403,35 +392,22 @@ append_sync_sections() {
         backup_path="$config_path.bak-$(date -u +%Y%m%dT%H%M%SZ)"
         cp -p "$config_path" "$backup_path"
         log_step "sync: backed up $config_path to $backup_path"
-        # Remove sections that are being replaced from the existing config before appending.
+        # Remove sections that are being replaced from the existing config before appending. A replaced
+        # section ends at the next table header of ANY kind, so a following [hook] or [mcp] is kept.
         if [[ ${#replace_domains[@]} -gt 0 ]]; then
-            local tmp_config line line_domain is_replace in_replace=0 rd
-            tmp_config="$(mktemp)"
-            while IFS= read -r line; do
-                case "$line" in
-                    '[sync.'*']')
-                        line_domain="${line#\[sync.}"
-                        line_domain="${line_domain%\]}"
-                        is_replace=0
-                        for rd in ${replace_domains[@]+"${replace_domains[@]}"}; do
-                            [[ "$rd" == "$line_domain" ]] && is_replace=1 && break
+            local kept_text="" config_line replaced_domain skipping=0
+            while IFS= read -r config_line; do
+                case "$config_line" in
+                    '['*']')
+                        skipping=0
+                        for replaced_domain in "${replace_domains[@]}"; do
+                            [[ "$config_line" == "[sync.$replaced_domain]" ]] && skipping=1 && break
                         done
-                        if [[ "$is_replace" -eq 1 ]]; then
-                            in_replace=1
-                            continue
-                        fi
-                        in_replace=0
-                        printf '%s\n' "$line" >>"$tmp_config"
-                        ;;
-                    *)
-                        if [[ "$in_replace" -eq 0 ]]; then
-                            printf '%s\n' "$line" >>"$tmp_config"
-                        fi
                         ;;
                 esac
+                [[ "$skipping" -eq 1 ]] || kept_text+="$config_line"$'\n'
             done <"$config_path"
-            cat "$tmp_config" >"$config_path"
-            rm -f "$tmp_config"
+            printf '%s' "$kept_text" >"$config_path"
         fi
     else
         printf '# lessons settings; see docs/config.sample.toml for every key.\n' >"$config_path"
@@ -458,7 +434,7 @@ configure_sync() {
         log_step "sync: no domain to sync"
         return 0
     fi
-    log_debug "configure_sync: sections_text to append:\n$sections_text"
+    log_debug "configure_sync: sections_text to append:"$'\n'"$sections_text"
     backup_path="$(append_sync_sections "$config_path" "$sections_text")" || return 1
     log_debug "configure_sync: backup_path='$backup_path'"
     if [[ "$dry_run" == true ]]; then
@@ -969,7 +945,7 @@ run_skill_self_test() {
 # The sync-configuration checks, run by --test with piped answers in throwaway LESSONS_HOME dirs.
 # Called from run_self_test, whose check_equal and failure count it uses.
 run_sync_self_test() {
-    local test_root lessons_binary="${LESSONS_BIN:-$REPO_ROOT/target/debug/lessons}" config_text prompt_text
+    local test_root lessons_binary="${LESSONS_BIN:-$REPO_ROOT/target/debug/lessons}" config_text prompt_text quiet_text loud_text invalid_dir
     test_root="$(mktemp -d "${TMPDIR:-/tmp}/lessons-setup-test.XXXXXX")"
     # shellcheck disable=SC2064 # expand test_root now: it is local and gone when the trap runs
     trap "rm -rf '$test_root'" RETURN
@@ -1032,10 +1008,43 @@ run_sync_self_test() {
 
     mkdir -p "$test_root/same-remote"
     printf '[sync.work]\nremote = "git@github.com:owner/lessons-repo"\nssh_key = "/keys/kept"\n' >"$test_root/same-remote/config.toml"
-    printf '%s\n' "y" "$SYNC_TEST_REMOTE" '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
-        configure_sync "$lessons_binary" "$test_root/same-remote" "" "" "" "" work shared 2>&1 >/dev/null || true
-    check_equal "an existing section is not asked again and lends its key to the same remote" "0 2" \
-        "$(grep -c 'URL for work\|SSH key for' <<<"$prompt_text") $(grep -cxF 'ssh_key = "/keys/kept"' "$test_root/same-remote/config.toml")"
+    prompt_text="$(printf '%s\n' "y" "$SYNC_TEST_REMOTE" '' '' | LESSONS_SETUP_ASSUME_TTY=1 LESSONS_SETUP_SSH_DIR="$test_root/no-ssh-dir" \
+        configure_sync "$lessons_binary" "$test_root/same-remote" "" "" "" "" work shared 2>&1 >/dev/null || true)"
+    check_equal "an existing section is asked keep-or-change once, and its key is lent to the same remote" "1 0 2" \
+        "$(grep -c 'Keep sync for work' <<<"$prompt_text") $(grep -c 'SSH key for' <<<"$prompt_text") $(grep -cxF 'ssh_key = "/keys/kept"' "$test_root/same-remote/config.toml")"
+
+    mkdir -p "$test_root/change"
+    printf '[sync.work]\nremote = "git@github.com:owner/old.git"\nssh_key = "/keys/old"\n\n[mcp]\ndomains = ["work"]\n\n[sync.shared]\nremote = "git@github.com:owner/shared-kept.git"\nssh_key = "/keys/shared"\n' >"$test_root/change/config.toml"
+    printf '%s\n' n git@github.com:owner/new.git /keys/new '' '' y | LESSONS_SETUP_ASSUME_TTY=1 \
+        fn_configure "$test_root/change" "" "" "" "" work shared >/dev/null
+    config_text="$(cat "$test_root/change/config.toml")"
+    check_equal "n replaces only that section: new remote once, old gone, [mcp] and [sync.shared] kept" "1 0 1 1 1" \
+        "$(grep -cxF 'remote = "git@github.com:owner/new.git"' <<<"$config_text") $(grep -cF 'owner/old.git' <<<"$config_text") $(grep -cxF '[mcp]' <<<"$config_text") $(grep -cxF 'remote = "git@github.com:owner/shared-kept.git"' <<<"$config_text") $(grep -cxF '[sync.work]' <<<"$config_text")"
+
+    mkdir -p "$test_root/yes-word"
+    printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' >"$test_root/yes-word/config.toml"
+    cp "$test_root/yes-word/config.toml" "$test_root/yes-word.before"
+    printf '%s\n' yes | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/yes-word" "" "" "" "" work >/dev/null
+    check_equal "yes (or a typo) keeps the section; only n changes it" "same" \
+        "$(cmp -s "$test_root/yes-word/config.toml" "$test_root/yes-word.before" && echo same || echo changed)"
+
+    mkdir -p "$test_root/invalid-keep" "$test_root/invalid-forget"
+    for invalid_dir in invalid-keep invalid-forget; do
+        printf 'bogus_key = 1\n' >"$test_root/$invalid_dir/config.toml"
+        cp "$test_root/$invalid_dir/config.toml" "$test_root/$invalid_dir.before"
+    done
+    printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' '' y | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/invalid-keep" "" "" "" "" work >/dev/null
+    printf '%s\n' "$SYNC_TEST_REMOTE" /keys/main '' '' n | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/invalid-forget" "" "" "" "" work >/dev/null
+    check_equal "a config that fails validation: y keeps the new section, anything else restores the backup" "1 same" \
+        "$(grep -cxF '[sync.work]' "$test_root/invalid-keep/config.toml") $(cmp -s "$test_root/invalid-forget/config.toml" "$test_root/invalid-forget.before" && echo same || echo changed)"
+
+    debug=false
+    quiet_text="$(log_debug 'hidden' 2>&1)"
+    debug=true
+    loud_text="$(log_debug 'shown' 2>&1)"
+    debug=false
+    check_equal "log_debug prints only under --debug" "0 1" \
+        "$(grep -c . <<<"$quiet_text") $(grep -c 'DEBUG: shown' <<<"$loud_text")"
 
     mkdir -p "$test_root/by-number/ssh"
     touch "$test_root/by-number/ssh/id_first" "$test_root/by-number/ssh/id_first.pub" "$test_root/by-number/ssh/id_second.pub"
