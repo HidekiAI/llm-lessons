@@ -396,6 +396,8 @@ append_sync_sections() {
         # section ends at the next table header of ANY kind, so a following [hook] or [mcp] is kept. A header
         # is read as in sync_section_lines (CR, comment and blanks ignored); a line with a comma or an equals
         # sign, such as an array element, is never a header. awk also keeps a last line with no newline.
+        # Known limit, only for hand-edited files: a bare [x] line inside a multi-line array ends the skip, and
+        # a [sync.<domain>.sub] table is not removed with its parent; a result that does not load is restored.
         if [[ ${#replace_domains[@]} -gt 0 ]]; then
             local kept_text replaced_csv end_marker='__LESSONS_AWK_DONE__'
             replaced_csv="$(printf '%s,' "${replace_domains[@]}")"
@@ -1047,6 +1049,22 @@ run_sync_self_test() {
     printf '%s\n' n git@github.com:owner/new.git /keys/new '' '' | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/double-bracket" "" "" "" "" work >/dev/null
     check_equal "a [[table]] ends the replaced section, and trailing blank lines are kept" "1 1 3" \
         "$(grep -cxF '[[hook]]' "$test_root/double-bracket/config.toml") $(grep -cxF 'name = "keepme"' "$test_root/double-bracket/config.toml") $(grep -c '^$' "$test_root/double-bracket/config.toml")"
+
+    mkdir -p "$test_root/change-crlf"
+    printf '[sync.work]\r\nremote = "git@github.com:owner/old.git"\r\nssh_key = "/keys/old"\r\n[mcp]\r\ndomains = ["work"]\r\n' >"$test_root/change-crlf/config.toml" # a bare CRLF header: only the CR strip can match it
+    printf '%s\n' n git@github.com:owner/new.git /keys/new '' '' | LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/change-crlf" "" "" "" "" work >/dev/null
+    config_text="$(tr -d '\r' <"$test_root/change-crlf/config.toml")"
+    check_equal "n on a bare CRLF header: old section gone, [mcp] kept" "0 1" \
+        "$(grep -cF 'owner/old.git' <<<"$config_text") $(grep -cxF '[mcp]' <<<"$config_text")"
+
+    mkdir -p "$test_root/awk-fails" "$test_root/awk-shim"
+    printf '#!/bin/bash\ncase "$*" in *replaced_csv*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v awk)" >"$test_root/awk-shim/awk" # fails only the removal call
+    chmod +x "$test_root/awk-shim/awk"
+    printf '[sync.work]\nremote = "git@github.com:owner/old.git"\nssh_key = "/keys/old"\n[mcp]\ndomains = ["work"]\n' >"$test_root/awk-fails/config.toml"
+    cp "$test_root/awk-fails/config.toml" "$test_root/awk-fails.before"
+    printf '%s\n' n git@github.com:owner/new.git /keys/new '' '' | PATH="$test_root/awk-shim:$PATH" LESSONS_SETUP_ASSUME_TTY=1 fn_configure "$test_root/awk-fails" "" "" "" "" work >/dev/null
+    check_equal "a failing awk leaves the config as it was, never truncated" "same" \
+        "$(cmp -s "$test_root/awk-fails/config.toml" "$test_root/awk-fails.before" && echo same || echo changed)"
 
     mkdir -p "$test_root/yes-word"
     printf '[sync.work]\nremote = "git@github.com:owner/kept.git"\nssh_key = "/keys/kept"\n' >"$test_root/yes-word/config.toml"
