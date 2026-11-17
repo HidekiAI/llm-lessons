@@ -151,6 +151,8 @@ Without a terminal (a script, CI), pass the answers as flags instead; they apply
 
 After that, run `lessons sync` by hand (running it by itself in the background, as `update` says, is not built yet). `lessons` makes and manages its own clone under `~/.lessons/sync/`.
 
+`<slug>`: the clone for a remote lives at `~/.lessons/sync/<slug>/`, where `<slug>` is the normalized remote encoded byte by byte: letters and digits are kept (lowercased), `-` is kept, and every other byte becomes `_` plus its hex code. Normalization trims the remote, drops http(s) credentials, lowercases the scheme and host but not the path, removes a trailing `/` and `.git`, and rewrites `ssh://user@host/path` without a port in scp form. So `git@github.com:HidekiAI/llm-lessons-dbs.git` clones to `~/.lessons/sync/git_40github_2ecom_3ahidekiai_2fllm-lessons-dbs/`. Domains that share a remote share the clone ("one clone has one key"); domains with different remotes each get their own. An encoded name longer than 200 bytes is cut there and suffixed with `-` and 16 hex digits. `ls ~/.lessons/sync/` lists every clone, and `--verbose` logs `config: [sync.<domain>] -> clone of <remote>` per configured domain, where `<remote>` is that normalized, credential-free clone key.
+
 Prefer an ssh remote. A token written into an https URL is kept in plain text in `~/.lessons/sync/<slug>/.git/config` and shows in the process list while git runs; `lessons` never prints it.
 
 How the merge works:
