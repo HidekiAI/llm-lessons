@@ -23,7 +23,7 @@ pub use run::sync_configured;
 /// Added to `tags` by a combine in `lessons resolve`, so `lessons list --tag needs-reword` finds the lesson.
 pub const NEEDS_REWORD_TAG: &str = "needs-reword";
 
-/// A lesson field merged on its own. `id`, `created_at`, `updated_at` and `hits` are not in it: they have their own
+/// A lesson field merged on its own. `id`, `created_at`, `updated_at`, `hits` and `bypassed` are not in it: they have their own
 /// rules. The serde names are the `field` values in `<domain>.conflicts.jsonl` and match the `Lesson` field names.
 /// The declaration order is the sort order of a queue group's key (`id`, then field), so it decides the order of the
 /// committed `<domain>.conflicts.jsonl`: append new fields at the end and never reorder (a test pins it).
@@ -174,7 +174,7 @@ fn newer_or_larger<'a>(left: &'a Version, right: &'a Version) -> &'a Version {
     std::cmp::max_by(left, right, fn_winner_order) // equal only for identical versions, so the tie side never matters
 }
 
-/// True when the merged fields of the two rows differ; `hits` and `updated_at` are ignored.
+/// True when the merged fields of the two rows differ; `hits`, `bypassed` and `updated_at` are ignored.
 fn fields_differ(left: &Lesson, right: &Lesson) -> bool {
     // Only merged fields count: a hit or a newer timestamp alone is not an edit.
     MERGED_FIELDS
@@ -229,7 +229,7 @@ fn merge_field(
 /// One merged field and the value it settled on.
 type FieldValue = (MergedField, Option<String>);
 
-/// Both sides hold the lesson: every merged field by the three-way rule, `hits` and `updated_at` the larger,
+/// Both sides hold the lesson: every merged field by the three-way rule, `hits`, `bypassed` and `updated_at` the larger,
 /// `created_at` the earlier (all side-independent).
 fn merge_both_present(
     base: Option<&Lesson>,
@@ -239,6 +239,7 @@ fn merge_both_present(
     // Each field merges on its own, so edits to different fields on two machines both survive.
     let row_with_counters = Lesson {
         hits: ours.hits.max(theirs.hits),
+        bypassed: ours.bypassed.max(theirs.bypassed),
         updated_at: ours.updated_at.clone().max(theirs.updated_at.clone()),
         created_at: ours.created_at.clone().min(theirs.created_at.clone()),
         ..ours.clone()
@@ -498,6 +499,9 @@ mod tests {
     const OTHER_ID: &str = "01KBBBBBBBBBBBBBBBBBBBBBBB";
     const FEW_HITS: i64 = 2;
     const MORE_HITS: i64 = 5;
+    // Not equal to the hits counts, so a merge that swapped the two counters would show.
+    const FEW_BYPASSED: i64 = 1;
+    const MORE_BYPASSED: i64 = 4;
 
     /// A lesson every field of which differs from the values the tests set, so no assertion passes on the pre-state.
     fn sample_lesson(lesson_id: &str, updated_at: &str) -> Lesson {
@@ -734,6 +738,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bypassed_takes_the_larger_in_both_orders_and_is_not_summed() {
+        let fn_with_bypassed = |bypassed_count: i64| Lesson {
+            bypassed: bypassed_count,
+            ..sample_lesson(LESSON_ID, EARLY)
+        };
+        let fn_merged_bypassed = |base: &[Lesson], ours: Lesson, theirs: Lesson| -> i64 {
+            merge_lessons(base, &[ours], &[theirs]).merged[0].bypassed
+        };
+        assert_eq!(
+            fn_merged_bypassed(
+                &[],
+                fn_with_bypassed(MORE_BYPASSED),
+                fn_with_bypassed(FEW_BYPASSED)
+            ),
+            MORE_BYPASSED,
+            "ours larger"
+        );
+        assert_eq!(
+            fn_merged_bypassed(
+                &[],
+                fn_with_bypassed(FEW_BYPASSED),
+                fn_with_bypassed(MORE_BYPASSED)
+            ),
+            MORE_BYPASSED,
+            "theirs larger"
+        );
+        // A back-to-back sync merges a lesson that already agrees on every side: the count stays a value.
+        assert_eq!(
+            fn_merged_bypassed(
+                &[fn_with_bypassed(MORE_BYPASSED)],
+                fn_with_bypassed(MORE_BYPASSED),
+                fn_with_bypassed(MORE_BYPASSED)
+            ),
+            MORE_BYPASSED,
+            "all sides equal"
+        );
+    }
+
+    #[test]
+    fn a_lesson_on_one_side_only_keeps_its_bypassed_count() {
+        let counted = Lesson {
+            bypassed: MORE_BYPASSED,
+            ..sample_lesson(LESSON_ID, EARLY)
+        };
+        let fn_only_bypassed = |outcome: MergeOutcome| -> Vec<i64> {
+            outcome.merged.iter().map(|row| row.bypassed).collect()
+        };
+        assert_eq!(
+            fn_only_bypassed(merge_lessons(&[], &[counted.clone()], &[])),
+            vec![MORE_BYPASSED],
+            "only in ours"
+        );
+        assert_eq!(
+            fn_only_bypassed(merge_lessons(&[], &[], &[counted])),
+            vec![MORE_BYPASSED],
+            "only in theirs"
+        );
+    }
+
     /// The old defect: an edit older than (or as old as) an unchanged copy must still win.
     #[test]
     fn an_older_edit_beats_a_newer_unchanged_copy() {
@@ -845,6 +909,11 @@ mod tests {
             updated_at: MIDDLE.to_string(),
             ..base_row.clone()
         };
+        let only_bypassed_bumped = Lesson {
+            bypassed: MORE_BYPASSED,
+            updated_at: MIDDLE.to_string(),
+            ..base_row.clone()
+        };
         let fn_ids = |outcome: MergeOutcome| -> Vec<(String, Option<String>)> {
             outcome
                 .merged
@@ -893,6 +962,15 @@ mod tests {
             fn_ids(merge_lessons(&[base_row.clone()], &[only_hits_bumped], &[])),
             vec![],
             "unchanged ignores hits"
+        );
+        assert_eq!(
+            fn_ids(merge_lessons(
+                &[base_row.clone()],
+                &[only_bypassed_bumped],
+                &[]
+            )),
+            vec![],
+            "unchanged ignores bypassed"
         );
     }
 

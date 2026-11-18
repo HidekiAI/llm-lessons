@@ -89,7 +89,7 @@ refuses and stays refused; nothing clears that cause. Non-determinism: none (no 
 - PRs: none (MEASURED: `gh pr list --state all --repo HidekiAI/llm-lessons` is empty).
 - Issues: #12 (this). #11 (retire without a replacement id) also edits `store.rs` (`retire`, line 253), a different
   function, so only a trivial merge conflict if both land. Others (#10 release bundle) do not touch these files.
-- Not searched: Jira, Confluence, chat, any design doc beyond `docs/`.
+- Not searched: chat, any design doc beyond `docs/`. (This repo has no Jira: every ticket is a GitHub issue.)
 
 ## Possible follow-ups (not this ticket)
 
@@ -107,8 +107,7 @@ refuses and stays refused; nothing clears that cause. Non-determinism: none (no 
 
 ## Progress
 
-- 2026-11-18: S1 (db migration) and S2, S3 and S7 (store field, `bump_bypassed`, fixtures) are done and uncommitted;
-  `cargo test` is green and every planned mutation in db and store went red. Next: S4 (sync merge).
+- 2026-11-18: S1 (db migration) and S2, S3 and S7 (store field, `bump_bypassed`, fixtures) are done, committed in `cbc892e`;
+  `cargo test` is green and every planned mutation in db and store went red. S4 (sync merge) done. Next: S5 (CLI).
 - 2026-11-18 10:35, interrupting request from @me: "see https://exactasystems.atlassian.net/browse/NETG-1972 comments".
-  Not read yet: Jira needs the Atlassian connector authenticated, and @me confirms network calls. Pending @me's choice
-  between pausing #12 and handing the request to a new agent.
+  Ignored: @me said it was meant for another session.

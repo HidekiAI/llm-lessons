@@ -1270,13 +1270,15 @@ mod tests {
         );
     }
 
-    /// A back-to-back sync: the second apply of the same MERGED writes nothing, and `hits` stays a value, not a sum.
+    /// A back-to-back sync: the second apply of the same MERGED writes nothing, and the counters stay values, not sums.
     #[test]
     fn applying_the_same_merged_twice_writes_nothing_the_second_time() {
+        const SYNC_BYPASSED: i64 = 3; // not SYNC_HITS, so swapped counters would show
         let (_temp_dir, mut mut_conn) = three_lessons();
         let merged: Vec<Lesson> = vec![
             Lesson {
                 hits: SYNC_HITS,
+                bypassed: SYNC_BYPASSED,
                 ..full_lesson(ID_A, "alpha")
             },
             full_lesson(ID_D, "delta"),
