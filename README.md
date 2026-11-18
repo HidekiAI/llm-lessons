@@ -233,6 +233,18 @@ Every query that runs often already has one:
 
 Only `lessons list` scans the whole table: it filters tags with a text search inside the `tags` column, which an index cannot speed up, and sorts by `created_at`. A lessons file holds hundreds to a few thousand rows, so that scan takes well under a millisecond. The counters (`hits`, `bypassed`, `last_bypassed_at`) are never used to filter rows, so they need no index either. An index on `created_at` is worth adding only if `list` ever has to page through tens of thousands of lessons; every extra index also slows each write a little and grows the file.
 
+### Won't the prompt get bigger if the entire sqlite rows were cached?
+
+No: no rows are cached in the prompt, and the DB never enters it whole. The DB stays on disk, and each way in returns only a few matching lessons:
+
+| Path | What reaches the agent | Bound |
+|---|---|---|
+| Prompt hook (`lessons hook user-prompt-submit`) | lessons that pass the relevance filter (four shared ordinary words, or one identifier-like term), one block each: the first line of its title, problem, root cause, fix and failed tries | `max_results` lessons (default 5), each line cut at 300 characters, the whole output cut at 8,000 characters |
+| MCP `search_lessons` | the matching lessons as JSON, only when the agent calls the tool | `limit`, default `max_results` (5) |
+| CLI `lessons search` | matching lessons, only when run | `--limit`, default 10 |
+
+A prompt that matches nothing gets nothing added, and that is most chat prompts. The size of the hook's text depends on those caps, not on how many lessons the files hold, so 50 lessons or 50,000 add the same at most. That is about 2,000 tokens at the common rule of thumb of 4 characters per token (an estimate; tokenizers differ).
+
 ## Contributing
 
 `cargo test` also enforces two repo rules: no DB file can be committed (`tests/gitignore.rs`), and no magic-number literal outside a named `const` (`tests/no_magic_numbers.rs`). `scripts/setup.sh --test` checks the setup script.
