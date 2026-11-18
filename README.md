@@ -231,7 +231,7 @@ Every query that runs often already has one:
 | `search` and the prompt hook (`MATCH`, ranked by score) | the FTS5 full-text index `lesson_fts` |
 | the search join back to the lesson row | `seq INTEGER PRIMARY KEY`, the row id itself |
 
-Only `lessons list` scans the whole table: it filters tags with a text search inside the `tags` column, which an index cannot speed up, and sorts by `created_at`. A lessons file holds hundreds to a few thousand rows, so that scan takes well under a millisecond. The counters (`hits`, `bypassed`, `last_bypassed_at`) are never used to filter rows, so they need no index either. An index on `created_at` is worth adding only if `list` ever has to page through tens of thousands of lessons; every extra index also slows each write a little and grows the file.
+Two reads touch every row. The sync export has to, since it writes them all, in the unique index's `id` order. `lessons list` filters tags with a text search inside the `tags` column, which no index can speed up, then sorts by `created_at`. A lessons file holds hundreds to a few thousand short rows, and that scan has not shown up as slow; it has not been measured either. The counters (`hits`, `bypassed`, `last_bypassed_at`) are never used to filter rows, so they need no index. Add an index on `created_at` only if `list` becomes measurably slow: every extra index also slows each write a little and grows the file.
 
 ### Won't the prompt get bigger if the entire sqlite rows were cached?
 
@@ -240,10 +240,10 @@ No: no rows are cached in the prompt, and the DB never enters it whole. The DB s
 | Path | What reaches the agent | Bound |
 |---|---|---|
 | Prompt hook (`lessons hook user-prompt-submit`) | lessons that pass the relevance filter (four shared ordinary words, or one identifier-like term), one block each: the first line of its title, problem, root cause, fix and failed tries | `max_results` lessons (default 5), each line cut at 300 characters, the whole output cut at 8,000 characters |
-| MCP `search_lessons` | the matching lessons as JSON, only when the agent calls the tool | `limit`, default `max_results` (5) |
-| CLI `lessons search` | matching lessons, only when run | `--limit`, default 10 |
+| MCP `search_lessons` | the matching lessons as JSON, every field in full, only when the agent calls the tool | `limit` lessons, default `max_results` (5); no character cap |
+| CLI `lessons search` | matching lessons, every field in full, only when run | `--limit` lessons, default 10; no character cap |
 
-A prompt that matches nothing gets nothing added, and that is most chat prompts. The size of the hook's text depends on those caps, not on how many lessons the files hold, so 50 lessons or 50,000 add the same at most. That is about 2,000 tokens at the common rule of thumb of 4 characters per token (an estimate; tokenizers differ).
+Only the hook adds text to the prompt on its own, and a prompt that matches nothing gets nothing added (see the prompt hook section for why chat prompts and one-word prompts match nothing). Its size depends on its caps, not on how many lessons the files hold: 50 lessons or 50,000 add at most 8,000 characters, about 2,000 tokens at the common rule of thumb of 4 characters per token (an estimate; tokenizers differ). MCP and the CLI cap the number of lessons, not their length, so a lesson with a long fix returns the whole fix; the agent sees that output only when it asked for it.
 
 ## Contributing
 

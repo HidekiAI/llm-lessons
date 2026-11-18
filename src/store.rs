@@ -44,8 +44,7 @@ pub struct Lesson {
     #[serde(default)]
     // a `.jsonl` line written before this column existed has no key: read it as 0
     pub bypassed: i64,
-    #[serde(default)]
-    // no key before this column existed, and NULL until the first bypassed bump: both read as None
+    // no key before this column existed, and NULL until the first bypassed bump: serde reads both as None
     pub last_bypassed_at: Option<String>,
 }
 

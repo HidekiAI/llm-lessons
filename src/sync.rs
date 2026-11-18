@@ -1024,7 +1024,7 @@ mod tests {
                 &[]
             )),
             vec![],
-            "unchanged ignores bypassed"
+            "unchanged ignores bypassed and last_bypassed_at"
         );
     }
 
