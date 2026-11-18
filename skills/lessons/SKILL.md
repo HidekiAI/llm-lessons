@@ -19,7 +19,8 @@ Use the installed binary (or the `search_lessons` and `record_lesson` MCP tools)
    corrected one.
 5. `lessons bypassed <id>` (alias `lessons remind <id>`) counts that the user had to remind you of a lesson you were
    already given. Run it ONLY when the user asks you to count a reminder and names the lesson id; never on your own
-   guess, and never because you noticed a slip yourself.
+   guess. When you catch your own slip against a lesson you were given, tell the user at once (the lesson id and what
+   slipped) and let them decide whether to count it; they may have missed it.
 
 ## After a problem is solved: record
 
