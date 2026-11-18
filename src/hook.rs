@@ -637,6 +637,7 @@ mod tests {
                 env_versions: None,
                 superseded_by: None,
                 hits: 0,
+                bypassed: 0,
             },
         }
     }

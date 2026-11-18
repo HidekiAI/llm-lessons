@@ -182,7 +182,7 @@ fn switch_to_wal(conn: &Connection) -> rusqlite::Result<String> {
 
 /// Schema migrations, in order: entry N (1-based) moves a file from `user_version` N-1 to N.
 /// Append new entries; never edit one that has shipped, files in the wild already ran it.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
 
 fn migrate(conn: &mut Connection, path: &Path) -> Result<()> {
     // Fast path without any lock: a file already at the latest version needs nothing, and taking
@@ -315,6 +315,11 @@ CREATE TRIGGER lesson_au AFTER UPDATE OF title, context, problem, root_cause, re
     VALUES (new.seq, new.title, new.context, new.problem, new.root_cause, new.resolution,
             new.failed_tries, new.tags);
 END;
+"#;
+
+/// Not an indexed column, so `lesson_au` does not fire on a bump, as for `hits`.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE lesson ADD COLUMN bypassed INTEGER NOT NULL DEFAULT 0;  -- bumped when the user had to remind the agent of this rule
 "#;
 
 #[cfg(test)]
@@ -454,6 +459,32 @@ mod tests {
     }
 
     #[test]
+    fn a_version_1_file_gains_the_bypassed_column_at_zero() {
+        const VERSION_1: i64 = 1;
+        let (_temp_dir, db_path) = temp_db_path();
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let v1_conn: Connection = Connection::open(&db_path).expect("raw open");
+        v1_conn.execute_batch(SCHEMA_V1).expect("schema v1");
+        v1_conn
+            .pragma_update(None, "user_version", VERSION_1)
+            .unwrap();
+        insert_lesson(&v1_conn, "01ID", "written before the bypassed column");
+        drop(v1_conn);
+
+        let conn: Connection = open(&db_path, OpenMode::Existing).expect("migrating open");
+        let schema_version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let bypassed_count: i64 = conn
+            .query_row("SELECT bypassed FROM lesson WHERE id = '01ID'", [], |row| {
+                row.get(0)
+            })
+            .expect("the migration added the column");
+        assert_eq!(schema_version, MIGRATIONS.len() as i64);
+        assert_eq!(bypassed_count, 0);
+    }
+
+    #[test]
     fn a_schema_newer_than_this_binary_is_refused() {
         let (_temp_dir, db_path) = temp_db_path();
         let conn: Connection = open(&db_path, OpenMode::Create).expect("open");
@@ -501,6 +532,10 @@ mod tests {
         };
         assert_eq!(
             fn_changes_made_by("UPDATE lesson SET hits = hits + 1 WHERE id = '01ID'"),
+            1
+        );
+        assert_eq!(
+            fn_changes_made_by("UPDATE lesson SET bypassed = bypassed + 1 WHERE id = '01ID'"),
             1
         );
         assert!(

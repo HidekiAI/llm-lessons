@@ -41,6 +41,9 @@ pub struct Lesson {
     pub env_versions: Option<String>,
     pub superseded_by: Option<String>,
     pub hits: i64,
+    #[serde(default)]
+    // a `.jsonl` line written before this column existed has no key: read it as 0
+    pub bypassed: i64,
 }
 
 /// A lesson together with the file it was found in, which is what `show` and `search` print.
@@ -67,7 +70,7 @@ pub struct NewLesson {
 
 /// Columns every SELECT reads, by name, so `lesson_from_row` never depends on their order.
 const LESSON_SELECT_COLUMNS: &str = "id, created_at, updated_at, title, context, problem, root_cause, \
-     resolution, failed_tries, tags, env_versions, superseded_by, hits";
+     resolution, failed_tries, tags, env_versions, superseded_by, hits, bypassed";
 
 fn lesson_from_row(row: &Row) -> rusqlite::Result<Lesson> {
     Ok(Lesson {
@@ -84,6 +87,7 @@ fn lesson_from_row(row: &Row) -> rusqlite::Result<Lesson> {
         env_versions: row.get("env_versions")?,
         superseded_by: row.get("superseded_by")?,
         hits: row.get("hits")?,
+        bypassed: row.get("bypassed")?,
     })
 }
 
@@ -250,6 +254,22 @@ pub fn bump_hits(conn: &Connection, lesson_id: &str) -> Result<Option<i64>> {
     Ok(new_hits)
 }
 
+/// Adds one to `bypassed` (the user had to remind the agent of this lesson) and returns the new
+/// count, or `None` for an unknown id. Leaves `updated_at` alone, like `bump_hits`. One statement,
+/// so two bumps at once are serialized by SQLite's write lock and neither count is lost; a
+/// read-then-write rewrite would lose one.
+pub fn bump_bypassed(conn: &Connection, lesson_id: &str) -> Result<Option<i64>> {
+    let new_bypassed: Option<i64> = conn
+        .query_row(
+            "UPDATE lesson SET bypassed = bypassed + 1 WHERE id = ?1 RETURNING bypassed",
+            [lesson_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    journal!("bypassed {lesson_id}: bypassed now {new_bypassed:?}");
+    Ok(new_bypassed)
+}
+
 /// Marks `lesson_id` as replaced by `superseded_by_id`, which hides it from search. Returns false
 /// for an unknown id. The caller checks that the replacement exists: it may live in another file.
 pub fn retire(conn: &Connection, lesson_id: &str, superseded_by_id: &str) -> Result<bool> {
@@ -269,13 +289,14 @@ pub fn retire(conn: &Connection, lesson_id: &str, superseded_by_id: &str) -> Res
 fn copy_into(target: &Connection, lesson: &Lesson) -> Result<()> {
     target.execute(
         "INSERT INTO lesson (id, created_at, updated_at, title, context, problem, root_cause, resolution, \
-                             failed_tries, tags, env_versions, superseded_by, hits) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                             failed_tries, tags, env_versions, superseded_by, hits, bypassed) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(id) DO UPDATE SET \
              created_at = excluded.created_at, updated_at = excluded.updated_at, title = excluded.title, \
              context = excluded.context, problem = excluded.problem, root_cause = excluded.root_cause, \
              resolution = excluded.resolution, failed_tries = excluded.failed_tries, tags = excluded.tags, \
-             env_versions = excluded.env_versions, superseded_by = excluded.superseded_by, hits = excluded.hits",
+             env_versions = excluded.env_versions, superseded_by = excluded.superseded_by, hits = excluded.hits, \
+             bypassed = excluded.bypassed",
         rusqlite::params![
             lesson.id,
             lesson.created_at,
@@ -290,6 +311,7 @@ fn copy_into(target: &Connection, lesson: &Lesson) -> Result<()> {
             lesson.env_versions,
             lesson.superseded_by,
             lesson.hits,
+            lesson.bypassed,
         ],
     )?;
     Ok(())
@@ -740,6 +762,7 @@ mod tests {
         };
         assert!(!update(&conn, "01NOSUCHID", &patch).unwrap());
         assert_eq!(bump_hits(&conn, "01NOSUCHID").unwrap(), None);
+        assert_eq!(bump_bypassed(&conn, "01NOSUCHID").unwrap(), None);
         assert!(!retire(&conn, "01NOSUCHID", "01OTHER").unwrap());
     }
 
@@ -755,6 +778,39 @@ mod tests {
         });
         let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
         assert_eq!(stored.updated_at, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn bump_bypassed_counts_up_and_leaves_hits_and_updated_at_alone() {
+        const BUMP_COUNT: i64 = 2; // more than one, so a counter stuck at 1 fails
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        backdate(&conn, &lesson_id);
+        (1..=BUMP_COUNT).for_each(|expected_bypassed| {
+            assert_eq!(
+                bump_bypassed(&conn, &lesson_id).unwrap(),
+                Some(expected_bypassed)
+            );
+        });
+        let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
+        assert_eq!(stored.bypassed, BUMP_COUNT);
+        assert_eq!(stored.hits, 0);
+        assert_eq!(stored.updated_at, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn lesson_json_without_bypassed_reads_zero_and_with_it_round_trips() {
+        const BYPASSED_COUNT: i64 = 3;
+        let pre_column_line: &str = r#"{"id":"01ID","created_at":"2000-01-01T00:00:00Z","updated_at":"2000-01-01T00:00:00Z","title":"t","context":null,"problem":"p","root_cause":null,"resolution":null,"failed_tries":null,"tags":null,"env_versions":null,"superseded_by":null,"hits":1}"#;
+        let old_lesson: Lesson = serde_json::from_str(pre_column_line).expect("pre-column line");
+        assert_eq!(old_lesson.bypassed, 0);
+        let counted = Lesson {
+            bypassed: BYPASSED_COUNT,
+            ..old_lesson
+        };
+        let round_tripped: Lesson =
+            serde_json::from_str(&serde_json::to_string(&counted).unwrap()).unwrap();
+        assert_eq!(round_tripped, counted);
     }
 
     #[test]
@@ -949,6 +1005,7 @@ mod tests {
         let (_temp_dir, mut work_conn, shared_conn) = work_and_shared();
         let lesson_id: String = insert(&work_conn, &minimal_lesson()).unwrap();
         bump_hits(&work_conn, &lesson_id).unwrap();
+        bump_bypassed(&work_conn, &lesson_id).unwrap(); // non-zero, so a copy that drops it differs
         let before_move: Lesson = find_by_id(&work_conn, &lesson_id).unwrap().unwrap();
 
         assert!(move_lesson(&mut work_conn, &shared_conn, &lesson_id).unwrap());
@@ -1099,6 +1156,7 @@ mod tests {
             env_versions: Some("rustc 1.95".to_string()),
             superseded_by: None,
             hits: 0,
+            bypassed: 0,
         }
     }
 

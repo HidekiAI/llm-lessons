@@ -104,3 +104,11 @@ refuses and stays refused; nothing clears that cause. Non-determinism: none (no 
   (ours-only, theirs-only) row with a mutation; (3) the hook mutation changed to "reverse the tie order" and the test
   given several equal-count ties; (4) the `search_all` pool truncation (`hook.rs:30,63`) labelled an accepted limit.
   Also: a T or D tag on every test row and on the docs step, and the all-three-domains migration via `open` labelled MEASURED.
+
+## Progress
+
+- 2026-11-18: S1 (db migration) and S2, S3 and S7 (store field, `bump_bypassed`, fixtures) are done and uncommitted;
+  `cargo test` is green and every planned mutation in db and store went red. Next: S4 (sync merge).
+- 2026-11-18 10:35, interrupting request from @me: "see https://exactasystems.atlassian.net/browse/NETG-1972 comments".
+  Not read yet: Jira needs the Atlassian connector authenticated, and @me confirms network calls. Pending @me's choice
+  between pausing #12 and handing the request to a new agent.

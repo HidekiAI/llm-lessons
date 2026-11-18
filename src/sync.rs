@@ -515,6 +515,7 @@ mod tests {
             env_versions: Some("base env".to_string()),
             superseded_by: None,
             hits: 0,
+            bypassed: 0,
         }
     }
 
