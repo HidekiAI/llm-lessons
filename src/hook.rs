@@ -700,12 +700,26 @@ mod tests {
     #[test]
     fn more_bypassed_ranks_first_and_equal_counts_keep_score_order() {
         // Listed in score order, as search_all returns them; three ties at 0 and two at MORE_REMINDERS.
+        // The tied pair's last_bypassed_at runs opposite to score, so ranking by time would swap them.
+        let fn_last_bypassed_at = |hit: SearchHit, stamp: &str| SearchHit {
+            lesson: crate::store::Lesson {
+                last_bypassed_at: Some(stamp.to_string()),
+                ..hit.lesson
+            },
+            ..hit
+        };
         let fn_candidates = || {
             vec![
                 counted_hit("first", 0, None),
-                counted_hit("second", MORE_REMINDERS, None),
+                fn_last_bypassed_at(
+                    counted_hit("second", MORE_REMINDERS, None),
+                    "2026-01-01T00:00:00Z",
+                ),
                 counted_hit("third", 0, None),
-                counted_hit("fourth", MORE_REMINDERS, None),
+                fn_last_bypassed_at(
+                    counted_hit("fourth", MORE_REMINDERS, None),
+                    "2026-06-01T00:00:00Z",
+                ),
                 counted_hit("fifth", FEW_REMINDERS, None),
                 counted_hit("sixth", 0, None),
             ]

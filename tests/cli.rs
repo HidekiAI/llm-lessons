@@ -371,6 +371,34 @@ fn bypassed_and_its_remind_alias_count_up_and_show_the_count() {
 }
 
 #[test]
+fn show_prints_the_last_bypassed_time_only_once_it_is_set() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_id: String = add_lesson(temp_dir.path(), "work", "t", "x");
+    let fn_show_json = || -> serde_json::Value {
+        let shown_json: String = expect_success(run_lessons(
+            temp_dir.path(),
+            &["show", &lesson_id, "--format", "json"],
+        ));
+        serde_json::from_str(&shown_json).expect("valid JSON")
+    };
+    let fn_show_text =
+        || -> String { expect_success(run_lessons(temp_dir.path(), &["show", &lesson_id])) };
+
+    assert!(!fn_show_text().contains("(last "), "never bumped");
+    assert_eq!(fn_show_json()["last_bypassed_at"], serde_json::Value::Null);
+
+    expect_success(run_lessons(temp_dir.path(), &["bypassed", &lesson_id]));
+    let stamp_json: serde_json::Value = fn_show_json()["last_bypassed_at"].clone();
+    let stamp: &str = stamp_json.as_str().expect("a time once bumped");
+    let shown_text: String = fn_show_text();
+    assert!(
+        shown_text.contains(&format!("1 bypassed (last {stamp})")),
+        "{shown_text}"
+    );
+}
+
+#[test]
 fn hit_and_bypassed_of_an_unknown_id_fail_with_the_same_message() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_all(temp_dir.path());

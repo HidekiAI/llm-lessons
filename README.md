@@ -64,7 +64,7 @@ lessons move <id> --to shared
 lessons sync                                    # --domain shared: only that domain's repo
 ```
 
-`lessons bypassed <id>` counts the times you had to remind an agent of a lesson it was already given ("I already told you ..."). Only you decide: an agent runs it when you ask, never on its own, and no hook bumps it. An agent that catches its own slip against a lesson tells you (the id and what slipped), so you can still count a slip you missed. `show` prints the count next to the hits, and the JSON and MCP output carry it as `bypassed`. A lesson you keep having to remind the agent of is also a hint that the session's context has grown too long and should be compacted or restarted.
+`lessons bypassed <id>` counts the times you had to remind an agent of a lesson it was already given ("I already told you ..."). Only you decide: an agent runs it when you ask, never on its own, and no hook bumps it. An agent that catches its own slip against a lesson tells you (the id and what slipped), so you can still count a slip you missed. `show` prints the count next to the hits, and the JSON and MCP output carry it as `bypassed`. Each bump also records when it happened, as `last_bypassed_at` (UTC); `show` adds `(last <time>)` once a lesson has been bumped, so "10 times, last one 3 months ago" reads differently from "10 times, last one today". A lesson you keep having to remind the agent of is also a hint that the session's context has grown too long and should be compacted or restarted.
 
 `--verbose` (or `LESSONS_LOG=1`) logs each step to stderr. `$LESSONS_HOME/config.toml` is optional:
 

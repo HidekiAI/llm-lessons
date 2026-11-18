@@ -116,7 +116,7 @@ format and `>=` a pre-bump read, never a literal or equality; merge tests use fi
 ## Progress
 
 - 2026-11-18: S1, S2, S3 and S6 (migration V3, the field, the stamp in `bump_bypassed`, fixtures) done; every planned db
-  and store mutation went red. S4 (sync, later-of-two) done. Next: S5 (show text), then the hook rank test.
+  and store mutation went red. S4 (sync) done. S5 (show text), the MCP, CLI and hook rank tests, and S7 (README) done; every mutation red. Next: independent self-review.
 - 2026-11-18 12:29, added by @me mid-task: "can we at least mention on README.md (FAQ part?) about what or why we don't
   need to index the sqlite". Done as its own docs commit on this branch.
 - 2026-11-18 12:36, added by @me mid-task: one more FAQ, "Won't the prompt get bigger if the entire sqlite rows were

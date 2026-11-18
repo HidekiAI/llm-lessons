@@ -551,8 +551,12 @@ fn lesson_as_text(found: &FoundLesson) -> String {
         })
     })
     .collect();
+    let last_bypassed_text: String = lesson
+        .last_bypassed_at
+        .as_deref()
+        .map_or(String::new(), |stamp| format!(" (last {stamp})")); // nothing until the first bump
     format!(
-        "{} [{}] {}\n{field_lines}  {:<LABEL_WIDTH$}{} created, {} updated, {} hits, {} bypassed\n",
+        "{} [{}] {}\n{field_lines}  {:<LABEL_WIDTH$}{} created, {} updated, {} hits, {} bypassed{last_bypassed_text}\n",
         lesson.id,
         found.domain,
         lesson.title,

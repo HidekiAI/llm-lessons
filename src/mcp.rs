@@ -637,6 +637,7 @@ mod tests {
         assert_eq!(hits[0]["id"], recorded["id"]);
         assert_eq!(hits[0]["domain"], "shared");
         assert_eq!(hits[0]["failed_tries"], "retrying the pull");
+        assert_eq!(hits[0]["last_bypassed_at"], Value::Null, "never bumped");
     }
 
     #[test]
@@ -674,6 +675,7 @@ mod tests {
         let hits: Vec<Value> =
             serde_json::from_str(tool_text(&search_replies[0])).expect("search result is JSON");
         assert_eq!(hits[0]["bypassed"], BUMP_COUNT, "{hits:?}");
+        assert!(hits[0]["last_bypassed_at"].is_string(), "{hits:?}");
     }
 
     #[test]
