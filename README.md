@@ -220,6 +220,19 @@ So lessons merges each lesson field by field, against the version both machines 
 
 Everything else is git: lessons only fetches, commits on top of the remote tip, and pushes. It never runs `git merge` or `git pull`.
 
+### Why are there no extra indexes in the SQLite files?
+
+Every query that runs often already has one:
+
+| Query | Index it uses |
+|---|---|
+| `show`, `hit`, `bypassed`, `update`, `retire`, `move`, sync deletes (`WHERE id = ?`) | the unique index SQLite builds for `id TEXT NOT NULL UNIQUE` |
+| sync export (`ORDER BY id`) | the same unique index |
+| `search` and the prompt hook (`MATCH`, ranked by score) | the FTS5 full-text index `lesson_fts` |
+| the search join back to the lesson row | `seq INTEGER PRIMARY KEY`, the row id itself |
+
+Only `lessons list` scans the whole table: it filters tags with a text search inside the `tags` column, which an index cannot speed up, and sorts by `created_at`. A lessons file holds hundreds to a few thousand rows, so that scan takes well under a millisecond. The counters (`hits`, `bypassed`, `last_bypassed_at`) are never used to filter rows, so they need no index either. An index on `created_at` is worth adding only if `list` ever has to page through tens of thousands of lessons; every extra index also slows each write a little and grows the file.
+
 ## Contributing
 
 `cargo test` also enforces two repo rules: no DB file can be committed (`tests/gitignore.rs`), and no magic-number literal outside a named `const` (`tests/no_magic_numbers.rs`). `scripts/setup.sh --test` checks the setup script.
