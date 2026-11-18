@@ -4,6 +4,7 @@
 //! still exits 0, because exit code 2 would block the prompt. Hits go to stdout, which the agent
 //! adds to the conversation as context; no hits means no output at all.
 
+use std::cmp::Reverse;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +66,7 @@ pub fn user_prompt_submit(lessons_home: &Path, hook_stdin: impl Read) -> Result<
             .into_iter()
             .filter(|hit| shared_weight(hit, &prompt_terms) >= MIN_SHARED_WEIGHT)
             .collect();
-            boost_current_repo(
+            order_candidates(
                 candidate_hits,
                 hook_input.cwd.as_deref(),
                 hook_config.max_results,
@@ -158,9 +159,9 @@ fn open_readable_domains(lessons_home: &Path, domains: &[Domain]) -> Vec<(Domain
         .collect()
 }
 
-/// Moves hits whose `context` names the current directory to the front, keeping score order
-/// within each group, then cuts to `max_results`.
-fn boost_current_repo(
+/// Orders the candidates: hits whose `context` names the current directory first, then within each group the
+/// lessons the user most often had to remind the agent of (`bypassed`), then score order; cuts to `max_results`.
+fn order_candidates(
     candidate_hits: Vec<SearchHit>,
     cwd: Option<&Path>,
     max_results: usize,
@@ -174,11 +175,17 @@ fn boost_current_repo(
         }
         (None, _) | (_, None) => false,
     };
-    let (mut mut_boosted, other_hits): (Vec<SearchHit>, Vec<SearchHit>) =
+    let fn_most_bypassed_first = |mut mut_group: Vec<SearchHit>| -> Vec<SearchHit> {
+        mut_group.sort_by_key(|hit| Reverse(hit.lesson.bypassed)); // stable: equal counts keep score order
+        mut_group
+    };
+    let (boosted, other_hits): (Vec<SearchHit>, Vec<SearchHit>) =
         candidate_hits.into_iter().partition(fn_is_current_repo);
-    mut_boosted.extend(other_hits);
-    mut_boosted.truncate(max_results);
-    mut_boosted
+    fn_most_bypassed_first(boosted)
+        .into_iter()
+        .chain(fn_most_bypassed_first(other_hits))
+        .take(max_results)
+        .collect()
 }
 
 /// Compact plain text for the agent: one block per lesson, first lines only, the failed tries kept
@@ -509,6 +516,23 @@ mod tests {
     }
 
     #[test]
+    fn a_bypassed_lesson_that_fails_the_relevance_filter_is_still_not_printed() {
+        const MANY_REMINDERS: i64 = 9;
+        let temp_dir = home_with_everyday_words_in_lessons();
+        open(
+            &Domain::Shared.file_path(temp_dir.path()),
+            OpenMode::Existing,
+        )
+        .unwrap()
+        .execute("UPDATE lesson SET bypassed = ?1", [MANY_REMINDERS])
+        .unwrap();
+        assert_eq!(
+            hook_output(temp_dir.path(), r#"{"prompt":"perl"}"#).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
     fn max_results_caps_the_output() {
         let temp_dir = tempfile::tempdir().unwrap();
         let default_max_results: usize = config::HookConfig::default().max_results;
@@ -640,6 +664,84 @@ mod tests {
                 bypassed: 0,
             },
         }
+    }
+
+    /// Room for every candidate the ordering tests pass, so only the ordering decides what comes back.
+    const NO_CAP: usize = 10;
+    const FEW_REMINDERS: i64 = 1;
+    const MORE_REMINDERS: i64 = 3;
+
+    fn counted_hit(title: &str, bypassed_count: i64, context: Option<&str>) -> SearchHit {
+        let plain_hit: SearchHit = search_hit(title, "unrelated words");
+        SearchHit {
+            lesson: crate::store::Lesson {
+                bypassed: bypassed_count,
+                context: context.map(str::to_string),
+                ..plain_hit.lesson
+            },
+            ..plain_hit
+        }
+    }
+
+    fn ordered_titles(
+        candidate_hits: Vec<SearchHit>,
+        cwd: Option<&Path>,
+        max_results: usize,
+    ) -> Vec<String> {
+        order_candidates(candidate_hits, cwd, max_results)
+            .into_iter()
+            .map(|hit| hit.lesson.title)
+            .collect()
+    }
+
+    #[test]
+    fn more_bypassed_ranks_first_and_equal_counts_keep_score_order() {
+        // Listed in score order, as search_all returns them; three ties at 0 and two at MORE_REMINDERS.
+        let fn_candidates = || {
+            vec![
+                counted_hit("first", 0, None),
+                counted_hit("second", MORE_REMINDERS, None),
+                counted_hit("third", 0, None),
+                counted_hit("fourth", MORE_REMINDERS, None),
+                counted_hit("fifth", FEW_REMINDERS, None),
+                counted_hit("sixth", 0, None),
+            ]
+        };
+        assert_eq!(
+            ordered_titles(fn_candidates(), None, NO_CAP),
+            ["second", "fourth", "fifth", "first", "third", "sixth"]
+        );
+        let most_reminded: &[&str] = &["second", "fourth"];
+        assert_eq!(
+            ordered_titles(fn_candidates(), None, most_reminded.len()),
+            most_reminded,
+            "the cut comes after the ordering"
+        );
+    }
+
+    #[test]
+    fn a_current_repo_lesson_still_beats_a_higher_bypassed_count() {
+        let candidates: Vec<SearchHit> = vec![
+            counted_hit(
+                "often reminded elsewhere",
+                MORE_REMINDERS,
+                Some("other-repo"),
+            ),
+            counted_hit("never reminded here", 0, Some("widget-api")),
+            counted_hit("reminded once here", FEW_REMINDERS, Some("widget-api")),
+        ];
+        assert_eq!(
+            ordered_titles(
+                candidates,
+                Some(Path::new("/home/someone/src/widget-api")),
+                NO_CAP
+            ),
+            [
+                "reminded once here",
+                "never reminded here",
+                "often reminded elsewhere"
+            ]
+        );
     }
 
     /// A hit whose only populated optional field is the one `set_field` fills, so a test sees which field is read.
