@@ -56,10 +56,13 @@ lessons show <id>                               # --format json
 lessons list --tag rust                         # --in, --limit
 lessons update <id> --resolution "..."          # an empty value clears a field
 lessons hit <id>                                # this lesson helped
+lessons bypassed <id>                           # you had to remind the agent of it (alias: remind)
 lessons retire <id> --by <newer-id>             # hide from search
 lessons move <id> --to shared
 lessons sync                                    # --domain shared: only that domain's repo
 ```
+
+`lessons bypassed <id>` counts the times you had to remind an agent of a lesson it was already given ("I already told you ..."). Only you decide: an agent runs it when you ask, never on its own, and no hook bumps it. `show` prints the count next to the hits, and the JSON and MCP output carry it as `bypassed`. A count that keeps climbing in one session is also a hint that its context has grown too long and should be compacted or restarted.
 
 `--verbose` (or `LESSONS_LOG=1`) logs each step to stderr. `$LESSONS_HOME/config.toml` is optional:
 
@@ -96,7 +99,7 @@ claude mcp add --scope user lessons -- lessons mcp
 
 ### Optional: prompt hook
 
-Both agents can search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which the agent adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt. A lesson matches only when it shares at least four ordinary words with the prompt, or one identifier-like term (`not_found_or_no_access`, `src/mcp.rs`, `v1.2.3`), as whole words (no stemming, so `failing` does not match `failed`); so chat prompts and prompts of one ordinary word print nothing. Claude Code runs it from a hook entry (below); opencode runs it from the plugin that `scripts/setup.sh --agents opencode` installs (see Install).
+Both agents can search on every prompt: `lessons hook user-prompt-submit` prints matching lessons, which the agent adds as context, prints nothing when none match, and always exits 0, so it never blocks a prompt. A lesson matches only when it shares at least four ordinary words with the prompt, or one identifier-like term (`not_found_or_no_access`, `src/mcp.rs`, `v1.2.3`), as whole words (no stemming, so `failing` does not match `failed`); so chat prompts and prompts of one ordinary word print nothing. Matching lessons are printed in this order: those whose context names the current directory first, then the ones with the highest `bypassed` count, then by search score; the count only reorders lessons that already match, it never adds one. Claude Code runs it from a hook entry (below); opencode runs it from the plugin that `scripts/setup.sh --agents opencode` installs (see Install).
 
 <details>
 <summary>Hook setup for <code>~/.claude/settings.json</code></summary>

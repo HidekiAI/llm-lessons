@@ -108,6 +108,6 @@ refuses and stays refused; nothing clears that cause. Non-determinism: none (no 
 ## Progress
 
 - 2026-11-18: S1 (db migration) and S2, S3 and S7 (store field, `bump_bypassed`, fixtures) are done, committed in `cbc892e`;
-  `cargo test` is green and every planned mutation in db and store went red. S4 (sync), S5 (CLI) and S6 (hook order; `boost_current_repo` renamed `order_candidates`, @me 2026-11-18) done. Next: S8 (docs).
+  `cargo test` is green and every planned mutation in db and store went red. S4 (sync), S5 (CLI) and S6 (hook order; `boost_current_repo` renamed `order_candidates`, @me 2026-11-18) done. S8 (README, shipped skill) done. Next: independent self-review, then ask @me to push.
 - 2026-11-18 10:35, interrupting request from @me: "see https://exactasystems.atlassian.net/browse/NETG-1972 comments".
   Ignored: @me said it was meant for another session.
