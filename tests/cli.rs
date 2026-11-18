@@ -351,6 +351,43 @@ fn hit_counts_up() {
 }
 
 #[test]
+fn bypassed_and_its_remind_alias_count_up_and_show_the_count() {
+    const BYPASSED_AFTER_TWO_BUMPS: i64 = 2;
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let lesson_id: String = add_lesson(temp_dir.path(), "work", "t", "x");
+    expect_success(run_lessons(temp_dir.path(), &["bypassed", &lesson_id]));
+    let second_bump: String = expect_success(run_lessons(temp_dir.path(), &["remind", &lesson_id]));
+    assert!(second_bump.contains("[work]: 2 bypassed"), "{second_bump}");
+
+    let shown_text: String = expect_success(run_lessons(temp_dir.path(), &["show", &lesson_id]));
+    assert!(shown_text.contains("0 hits, 2 bypassed"), "{shown_text}");
+    let shown_json: String = expect_success(run_lessons(
+        temp_dir.path(),
+        &["show", &lesson_id, "--format", "json"],
+    ));
+    let lesson_json: serde_json::Value = serde_json::from_str(&shown_json).expect("valid JSON");
+    assert_eq!(lesson_json["bypassed"], BYPASSED_AFTER_TWO_BUMPS);
+}
+
+#[test]
+fn hit_and_bypassed_of_an_unknown_id_fail_with_the_same_message() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_all(temp_dir.path());
+    let fn_unknown_id_stderr = |subcommand: &str| -> String {
+        let output: Output = run_lessons(temp_dir.path(), &[subcommand, "01NOSUCHID"]);
+        assert!(!output.status.success(), "{subcommand} must fail");
+        stderr_of(&output)
+    };
+    let hit_stderr: String = fn_unknown_id_stderr("hit");
+    assert!(
+        hit_stderr.contains("no lesson with id 01NOSUCHID"),
+        "{hit_stderr}"
+    );
+    assert_eq!(fn_unknown_id_stderr("bypassed"), hit_stderr);
+}
+
+#[test]
 fn retire_checks_the_replacement_exists_and_is_not_itself() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_all(temp_dir.path());

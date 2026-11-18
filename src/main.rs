@@ -74,6 +74,9 @@ enum Command {
     },
     /// Record that a retrieved lesson actually helped
     Hit { id: String },
+    /// Record that the user had to remind the agent of this lesson: run only when the user asks
+    #[command(visible_alias = "remind")]
+    Bypassed { id: String },
     /// Search lessons by keywords or pasted error text
     Search {
         /// Keywords or pasted error text; may start with `-`, as error text often does
@@ -288,6 +291,7 @@ fn main() -> Result<ExitCode> {
             fn_done(run_update(&fn_lessons_home()?, &id, fields.into_patch()))
         }
         Command::Hit { id } => fn_done(run_hit(&fn_lessons_home()?, &id)),
+        Command::Bypassed { id } => fn_done(run_bypassed(&fn_lessons_home()?, &id)),
         Command::Search {
             text,
             in_domains,
@@ -548,14 +552,15 @@ fn lesson_as_text(found: &FoundLesson) -> String {
     })
     .collect();
     format!(
-        "{} [{}] {}\n{field_lines}  {:<LABEL_WIDTH$}{} created, {} updated, {} hits\n",
+        "{} [{}] {}\n{field_lines}  {:<LABEL_WIDTH$}{} created, {} updated, {} hits, {} bypassed\n",
         lesson.id,
         found.domain,
         lesson.title,
         "recorded",
         lesson.created_at,
         lesson.updated_at,
-        lesson.hits
+        lesson.hits,
+        lesson.bypassed
     )
 }
 
@@ -676,6 +681,20 @@ fn run_hit(lessons_home: &Path, lesson_id: &str) -> Result<()> {
     let new_hits: i64 = store::bump_hits(conn, lesson_id)?
         .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?; // gone between the lookup and the update
     println!("hit {lesson_id} [{}]: {new_hits} hits", domain.as_str());
+    Ok(())
+}
+
+fn run_bypassed(lessons_home: &Path, lesson_id: &str) -> Result<()> {
+    let opened: Vec<(Domain, rusqlite::Connection)> =
+        db::open_existing_domains(lessons_home, &Domain::ALL)?;
+    let (domain, conn): &(Domain, rusqlite::Connection) = store::owner_of(&opened, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?;
+    let new_bypassed: i64 = store::bump_bypassed(conn, lesson_id)?
+        .with_context(|| lesson_not_found(lessons_home, &opened, lesson_id))?; // gone between the lookup and the update
+    println!(
+        "bypassed {lesson_id} [{}]: {new_bypassed} bypassed",
+        domain.as_str()
+    );
     Ok(())
 }
 
