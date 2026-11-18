@@ -24,6 +24,8 @@ cargo install --path .        # puts `lessons` in ~/.cargo/bin
 lessons init                  # creates the DB files (--domain work|personal|shared for one)
 ```
 
+Upgrading: a newer `lessons` may migrate the `.db` files the first time it opens them, and an older `lessons` then refuses them ("newer than this lessons binary supports"). So install the new build at once for everything on that machine that runs `lessons` (the hook, the MCP server, your shell). Upgrade your other machines soon too: an older `lessons` ignores a field it does not know (such as `bypassed`) in synced lessons and writes them back without it, until a newer machine syncs again.
+
 `setup.sh` requires `--domains`, so it never creates a file this machine should not hold. `--dry-run` shows the steps without running them.
 
 For each agent in `--agents` that is installed, `setup.sh` also copies the shipped skill (`skills/lessons/SKILL.md`) into that agent's skills directory: `~/.claude/skills/lessons/` for Claude Code, and `$XDG_CONFIG_HOME/opencode/skills/lessons/` (default `~/.config/opencode/skills/lessons/`) for opencode. It never overwrites an existing `SKILL.md`, and it leaves the skill alone when the skill directory or any directory above it, up to your home directory, is a symlink (a symlink usually points into another repository, such as a dotfiles repo, and a copy would put a file there). A symlink above your home directory is not looked at. `--no-skills` skips the step (and the plugin below). The skill teaches an agent to search the lessons before a task and to record one after a fix, through the `lessons` CLI, so it works without the MCP server too.
@@ -62,7 +64,7 @@ lessons move <id> --to shared
 lessons sync                                    # --domain shared: only that domain's repo
 ```
 
-`lessons bypassed <id>` counts the times you had to remind an agent of a lesson it was already given ("I already told you ..."). Only you decide: an agent runs it when you ask, never on its own, and no hook bumps it. `show` prints the count next to the hits, and the JSON and MCP output carry it as `bypassed`. A count that keeps climbing in one session is also a hint that its context has grown too long and should be compacted or restarted.
+`lessons bypassed <id>` counts the times you had to remind an agent of a lesson it was already given ("I already told you ..."). Only you decide: an agent runs it when you ask, never on its own, and no hook bumps it. `show` prints the count next to the hits, and the JSON and MCP output carry it as `bypassed`. A lesson you keep having to remind the agent of is also a hint that the session's context has grown too long and should be compacted or restarted.
 
 `--verbose` (or `LESSONS_LOG=1`) logs each step to stderr. `$LESSONS_HOME/config.toml` is optional:
 

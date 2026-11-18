@@ -18,8 +18,8 @@ Use the installed binary (or the `search_lessons` and `record_lesson` MCP tools)
 4. If a lesson helped, `lessons hit <id>`. If it proved wrong, `lessons retire <id> --by <new-id>` after adding the
    corrected one.
 5. `lessons bypassed <id>` (alias `lessons remind <id>`) counts that the user had to remind you of a lesson you were
-   already given. Run it ONLY when the user asks you to count a reminder and names the lesson (or confirms the id you
-   found); never on your own guess, and never because you noticed a slip yourself.
+   already given. Run it ONLY when the user asks you to count a reminder and names the lesson id; never on your own
+   guess, and never because you noticed a slip yourself.
 
 ## After a problem is solved: record
 

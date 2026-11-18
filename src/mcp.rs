@@ -640,6 +640,43 @@ mod tests {
     }
 
     #[test]
+    fn search_results_carry_the_bypassed_count() {
+        const BUMP_COUNT: i64 = 2; // more than one, so a count stuck at 1 fails
+        let lessons_home = work_laptop_home();
+        let record_replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[tool_call(
+                "record",
+                "record_lesson",
+                json!({ "domain": "shared", "title": "registry token expired", "problem": "pull_image: not_found_or_no_access" }),
+            )],
+        );
+        let recorded: Value =
+            serde_json::from_str(tool_text(&record_replies[0])).expect("record result is JSON");
+        let lesson_id: &str = recorded["id"].as_str().expect("recorded id");
+        let shared_conn: rusqlite::Connection = db::open(
+            &Domain::Shared.file_path(lessons_home.path()),
+            OpenMode::Existing,
+        )
+        .expect("open shared");
+        (0..BUMP_COUNT).for_each(|_bump| {
+            store::bump_bypassed(&shared_conn, lesson_id).expect("bump");
+        });
+
+        let search_replies: Vec<Value> = exchange(
+            lessons_home.path(),
+            &[tool_call(
+                "search",
+                "search_lessons",
+                json!({ "query": "not_found_or_no_access" }),
+            )],
+        );
+        let hits: Vec<Value> =
+            serde_json::from_str(tool_text(&search_replies[0])).expect("search result is JSON");
+        assert_eq!(hits[0]["bypassed"], BUMP_COUNT, "{hits:?}");
+    }
+
+    #[test]
     fn personal_is_refused_for_search_and_record_and_its_file_is_never_created() {
         let lessons_home = work_laptop_home();
         let replies: Vec<Value> = exchange(

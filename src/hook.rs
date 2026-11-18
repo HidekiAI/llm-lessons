@@ -515,6 +515,8 @@ mod tests {
         );
     }
 
+    /// Guards one mutation: a non-zero `bypassed` letting a lesson past `MIN_SHARED_WEIGHT`. Sorting before or after
+    /// the filter keeps the same members, so the order of the two steps needs no test of its own.
     #[test]
     fn a_bypassed_lesson_that_fails_the_relevance_filter_is_still_not_printed() {
         const MANY_REMINDERS: i64 = 9;
