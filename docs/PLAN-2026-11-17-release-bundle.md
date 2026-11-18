@@ -3,21 +3,28 @@
 TL;DR: a tag `v<Cargo version>` publishes a GitHub pre-release with two zips that are both run as "unzip, run
 `install.sh`". The binary zip (Debian x86_64) carries a prebuilt `bin/lessons`. The source zip is the one GitHub
 attaches to every release, and it builds the binary. `install.sh` installs only the missing apps, then hands off to
-the existing `scripts/setup.sh`. Detail below.
+the existing `scripts/setup.sh`. The release logic (tag check, notes range, pre-release flag) lives in
+`scripts/release-meta.sh` so it has `--test` checks with mutations. Detail below.
 
-Current step: plan gate iteration 2 (paused 2026-11-18)
+Current step: plan gate passed (iteration 3, 91/100); next R1 `scripts/setup.sh`
 
 ## Requirements
 
 From issue #10 (the ticket):
 
-- T1 A version tag (e.g. `v0.1.0`) triggers a build and publishes a GitHub Release with one bundle: the binary, the
-  MCP entrypoint, the skill, the opencode plugin, and the installer.
-- T2 The installer works with no Rust toolchain and no source clone: binary on `PATH`, skill per agent, MCP
-  registered, DB initialized.
-- T3 The installer's `--test` runs the install assertions against the bundle.
-- T4 Release notes list the version and the Conventional Commits since the last tag.
-- T5 Debian 64-bit only; other platforms build from source (`cargo build --release && scripts/setup.sh`).
+Quoted from the live ticket (`gh issue view 10 --repo HidekiAI/llm-lessons`, read 2026-11-18):
+
+- T1 "Pushing a git tag (e.g. `v0.1.0`) triggers a build and publishes a GitHub Release with one bundle artifact (e.g.
+  `lessons-v0.1.0.tar.gz` containing the binary, MCP entrypoint, skill, plugin, and `setup-from-bundle.sh`)."
+- T2 "`setup-from-bundle.sh` installs from the bundle on a machine with no Rust toolchain and no source clone: binary on
+  `PATH`, skill copied per agent, MCP registered, DB initialized."
+- T3 "`setup-from-bundle.sh --test` runs the same assertions as `scripts/test-debian.sh` against the bundle."
+- T4 "Release notes list the version and what changed (Conventional Commits since the last tag)."
+- T5 "The bundle ships a binary for **Debian 64-bit only**. ... If you want it on another target, you build it yourself:
+  `cargo build --release && scripts/setup.sh`."
+
+Test layer: every check below is a shell `--test` (the unit-level layer for shell). The workflow parts (docker, zip,
+`gh release create`) cannot be unit-tested; a `workflow_dispatch` run of the branch exercises them (R4-R6 "Done when").
 
 Decided with @me, 2026-11-17 (folded into #10; @me rewords the ticket):
 
@@ -32,73 +39,137 @@ Decided with @me, 2026-11-17 (folded into #10; @me rewords the ticket):
   via apt (Debian) or Homebrew (macOS), else list what is missing and stop; no `gh` (MEASURED: `grep -rn '"gh"' src`
   finds no call).
 - D6 (@me 17:13) "it is just a zip package which user unzips, runs the install.sh, and it'll install all necessary
-  dependant apps". So both kinds are zips with `install.sh` at the root.
+  dependant apps". So both kinds are zips holding `install.sh`. Holds with one extra step: GitHub's automatic source zip
+  unpacks into a top-level `llm-lessons-<ver>/` (UNVERIFIED, GitHub's documented archive layout), so `install.sh` is not at
+  the zip root. For consistency our binary zip also has one top-level directory, `lessons-v<ver>-linux-x86_64/`. The
+  README steps for both are "unzip, `cd` into the one directory, `bash install.sh`".
 - D7 (@me 17:14) "for Debian, I prefer appImage over brew or other package installation". Asked whether that means
   lessons as an AppImage or the dependencies as AppImages; @me chose neither: keep the zip, no AppImage, apt installs
   only a missing `git` (and the build tools for the source zip).
 - D8 The zip ships `LICENSE` (MIT, MEASURED: `LICENSE:1`). @me 2026-11-17: "add license = "MIT" to Cargo.toml too";
-  done in this branch (`Cargo.toml` `[package]`).
+  done in this branch (`Cargo.toml:5`).
 
-Prerequisites, MEASURED from `Cargo.toml`: `rusqlite` uses `bundled`, so a build needs a C compiler and not OpenSSL.
-`git` is needed only by `lessons sync` (MEASURED: README "Install", line 33).
+Premises, each labelled:
 
-Deviations, stated for the gate: the MCP entrypoint is the binary itself (`lessons mcp`, MEASURED: `src/main.rs:311`),
-so the zip has no separate MCP file. `cargo test` cannot run without the source, so CI runs it before packaging (T3).
-The source zip is GitHub's automatic "Source code (zip)" of the tag; it already holds `install.sh` (UNVERIFIED: that
-GitHub's archive keeps the exec bit; the README says `bash install.sh`, which does not need it).
+- MEASURED: `rusqlite` is `bundled` (`Cargo.toml:12`), so a build needs a C compiler and not OpenSSL.
+- MEASURED: `git` is needed only by `lessons sync` (README line 35).
+- MEASURED: the MCP entrypoint is the binary itself, `lessons mcp` (`src/main.rs:315`), so the zip has no separate MCP file.
+- MEASURED: `REPO_ROOT` is the parent of `scripts/` (`scripts/setup.sh:25`), so in the unpacked zip it is the zip root,
+  and `SKILL_SOURCE` / `PLUGIN_SOURCE` (`setup.sh:32,36`) resolve to the zip's `skills/` and `integrations/`.
+- MEASURED: the toolchain here is `rustc 1.95.0` (`rustc --version`) and `Cargo.toml:6` has `rust-version = "1.89"`, so the
+  build image is pinned `rust:1.95-bookworm`. UNVERIFIED: that this tag exists on Docker Hub (no network call made); R4's
+  first run proves it, else step down to the newest existing `1.NN` at or above 1.89.
+- UNVERIFIED (checked by the smoke job, R5): glibc 2.36 in `rust:1.95-bookworm`, and so that the binary runs on Debian 12
+  and 13. Command to measure: `docker run --rm rust:1.95-bookworm ldd --version`, then run the binary in `debian:bookworm-slim`
+  and `debian:trixie-slim`.
+- MEASURED: nothing else uses `curl` (`grep -rn curl scripts src` is empty), so only the rustup fetch needs it.
+- UNVERIFIED: a fresh `debian:bookworm-slim` has empty apt lists, so `apt-get install` fails without `apt-get update` first.
+- UNVERIFIED: `debian:bookworm-slim` lacks `git`, `cc` and Rust (R5 asserts it before installing: `command -v git` fails).
+- UNVERIFIED: rustup `--profile minimal` is enough for `cargo install --locked --path` (no rustfmt or clippy are needed,
+  and `bundled` needs only `cc`); the source smoke run proves it.
+- UNVERIFIED: `zip` and `unzip` exist in `rust:1.NN-bookworm` and `debian:bookworm-slim`; R4 and R5 run `apt-get install -y zip unzip`
+  first, so it does not matter.
+- UNVERIFIED: GitHub's automatic "Source code (zip)" keeps `install.sh`'s exec bit; the README says `bash install.sh`, which does not need it.
+
+### Why T3 cannot hold word for word
+
+`scripts/test-debian.sh` runs, in a Debian container: `grep PRETTY_NAME /etc/os-release`, `git --version`, `cargo test -q`
+(the whole suite, two tests of which run `git ls-files`). A zip has no source, no `.git` and no Cargo, so `cargo test`
+cannot run against it. Mapping each assertion:
+
+| `test-debian.sh` assertion | In the release flow |
+|---|---|
+| runs on Debian (`os-release`) | smoke job prints `PRETTY_NAME` of `debian:bookworm-slim` and asserts `ID=debian` (R5) |
+| `git --version` works | the smoke job asserts `git --version` after `install.sh` installed it (R5) |
+| `cargo test -q` passes | CI runs `cargo test --locked` in the Debian build image BEFORE packaging (R4); the binary tested is the one built |
+| `git ls-files` tests | stay in `cargo test` in CI (a git checkout there); not reachable from a zip |
+| (new) the bundle itself installs | smoke job: `install.sh`, then `lessons --version`, then `scripts/setup.sh --test` with `LESSONS_BIN=bin/lessons` (R5) |
+
+The ticket's wording is reworded by @me; this plan keeps its intent: every `test-debian.sh` assertion has a home.
 
 ## Steps
 
-| Step | Change | Done when |
-|---|---|---|
-| R1 | `scripts/setup.sh` `run_setup` (line 765): when `$REPO_ROOT/bin/lessons` is executable, `install -m 755` it to `~/.local/bin/lessons` and use that path, skipping the `cargo` check; else `cargo install` as today. `run_sync_self_test` (line 960) defaults `LESSONS_BIN` to `bin/lessons` when it exists | `setup.sh --test` green; new checks go red under their mutations |
-| R2 | `install.sh` (repo root, D5, D6): checks `git`; when `bin/lessons` is absent also `curl` and `cc`. Missing ones: `apt-get install -y git curl ca-certificates build-essential` (with `sudo` unless root) on Debian, `brew install git curl` on macOS; no `cc` on macOS prints `xcode-select --install` and exits 1; other OS lists what is missing and exits 1. No `cargo` and no `bin/lessons`: rustup with `-y --profile minimal`, then `. ~/.cargo/env`. Then `exec scripts/setup.sh "$@"`, whose `cargo install --locked --path` is the release build. `--dry-run` prints and runs nothing; `--test` uses fake tools on `PATH` | `bash install.sh --test` green; each check red under its mutation |
-| R3 | `.github/workflows/release.yml`, build job: pinned `rust:1.NN-bookworm` (glibc 2.36, runs on Debian 12 and 13), tag == `Cargo.toml` version, `cargo test --locked`, `cargo build --release --locked`, zip `lessons-v<ver>-linux-x86_64.zip` holding `install.sh`, `bin/lessons`, `scripts/setup.sh`, `skills/`, `integrations/opencode/lessons-hook.js`, `README.md`, `LICENSE` | `actionlint` if installed, else manual review |
-| R4 | Smoke job: unzip in `debian:bookworm-slim` (no Rust, no git), `bash install.sh --domains shared --no-sync`, then `~/.local/bin/lessons --version` and `scripts/setup.sh --test` | green on a `workflow_dispatch` run of the branch; no test tag is pushed |
-| R5 | Release job, tags only: notes from `git log --format='- %s' <previous tag>..<tag>` (all commits with no previous tag), `gh release create --prerelease` for `0.x`, binary zip attached | the `workflow_dispatch` run prints the notes and skips the release |
-| R6 | README "Install": the two zips, `bash install.sh`, the Debian-only binary, the `~/.local/bin` note | grep finds the section |
+| Step | Change | Serves | Done when |
+|---|---|---|---|
+| R1 | `scripts/setup.sh` `run_setup` (cargo check at line 757, `cargo install` at 765): when `$REPO_ROOT/bin/lessons` is executable, `install -m 755` it to `~/.local/bin/lessons`, set `lessons_binary` to `~/.local/bin/lessons` (today it is derived from `CARGO_INSTALL_ROOT`/`CARGO_HOME`/`~/.cargo`, lines 766-767), warn when `~/.local/bin` is not on `PATH`, and skip the cargo check; else `cargo install` as today. `run_sync_self_test` (line 959; its `lessons_binary` default is line 960) defaults `LESSONS_BIN` to `bin/lessons` when that exists | T2, D1, D2 | `setup.sh --test` green; new checks red under their mutations |
+| R2 | `install.sh` (repo root): checks `git`; when `bin/lessons` is absent also `cc`, and `curl` only when `cargo` is also absent (rustup fetch). Missing ones: `apt-get update` then `apt-get install -y` of the missing ones among `git curl ca-certificates build-essential` (with `sudo` unless root) on Debian, `brew install` of the missing ones on macOS; no `cc` on macOS prints `xcode-select --install` and exits 1; other OS lists what is missing and exits 1. No `cargo` and no `bin/lessons`: rustup with `-y --profile minimal`, then `. ~/.cargo/env`. Then `exec scripts/setup.sh "$@"`. `--test` uses fake tools on `PATH` (the shell test layer for D5's install rules) | T2, T5, D1, D5, D6, D7 | `bash install.sh --test` green; each check red under its mutation |
+| R3 | `scripts/release-meta.sh` with subcommands `check-tag <tag> <Cargo.toml>`, `notes <tag>`, `prerelease <version>`; checks behind `--test` (repo convention, as `scripts/setup.sh --test`) | T1, T4, D3 | `bash scripts/release-meta.sh --test` green; each check red under its mutation |
+| R4 | `.github/workflows/release.yml` build job: pinned `rust:1.95-bookworm`, `apt-get update && apt-get install -y zip` (UNVERIFIED zip is preinstalled), `release-meta.sh check-tag`, `cargo test --locked`, `cargo build --release --locked`, zip `lessons-v<ver>-linux-x86_64.zip` with top-level directory `lessons-v<ver>-linux-x86_64/` holding `install.sh`, `bin/lessons`, `scripts/setup.sh`, `skills/`, `integrations/opencode/lessons-hook.js`, `README.md`, `LICENSE`. A `concurrency` group keyed on the tag, `cancel-in-progress: false`: it only serialises a RE-PUSH of the same tag (distinct tags build independently and never touch each other's release); it serves T1 only through that re-push and is the one guard not taken from a ticket line | T1, T3, T5, D8 | `actionlint` if installed, else manual review; the zip listing in the `workflow_dispatch` run shows all seven entries |
+| R5 | Smoke job (`needs` build): unzip in `debian:bookworm-slim`, assert `git` absent, `bash install.sh --domains shared --no-sync`, then `lessons --version` and `scripts/setup.sh --test` (T3 map above). A second smoke job tests the source path on the SAME tree a release would hold: before a release exists the source tree is `git archive --prefix=llm-lessons-<ver>/ HEAD` of the CI checkout (GitHub's own archive has the same top-level directory), unzipped and run the same way | T2, T3, D6 | green on a `workflow_dispatch` run of the branch; no test tag is pushed |
+| R6 | Release job, tags only, with `permissions: contents: write` (the default token cannot create a release): `release-meta.sh notes` into the notes file, `release-meta.sh prerelease` picks `--prerelease`, `gh release create`, binary zip attached | T1, T4, D3 | the `workflow_dispatch` run prints the notes and the flag and skips the release |
+| R7 | README "Install" (line 14): the two zips, "unzip, `cd` into the one directory, `bash install.sh`", the Debian-only binary, the `~/.local/bin` note, and the note to restart agents after an upgrade (a running MCP keeps the old binary, see this plan's "Race and non-determinism" paragraph) | T5, D2, D6 | grep finds the section |
 
 ## Tests
 
 `setup.sh --test` (temp `HOME`, a fake `cargo` on `PATH` that records its calls):
 
-| Check | Mutation that must turn it red |
-|---|---|
-| with a fake `bin/lessons`, setup installs it to `~/.local/bin` and never calls `cargo` | delete the `bin/lessons` branch |
-| without `bin/lessons`, setup still calls `cargo install` | invert the detection test |
-| `~/.local/bin` missing from `PATH` logs the warning | delete the warning |
+| Check | Serves | Mutation that must turn it red |
+|---|---|---|
+| with a fake `bin/lessons`, setup installs it to `~/.local/bin` and never calls `cargo` | T2, D2 | delete the `bin/lessons` branch |
+| the MCP registration and `init` use `~/.local/bin/lessons`, not the cargo path | T2, D2 | leave `lessons_binary` on the cargo path |
+| back-to-back: run setup twice with a fake `bin/lessons`; both exit 0 and `~/.local/bin/lessons` is executable (mode 755) and has the fake's content both times | T2, D2 | `cp -n` (second run skips, a newer binary never lands: use a changed fake on run two); or `install` without `-m 755` |
+| without `bin/lessons`, setup still calls `cargo install` | T5 | invert the detection test |
+| `~/.local/bin` missing from `PATH` logs the warning; present, none | D2 | delete the warning |
 
 `install.sh --test` (fake `uname`, `apt-get`, `sudo`, `brew`, `curl` on `PATH`, each logging its arguments):
 
-| Check | Mutation that must turn it red |
-|---|---|
-| Debian, binary zip, `git` missing: installs `git` only, no rustup | check build tools even with `bin/lessons` |
-| Debian, source, `git` and `cc` missing: one `apt-get install` naming both | always install every package |
-| Debian as root: no `sudo`; as a user: `sudo` | always `sudo` |
-| macOS, `git` missing: `brew install git`, never `sudo` | use apt on Darwin |
-| macOS, source, no `cc`: prints `xcode-select --install`, exits 1, no build | drop the `cc` check |
-| source, no `cargo`: rustup fetched once; with `cargo` present never | invert the `cargo` test |
-| unknown OS, `git` missing: exit 1, names `git`, installs nothing | fall through to apt |
-| all present: no installs, `setup.sh` gets the same arguments | drop `"$@"` from the exec |
-| second run installs nothing (back-to-back repeat) | reinstall when present |
+| Check | Serves | Mutation that must turn it red |
+|---|---|---|
+| Debian, binary zip, `git` missing: installs `git` only, no rustup | D5, D7 | check build tools even with `bin/lessons` |
+| Debian, source, `git` and `cc` missing: one `apt-get update`, then one `apt-get install` naming both, in that order (the fake logs the sequence) | D5 | always install every package; drop the `update` |
+| Debian, binary zip: `curl` never installed; source with `cargo` present: `curl` never installed | D5 | install `curl` unconditionally |
+| Debian as root: no `sudo`; as a user: `sudo` | D5 | always `sudo` |
+| macOS, `git` missing: `brew install git`, never `sudo` | D5 | use apt on Darwin |
+| macOS, source, no `cc`: prints `xcode-select --install`, exits 1, no build | D5 | drop the `cc` check |
+| source, no `cargo`: rustup fetched once; with `cargo` present never | D5 | invert the `cargo` test |
+| unknown OS, `git` missing: exit 1, names `git`, installs nothing | D5, T5 | fall through to apt |
+| repeat after refusal: the unknown-OS refusal and the macOS-no-cc refusal each run twice; both runs exit 1 with the same message and install nothing | T5, D5 | the first refusal writes a marker file that makes the second run proceed |
+| all present: no installs, `setup.sh` gets the same arguments | D1 | drop `"$@"` from the exec |
+| second run installs nothing (back-to-back repeat) | D1 | reinstall when present |
 
-Race and non-determinism: not reachable. Both scripts run once, by one user, on one machine; no shared row, no timer.
+`release-meta.sh --test` (a temp git repo with tagged commits; a temp `Cargo.toml`):
+
+| Check | Serves | Mutation that must turn it red |
+|---|---|---|
+| `check-tag v0.1.0` against version `0.1.0` passes; `v0.1.1` against `0.1.0` and `0.1.0` (no `v`) fail | T1, D3 | always exit 0; or skip the `v` strip |
+| `check-tag vX` and `check-tag v` against `0.1.0` fail with the tag named (malformed tag) | T1 | compare only a prefix of the version; or accept an empty version after the strip |
+| repeat after refusal: `check-tag v0.1.1` against `0.1.0` run twice exits non-zero both times with the same message | T1, D3 | the first refusal rewrites the `Cargo.toml` copy or caches the verdict |
+| `notes v0.2.0` lists only the subjects after `v0.1.0`, one `- <subject>` per commit, and the version line | T4 | range `HEAD` instead of `<previous>..<tag>` |
+| `notes v0.1.0` with no earlier tag lists every commit, exit 0 | T4 | drop the no-previous-tag branch (the lookup fails under `set -e`) |
+| `prerelease 0.1.0` prints `true`; `1.0.0` prints `false` | D3 | invert; or always `true` |
+| running `notes` twice gives identical output (back-to-back repeat) | T4 | stamp the output with `date` |
+
+Workflow-only parts (`docker`, `gh release create`, the zip step) are checked by the `workflow_dispatch` run, not a unit test
+(R4, R5, R6 "Done when").
+
+Race and non-determinism: not reachable in the scripts. Each runs once, by one user, on one machine; no shared row, no timer.
+One caveat for the new setup branch: `install` replaces `~/.local/bin/lessons` by unlink and create, so an MCP server already
+running keeps its old inode and keeps running the old binary until restarted (UNVERIFIED for this `install` build; `cp` would
+instead write into the running file and fail with "Text file busy"). The upgrade note in R7 says to restart agents. The only
+external race (the same tag re-pushed) is the `concurrency` group in R4.
 
 ## Provenance
 
-- `scripts/setup.sh:757-767` (cargo check and install): `8f1d9db`, `1f17df9`, `7ce10b8`, HidekiAI-WORK, 2026-11-10.
-  `scripts/setup.sh:960`: `12a31e3`, 2026-11-17. `scripts/test-debian.sh`: `61ada3e`, 2026-11-11.
-- PRs: none exist (MEASURED: `gh pr list --state all` is empty); every change was merged to `trunk` locally.
-- Issues: #10 (this ticket), #9 (its duplicate). Searched no other source; there are no design docs beyond
-  `docs/PLAN-2026-11-10-sync.md`, whose agent-install steps (R14, S8b) are what `setup.sh` already does.
+- Searched: `git log`/`git blame`, `gh issue` and `gh pr` of this repo, the files under `docs/`. This repo has no Jira or
+  Confluence (GitHub issues only). Not searched: chat.
+- `scripts/setup.sh:757-764` (cargo check): `8f1d9db4`, HidekiAI-WORK, 2026-11-10 (line 761 `7ce10b81`, same author and date).
+  `setup.sh:765` (`cargo install`): `1f17df93`, 2026-11-10. `setup.sh:766-767` (`lessons_binary`): `8f1d9db4`, 2026-11-10.
+  `setup.sh:959-960` (`run_sync_self_test`): `6ce4dcf9` 2026-11-11, line 960 amended by `12a31e3b` 2026-11-17. All INHERITED
+  by this change (R1 edits them). `scripts/test-debian.sh`: `61ada3e`, HidekiAI-WORK, 2026-11-11. `Cargo.toml:3,12`: `9ded67d8`, 2026-11-10. `Cargo.toml:5` (`license`): `85f79dd`, HidekiAI-WORK, 2026-11-18, NEW in this
+  branch (D8). `README.md:14` (`## Install`, R7): `df8e60e7`, HidekiAI-WORK, 2026-11-10, INHERITED.
+- PRs: none exist (`gh pr list --state all` is empty); every change was merged to `trunk` locally.
+- Issues: #10 (this ticket), #9 (its duplicate). No design docs beyond `docs/PLAN-2026-11-10-sync.md`, whose agent-install
+  steps (R14, S8b) are what `setup.sh` already does.
 
 ## Plan gate
 
 - 2026-11-17 iteration 1: 76/100 (Traceability 27, Coverage 19, Minimality 12, Grounding 7, Provenance 11). No CRITICAL.
-  To fix in iteration 2 (by a separate planner agent): cite a T or D label on every step and test row; map
-  `scripts/test-debian.sh`'s assertions to the zip's checks or state why they differ; give the tag-equals-version,
-  previous-tag notes range and `0.x` pre-release logic a testable form with mutations; label the glibc 2.36,
-  `debian:bookworm-slim` and rustup `--profile minimal` premises; say R1 sets `lessons_binary` to `~/.local/bin/lessons`
-  and that `REPO_ROOT` is the zip root; fix line refs (`run_sync_self_test` is `setup.sh:959`, `Command::Mcp` is
-  `src/main.rs:310`); name the provenance classes not searched (Jira, Confluence, chat).
-- 2026-11-18: paused for a new high-priority issue; resume at iteration 2.
+  To fix in iteration 2: Serves label on every step and test row; map `test-debian.sh` assertions; testable form for tag,
+  notes range and pre-release logic; label premises; `lessons_binary` and `REPO_ROOT`; fix line refs; provenance classes.
+- 2026-11-18: paused for a new high-priority issue; resumed at iteration 2.
+- iteration 2: revised for the iteration-1 findings (date 2026-11-18)
+- 2026-11-18 iteration 2: 87/100 (Traceability 32, Coverage 20 capped by UNCOVERED, Minimality 12, Grounding 9, Provenance 14).
+- iteration 3: revised for the iteration-2 findings (2026-11-18)
+- 2026-11-18 iteration 3: 91/100 PASS (Traceability 32, Coverage 23, Minimality 13, Grounding 9, Provenance 14). No CRITICAL,
+  no UNCOVERED. Refinements applied after scoring: `--dry-run` dropped from R2 (no ticket line); R4 concurrency marked as the
+  one non-ticket guard; malformed-tag `check-tag` row added; blame for `Cargo.toml:5` and `README.md:14` added; R7 restart-agents note traced to D2.
