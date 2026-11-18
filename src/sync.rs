@@ -23,8 +23,9 @@ pub use run::sync_configured;
 /// Added to `tags` by a combine in `lessons resolve`, so `lessons list --tag needs-reword` finds the lesson.
 pub const NEEDS_REWORD_TAG: &str = "needs-reword";
 
-/// A lesson field merged on its own. `id`, `created_at`, `updated_at`, `hits` and `bypassed` are not in it: they have their own
-/// rules. The serde names are the `field` values in `<domain>.conflicts.jsonl` and match the `Lesson` field names.
+/// A lesson field merged on its own. `id`, `created_at`, `updated_at`, `hits`, `bypassed` and `last_bypassed_at` are
+/// not in it: they have their own rules. The serde names are the `field` values in `<domain>.conflicts.jsonl` and match
+/// the `Lesson` field names.
 /// The declaration order is the sort order of a queue group's key (`id`, then field), so it decides the order of the
 /// committed `<domain>.conflicts.jsonl`: append new fields at the end and never reorder (a test pins it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -174,7 +175,8 @@ fn newer_or_larger<'a>(left: &'a Version, right: &'a Version) -> &'a Version {
     std::cmp::max_by(left, right, fn_winner_order) // equal only for identical versions, so the tie side never matters
 }
 
-/// True when the merged fields of the two rows differ; `hits`, `bypassed` and `updated_at` are ignored.
+/// True when the merged fields of the two rows differ; `hits`, `bypassed`, `last_bypassed_at` and `updated_at` are
+/// ignored.
 fn fields_differ(left: &Lesson, right: &Lesson) -> bool {
     // Only merged fields count: a hit or a newer timestamp alone is not an edit.
     MERGED_FIELDS
@@ -229,8 +231,8 @@ fn merge_field(
 /// One merged field and the value it settled on.
 type FieldValue = (MergedField, Option<String>);
 
-/// Both sides hold the lesson: every merged field by the three-way rule, `hits`, `bypassed` and `updated_at` the larger,
-/// `created_at` the earlier (all side-independent).
+/// Both sides hold the lesson: every merged field by the three-way rule, `hits`, `bypassed`, `last_bypassed_at` and
+/// `updated_at` the larger, `created_at` the earlier (all side-independent).
 fn merge_both_present(
     base: Option<&Lesson>,
     ours: &Lesson,
@@ -240,6 +242,11 @@ fn merge_both_present(
     let row_with_counters = Lesson {
         hits: ours.hits.max(theirs.hits),
         bypassed: ours.bypassed.max(theirs.bypassed),
+        // None orders below Some, and the stamps are fixed-width UTC text, so max keeps the later bump.
+        last_bypassed_at: ours
+            .last_bypassed_at
+            .clone()
+            .max(theirs.last_bypassed_at.clone()),
         updated_at: ours.updated_at.clone().max(theirs.updated_at.clone()),
         created_at: ours.created_at.clone().min(theirs.created_at.clone()),
         ..ours.clone()
@@ -779,22 +786,67 @@ mod tests {
     }
 
     #[test]
-    fn a_lesson_on_one_side_only_keeps_its_bypassed_count() {
-        let counted = Lesson {
-            bypassed: MORE_BYPASSED,
+    fn last_bypassed_at_takes_the_later_and_a_set_time_beats_none_in_both_orders() {
+        let fn_stamped = |stamp: Option<&str>| Lesson {
+            last_bypassed_at: stamp.map(str::to_string),
             ..sample_lesson(LESSON_ID, EARLY)
         };
-        let fn_only_bypassed = |outcome: MergeOutcome| -> Vec<i64> {
-            outcome.merged.iter().map(|row| row.bypassed).collect()
+        let fn_merged_stamp = |ours: Lesson, theirs: Lesson| -> Option<String> {
+            merge_lessons(&[], &[ours], &[theirs]).merged[0]
+                .last_bypassed_at
+                .clone()
         };
+        let later: Option<String> = Some(LATE.to_string());
         assert_eq!(
-            fn_only_bypassed(merge_lessons(&[], &[counted.clone()], &[])),
-            vec![MORE_BYPASSED],
+            fn_merged_stamp(fn_stamped(Some(LATE)), fn_stamped(Some(EARLY))),
+            later,
+            "ours later"
+        );
+        assert_eq!(
+            fn_merged_stamp(fn_stamped(Some(EARLY)), fn_stamped(Some(LATE))),
+            later,
+            "theirs later"
+        );
+        assert_eq!(
+            fn_merged_stamp(fn_stamped(Some(LATE)), fn_stamped(None)),
+            later,
+            "only ours set"
+        );
+        assert_eq!(
+            fn_merged_stamp(fn_stamped(None), fn_stamped(Some(LATE))),
+            later,
+            "only theirs set"
+        );
+        assert_eq!(
+            fn_merged_stamp(fn_stamped(None), fn_stamped(None)),
+            None,
+            "neither set"
+        );
+    }
+
+    #[test]
+    fn a_lesson_on_one_side_only_keeps_its_bypassed_count_and_time() {
+        let counted = Lesson {
+            bypassed: MORE_BYPASSED,
+            last_bypassed_at: Some(LATE.to_string()),
+            ..sample_lesson(LESSON_ID, EARLY)
+        };
+        let fn_counters = |outcome: MergeOutcome| -> Vec<(i64, Option<String>)> {
+            outcome
+                .merged
+                .into_iter()
+                .map(|row| (row.bypassed, row.last_bypassed_at))
+                .collect()
+        };
+        let kept: Vec<(i64, Option<String>)> = vec![(MORE_BYPASSED, Some(LATE.to_string()))];
+        assert_eq!(
+            fn_counters(merge_lessons(&[], &[counted.clone()], &[])),
+            kept,
             "only in ours"
         );
         assert_eq!(
-            fn_only_bypassed(merge_lessons(&[], &[], &[counted])),
-            vec![MORE_BYPASSED],
+            fn_counters(merge_lessons(&[], &[], &[counted])),
+            kept,
             "only in theirs"
         );
     }
@@ -912,6 +964,7 @@ mod tests {
         };
         let only_bypassed_bumped = Lesson {
             bypassed: MORE_BYPASSED,
+            last_bypassed_at: Some(LATE.to_string()),
             updated_at: MIDDLE.to_string(),
             ..base_row.clone()
         };

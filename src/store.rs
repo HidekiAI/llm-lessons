@@ -1361,6 +1361,7 @@ mod tests {
             Lesson {
                 hits: SYNC_HITS,
                 bypassed: SYNC_BYPASSED,
+                last_bypassed_at: Some("2026-06-01T00:00:00Z".to_string()),
                 ..full_lesson(ID_A, "alpha")
             },
             full_lesson(ID_D, "delta"),
