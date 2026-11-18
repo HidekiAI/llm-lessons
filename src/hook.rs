@@ -664,6 +664,7 @@ mod tests {
                 superseded_by: None,
                 hits: 0,
                 bypassed: 0,
+                last_bypassed_at: None,
             },
         }
     }

@@ -44,6 +44,9 @@ pub struct Lesson {
     #[serde(default)]
     // a `.jsonl` line written before this column existed has no key: read it as 0
     pub bypassed: i64,
+    #[serde(default)]
+    // no key before this column existed, and NULL until the first bypassed bump: both read as None
+    pub last_bypassed_at: Option<String>,
 }
 
 /// A lesson together with the file it was found in, which is what `show` and `search` print.
@@ -70,7 +73,7 @@ pub struct NewLesson {
 
 /// Columns every SELECT reads, by name, so `lesson_from_row` never depends on their order.
 const LESSON_SELECT_COLUMNS: &str = "id, created_at, updated_at, title, context, problem, root_cause, \
-     resolution, failed_tries, tags, env_versions, superseded_by, hits, bypassed";
+     resolution, failed_tries, tags, env_versions, superseded_by, hits, bypassed, last_bypassed_at";
 
 fn lesson_from_row(row: &Row) -> rusqlite::Result<Lesson> {
     Ok(Lesson {
@@ -88,6 +91,7 @@ fn lesson_from_row(row: &Row) -> rusqlite::Result<Lesson> {
         superseded_by: row.get("superseded_by")?,
         hits: row.get("hits")?,
         bypassed: row.get("bypassed")?,
+        last_bypassed_at: row.get("last_bypassed_at")?,
     })
 }
 
@@ -254,20 +258,21 @@ pub fn bump_hits(conn: &Connection, lesson_id: &str) -> Result<Option<i64>> {
     Ok(new_hits)
 }
 
-/// Adds one to `bypassed` (the user had to remind the agent of this lesson) and returns the new
-/// count, or `None` for an unknown id. Leaves `updated_at` alone, like `bump_hits`. One statement,
-/// so two bumps at once are serialized by SQLite's write lock and neither count is lost; a
-/// read-then-write rewrite would lose one.
+/// Adds one to `bypassed` (the user had to remind the agent of this lesson), stamps `last_bypassed_at` with the
+/// current UTC second, and returns the new count, or `None` for an unknown id. Leaves `updated_at` alone, like
+/// `bump_hits`. One statement, so two bumps at once are serialized by SQLite's write lock, neither count is lost,
+/// and a count and its stamp always come from the same bump; a read-then-write rewrite would break both.
 pub fn bump_bypassed(conn: &Connection, lesson_id: &str) -> Result<Option<i64>> {
-    let new_bypassed: Option<i64> = conn
+    let bumped: Option<(i64, String)> = conn
         .query_row(
-            "UPDATE lesson SET bypassed = bypassed + 1 WHERE id = ?1 RETURNING bypassed",
+            "UPDATE lesson SET bypassed = bypassed + 1, last_bypassed_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+             WHERE id = ?1 RETURNING bypassed, last_bypassed_at",
             [lesson_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    journal!("bypassed {lesson_id}: bypassed now {new_bypassed:?}");
-    Ok(new_bypassed)
+    journal!("bypassed {lesson_id}: bypassed and last_bypassed_at now {bumped:?}");
+    Ok(bumped.map(|(new_bypassed, _stamp)| new_bypassed))
 }
 
 /// Marks `lesson_id` as replaced by `superseded_by_id`, which hides it from search. Returns false
@@ -289,14 +294,14 @@ pub fn retire(conn: &Connection, lesson_id: &str, superseded_by_id: &str) -> Res
 fn copy_into(target: &Connection, lesson: &Lesson) -> Result<()> {
     target.execute(
         "INSERT INTO lesson (id, created_at, updated_at, title, context, problem, root_cause, resolution, \
-                             failed_tries, tags, env_versions, superseded_by, hits, bypassed) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                             failed_tries, tags, env_versions, superseded_by, hits, bypassed, last_bypassed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
          ON CONFLICT(id) DO UPDATE SET \
              created_at = excluded.created_at, updated_at = excluded.updated_at, title = excluded.title, \
              context = excluded.context, problem = excluded.problem, root_cause = excluded.root_cause, \
              resolution = excluded.resolution, failed_tries = excluded.failed_tries, tags = excluded.tags, \
              env_versions = excluded.env_versions, superseded_by = excluded.superseded_by, hits = excluded.hits, \
-             bypassed = excluded.bypassed",
+             bypassed = excluded.bypassed, last_bypassed_at = excluded.last_bypassed_at",
         rusqlite::params![
             lesson.id,
             lesson.created_at,
@@ -312,6 +317,7 @@ fn copy_into(target: &Connection, lesson: &Lesson) -> Result<()> {
             lesson.superseded_by,
             lesson.hits,
             lesson.bypassed,
+            lesson.last_bypassed_at,
         ],
     )?;
     Ok(())
@@ -814,6 +820,81 @@ mod tests {
     }
 
     #[test]
+    fn lesson_json_without_last_bypassed_at_reads_none_and_both_forms_round_trip() {
+        const STAMP: &str = "2026-06-01T00:00:00Z";
+        // The shape a v2 binary wrote: `bypassed` present, `last_bypassed_at` absent.
+        let pre_column_line: &str = r#"{"id":"01ID","created_at":"2000-01-01T00:00:00Z","updated_at":"2000-01-01T00:00:00Z","title":"t","context":null,"problem":"p","root_cause":null,"resolution":null,"failed_tries":null,"tags":null,"env_versions":null,"superseded_by":null,"hits":1,"bypassed":2}"#;
+        let old_lesson: Lesson = serde_json::from_str(pre_column_line).expect("pre-column line");
+        assert_eq!(old_lesson.last_bypassed_at, None);
+        let fn_round_trip = |lesson: &Lesson| -> Lesson {
+            serde_json::from_str(&serde_json::to_string(lesson).unwrap()).unwrap()
+        };
+        assert_eq!(fn_round_trip(&old_lesson), old_lesson, "null round-trips");
+        let stamped = Lesson {
+            last_bypassed_at: Some(STAMP.to_string()),
+            ..old_lesson
+        };
+        assert_eq!(fn_round_trip(&stamped), stamped, "a stamp round-trips");
+    }
+
+    #[test]
+    fn bump_bypassed_stamps_each_bump_with_a_utc_second_and_leaves_updated_at_alone() {
+        // Every character of a stamp is a digit where the shape has 0, and the literal character elsewhere.
+        const STAMP_SHAPE: &str = "0000-00-00T00:00:00Z";
+        let fn_is_utc_second_stamp = |stamp: &str| -> bool {
+            stamp.len() == STAMP_SHAPE.len()
+                && stamp
+                    .chars()
+                    .zip(STAMP_SHAPE.chars())
+                    .all(|(stamp_char, shape_char)| match shape_char {
+                        '0' => stamp_char.is_ascii_digit(),
+                        _ => stamp_char == shape_char,
+                    })
+        };
+        let fn_sqlite_now = |conn: &Connection| -> String {
+            conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ','now')", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        let fn_stamp_of = |conn: &Connection, lesson_id: &str| -> Option<String> {
+            find_by_id(conn, lesson_id)
+                .unwrap()
+                .expect("stored")
+                .last_bypassed_at
+        };
+        let (_temp_dir, conn) = temp_conn();
+        let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
+        backdate(&conn, &lesson_id);
+        assert_eq!(fn_stamp_of(&conn, &lesson_id), None, "fresh lesson");
+
+        let before_first_bump: String = fn_sqlite_now(&conn);
+        bump_bypassed(&conn, &lesson_id).unwrap();
+        let first_stamp: String = fn_stamp_of(&conn, &lesson_id).expect("stamped");
+        assert!(fn_is_utc_second_stamp(&first_stamp), "{first_stamp}");
+        assert!(
+            first_stamp >= before_first_bump,
+            "{first_stamp} < {before_first_bump}"
+        );
+
+        // Backdate the stored stamp, so a bump that kept the old value instead of writing the new one shows.
+        const BACKDATED_STAMP: &str = "2000-01-01T00:00:00Z";
+        conn.execute(
+            "UPDATE lesson SET last_bypassed_at = ?1 WHERE id = ?2",
+            (BACKDATED_STAMP, &lesson_id),
+        )
+        .unwrap();
+        bump_bypassed(&conn, &lesson_id).unwrap();
+        let second_stamp: String = fn_stamp_of(&conn, &lesson_id).expect("stamped");
+        assert!(
+            second_stamp >= first_stamp,
+            "equal allowed: the clock has one-second steps"
+        );
+        let stored: Lesson = find_by_id(&conn, &lesson_id).unwrap().expect("stored");
+        assert_eq!(stored.updated_at, "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
     fn retire_records_the_replacement_and_bumps_updated_at() {
         let (_temp_dir, conn) = temp_conn();
         let lesson_id: String = insert(&conn, &minimal_lesson()).unwrap();
@@ -1157,6 +1238,7 @@ mod tests {
             superseded_by: None,
             hits: 0,
             bypassed: 0,
+            last_bypassed_at: None,
         }
     }
 

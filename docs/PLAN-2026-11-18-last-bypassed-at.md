@@ -112,3 +112,10 @@ format and `>=` a pre-bump read, never a literal or equality; merge tests use fi
   `copy_into`, `lesson_from_row`, `merge_both_present` and the classes not searched; (6) migration test keeps a
   `bypassed` > 0 row; (7) old-binary limit relabelled MEASURED with `store.rs:29-30,59`; (8) S5 names `lesson_as_text`
   and the format string; (9) S6 and S7 carry T tags.
+
+## Progress
+
+- 2026-11-18: S1, S2, S3 and S6 (migration V3, the field, the stamp in `bump_bypassed`, fixtures) done; every planned db
+  and store mutation went red. Next: S4 (sync).
+- 2026-11-18 12:29, added by @me mid-task: "can we at least mention on README.md (FAQ part?) about what or why we don't
+  need to index the sqlite". Done as its own docs commit on this branch.
