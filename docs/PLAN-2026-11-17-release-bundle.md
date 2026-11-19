@@ -147,6 +147,8 @@ install run with `--install-depends`:
 | source, no `cargo` and no `curl`: apt installs `curl ca-certificates`, rustup runs, and `setup.sh` finds the new `cargo` on PATH | D5 | drop `ca-certificates`; drop the `~/.cargo/bin` PATH export |
 | a failing install command is journaled with the command and its exit status; `setup.sh` never runs | D5 | run the command without logging its failure |
 | Debian, a user with no `sudo`: refuses, calls no `apt-get` | D5 | drop the `sudo` check |
+| a failing rustup download is journaled with its exit status; `setup.sh` never runs | D5 | swallow the rustup failure (`|| true`) |
+| `CARGO_HOME` set: `setup.sh` finds the cargo rustup put under it | D5 | export `~/.cargo/bin` whatever `CARGO_HOME` says |
 
 `release-meta.sh --test` (a temp git repo with tagged commits; a temp `Cargo.toml`):
 

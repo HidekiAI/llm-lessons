@@ -115,7 +115,7 @@ install_missing() {
             log_step "run: rustup from https://sh.rustup.rs (-y --profile minimal)"
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal ||
                 fn_refuse "rustup failed (exit $?)" # pipefail: a failed download is not masked by sh
-            export PATH="$HOME/.cargo/bin:$PATH" # rustup's default install dir, for the cargo install in setup.sh
+            export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH" # where rustup puts cargo, for the cargo install in setup.sh
             ;;
     esac
 }
@@ -152,7 +152,7 @@ main() {
 # the case, not by this machine.
 run_self_test() {
     local test_root core_bin case_bin tool_name tool_path kind_name failures=0
-    local case_os="" case_uid="" case_tools="" case_failing="" case_xcode_status=0 first_status second_status first_output
+    local case_os="" case_uid="" case_tools="" case_failing="" case_cargo_home="" case_xcode_status=0 first_status second_status first_output
     test_root="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/lessons-install-test.XXXXXX")" && pwd)" # pwd drops the // a TMPDIR ending in / gives
     # shellcheck disable=SC2064 # expand test_root now: it is local and gone when the trap runs
     trap "rm -rf '$test_root'" RETURN
@@ -174,8 +174,8 @@ run_self_test() {
     printf '#!/bin/sh\n' >"$test_root/binary/bin/lessons"
     chmod +x "$test_root/binary/bin/lessons"
     # What the fake curl serves as rustup's installer: it logs its arguments and leaves a cargo where rustup puts it.
-    printf '%s\n' 'echo "rustup-script $*" >>"$CALLS_LOG"' 'mkdir -p "$HOME/.cargo/bin"' \
-        'printf "#!/bin/sh\n" >"$HOME/.cargo/bin/cargo"' 'chmod +x "$HOME/.cargo/bin/cargo"' >"$test_root/rustup-installer.sh"
+    printf '%s\n' 'echo "rustup-script $*" >>"$CALLS_LOG"' 'cargo_bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"' 'mkdir -p "$cargo_bin_dir"' \
+        'printf "#!/bin/sh\n" >"$cargo_bin_dir/cargo"' 'chmod +x "$cargo_bin_dir/cargo"' >"$test_root/rustup-installer.sh"
 
     check_equal() {
         local check_name="$1" expected_text="$2" actual_text="$3"
@@ -196,7 +196,7 @@ run_self_test() {
     fn_run_case() {
         local kind_name="$1"
         shift
-        rm -rf "$case_bin" "$test_root/calls.log" "$test_root/home/.cargo"
+        rm -rf "$case_bin" "$test_root/calls.log" "$test_root/home/.cargo" "$test_root/cargo-home"
         mkdir -p "$case_bin"
         printf '#!/bin/sh\necho "$FAKE_UNAME"\n' >"$case_bin/uname"
         printf '#!/bin/sh\necho "$FAKE_UID"\n' >"$case_bin/id"
@@ -205,8 +205,8 @@ run_self_test() {
         for tool_name in $case_tools; do
             case "$tool_name:$case_failing" in
                 sudo:*) fn_write_fake sudo 'exec "$@"' ;;
-                curl:*) fn_write_fake curl 'cat "$FAKE_RUSTUP_INSTALLER"' ;;
                 *:*" $tool_name "*) fn_write_fake "$tool_name" 'exit 1' ;; # present but failing, like a macOS git stub
+                curl:*) fn_write_fake curl 'cat "$FAKE_RUSTUP_INSTALLER"' ;;
                 apt-get-with-curl:*) # an apt-get whose install leaves a curl behind, as the real one does
                     fn_write_fake apt-get 'cp "$case_bin_dir/curl.pending" "$case_bin_dir/curl"'
                     fn_write_fake curl 'cat "$FAKE_RUSTUP_INSTALLER"'
@@ -217,7 +217,7 @@ run_self_test() {
         done
         env -i HOME="$test_root/home" XDG_STATE_HOME="$test_root/state" PATH="$case_bin:$core_bin" \
             CALLS_LOG="$test_root/calls.log" FAKE_UNAME="$case_os" FAKE_UID="$case_uid" FAKE_XCODE_STATUS="$case_xcode_status" \
-            FAKE_RUSTUP_INSTALLER="$test_root/rustup-installer.sh" case_bin_dir="$case_bin" \
+            FAKE_RUSTUP_INSTALLER="$test_root/rustup-installer.sh" case_bin_dir="$case_bin" ${case_cargo_home:+CARGO_HOME="$case_cargo_home"} \
             bash "$test_root/$kind_name/install.sh" "$@" >"$test_root/output.txt" 2>&1 && echo 0 || echo $?
     }
     fn_calls() { # the logged calls whose first word matches the pattern, joined by ';'
@@ -283,6 +283,15 @@ run_self_test() {
         check_equal "source, no cargo: rustup is fetched once with -y --profile minimal, and setup.sh finds its cargo" \
             "0 curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs;rustup-script -y --profile minimal; setup-cargo $test_root/home/.cargo/bin/cargo;" \
             "$first_status $(fn_calls 'curl|rustup-script') $(fn_calls setup-cargo)"
+        case_cargo_home="$test_root/cargo-home"
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "source, no cargo, CARGO_HOME set: setup.sh finds the cargo rustup put under CARGO_HOME" \
+            "0 setup-cargo $test_root/cargo-home/bin/cargo;" "$first_status $(fn_calls setup-cargo)"
+        case_cargo_home="" case_failing=" curl "
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "a failing rustup download is journaled with its exit status, and setup.sh never runs" "1 1 " \
+            "$first_status $(fn_output_count 'rustup failed (exit 1)') $(fn_calls setup)"
+        case_failing=""
         case_tools="apt-get-with-curl git cc"
         first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
         check_equal "source, no cargo and no curl: apt installs curl with ca-certificates, then rustup runs" \
