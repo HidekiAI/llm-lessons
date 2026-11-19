@@ -115,7 +115,8 @@ The ticket's wording is reworded by @me; this plan keeps its intent: every `test
 | the MCP registration and `init` use `~/.local/bin/lessons`, not the cargo path | T2, D2 | leave `lessons_binary` on the cargo path |
 | back-to-back: run setup twice with a fake `bin/lessons`; both exit 0 and `~/.local/bin/lessons` is executable (mode 755) and has the fake's content both times | T2, D2 | `cp -n` (second run skips, a newer binary never lands: use a changed fake on run two); or plain `cp` (keeps the fake's mode 700; MEASURED on macOS BSD `install`: without `-m` it already gives 755, so that mutation cannot go red; GNU `install` UNVERIFIED) |
 | without `bin/lessons`, setup still calls `cargo install` | T5 | invert the detection test |
-| `~/.local/bin` missing from `PATH` logs the warning; present, none | D2 | delete the warning |
+| `~/.local/bin` missing from `PATH` (a lookalike `~/.local/bin2` on it does not count) logs the warning and the `export PATH` line; present, none | D2 | delete the warning; match `$PATH` by substring instead of colon-fenced entries |
+| `bin/lessons` a directory, or a regular file without the exec bit: setup calls `cargo install` | T5 | drop the `-f` test; drop the `-x` test |
 
 `install.sh --test` (fake `uname`, `apt-get`, `sudo`, `brew`, `curl` on `PATH`, each logging its arguments). Rows that
 install run with `--install-depends`:

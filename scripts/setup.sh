@@ -1015,6 +1015,13 @@ run_bundle_self_test() {
     fn_run_bundle_setup "$fake_bin:$PATH" >/dev/null # fails after cargo, at init: the fake cargo builds nothing
     check_equal "no bin/lessons file (a directory there): setup still calls cargo install" "1" \
         "$(grep -cxF "cargo install --locked --path $bundle_root" "$test_root/calls.log" 2>/dev/null)"
+
+    rm -rf "${bundle_root:?}/bin" "${test_root:?}/calls.log"
+    fn_write_fake_lessons three
+    chmod 644 "$bundle_root/bin/lessons" # a regular file passes -f, so only the -x test keeps it off the bundle branch
+    fn_run_bundle_setup "$fake_bin:$PATH" >/dev/null # fails after cargo, at init, as above
+    check_equal "bin/lessons not executable: setup calls cargo install" "1" \
+        "$(grep -cxF "cargo install --locked --path $bundle_root" "$test_root/calls.log" 2>/dev/null)"
 }
 
 # The sync-configuration checks, run by --test with piped answers in throwaway LESSONS_HOME dirs.
