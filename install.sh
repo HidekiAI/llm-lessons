@@ -343,7 +343,7 @@ run_self_test() {
         printf 'install self-test: all checks passed\n'
     else
         printf 'install self-test: %s check(s) failed\n' "$failures"
-        exit "$EXIT_FAILURE"
+        return "$EXIT_FAILURE" # return, not exit, so the RETURN trap removes the temp dir
     fi
 }
 

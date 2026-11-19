@@ -22,13 +22,17 @@ log_step() {
     printf '[%s] release-meta: %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2
 }
 
-# The version under [package] only: a [dependencies.<name>] table also has a `version =` line.
+# The version under [package] only: a [dependencies.<name>] table also has a `version =` line. Takes either quote,
+# leading spaces, CRLF line ends and a comment after the header; a `version.workspace = true` gives no version.
 package_version() {
-    awk '/^\[/ { in_package = ($0 == "[package]") } in_package && /^version *=/ { gsub(/^version *= *"|".*$/, ""); print; exit }' "$1"
+    awk '{ sub(/\r$/, "") }
+        /^[ \t]*\[/ { in_package = ($0 ~ /^[ \t]*\[package\][ \t]*(#.*)?$/) }
+        in_package && /^[ \t]*version[ \t]*=[ \t]*["\047]/ { sub(/^[ \t]*version[ \t]*=[ \t]*["\047]/, ""); sub(/["\047].*$/, ""); print; exit }' "$1"
 }
 
 check_tag() {
     local tag_name="$1" cargo_file="$2" package_version_text
+    [[ -r "$cargo_file" ]] || { log_step "ERROR: cannot read $cargo_file" && return "$EXIT_FAILURE"; }
     package_version_text="$(package_version "$cargo_file")"
     [[ -n "$package_version_text" ]] || { log_step "ERROR: no [package] version in $cargo_file" && return "$EXIT_FAILURE"; }
     case "$tag_name" in
@@ -44,18 +48,25 @@ check_tag() {
 # first tag), newest first.
 release_notes() {
     local tag_name="$1" previous_tag
+    git rev-parse -q --verify "$tag_name^{commit}" >/dev/null ||
+        { log_step "ERROR: notes: no commit named '$tag_name'" && return "$EXIT_FAILURE"; }
+    # A shallow clone hides the previous tag, so the notes would list too little and still succeed.
+    [[ "$(git rev-parse --is-shallow-repository)" == false ]] ||
+        { log_step "ERROR: notes: shallow clone; fetch the full history (fetch-depth 0)" && return "$EXIT_FAILURE"; }
     previous_tag="$(git describe --tags --abbrev=0 "$tag_name^" 2>/dev/null || true)" # empty: this is the first tag
     log_step "notes: $tag_name since ${previous_tag:-the first commit}"
     printf 'lessons %s\n\n' "$tag_name"
     git log --format='- %s' "${previous_tag:+$previous_tag..}$tag_name"
 }
 
+readonly VERSION_PATTERN='^(0|[1-9][0-9]*)\.[0-9]+\.[0-9]+' # major.minor.patch, any suffix after it
+
 is_prerelease() {
     local version_text="$1"
-    case "$version_text" in
-        0.*) echo true ;; # every 0.x release is a pre-release until 1.0
-        [1-9]*) echo false ;;
-        *) log_step "ERROR: not a version: '$version_text'" && return "$EXIT_FAILURE" ;;
+    [[ "$version_text" =~ $VERSION_PATTERN ]] || { log_step "ERROR: not a version: '$version_text'" && return "$EXIT_FAILURE"; }
+    case "${BASH_REMATCH[1]}" in
+        0) echo true ;; # every 0.x release is a pre-release until 1.0
+        *) echo false ;;
     esac
 }
 
@@ -86,8 +97,16 @@ run_self_test() {
         fn_git commit -q --allow-empty -m "$1"
         [[ -z "${2:-}" ]] || fn_git tag "$2"
     }
-    fn_status() { # runs this script's subcommand in the temp repo; prints its exit status, output to output.txt
-        (cd "$repo_dir" && bash "$SCRIPT_PATH" "$@") >"$test_root/output.txt" 2>&1 && echo 0 || echo $?
+    fn_status_in() { # a directory, then this script's subcommand run there; prints its exit status, output to output.txt
+        local run_dir="$1"
+        shift
+        (cd "$run_dir" && bash "$SCRIPT_PATH" "$@") >"$test_root/output.txt" 2>&1 && echo 0 || echo $?
+    }
+    fn_status() { # this script's subcommand, run in the temp repo
+        fn_status_in "$repo_dir" "$@"
+    }
+    fn_output_count() { # lines of the last run's output holding the fixed text
+        grep -cF -e "$1" "$test_root/output.txt" || true
     }
 
     mkdir -p "$repo_dir"
@@ -110,6 +129,18 @@ run_self_test() {
     second_status="$(fn_status check-tag v0.1.1 "$cargo_file")"
     check_equal "check-tag: a refusal repeated gives the same refusal, and Cargo.toml is untouched" "1 1 same 1" \
         "$first_status $second_status $([[ "$first_message" == "$(grep -o 'tag v0.1.1 .*' "$test_root/output.txt")" ]] && echo same || echo differs) $(grep -c '^version = "0.1.0"$' "$cargo_file")"
+    check_equal "check-tag: only an exact match passes (v0.1.0-rc.1 and v0.1.00 start with v0.1.0 but are refused)" "1 1" \
+        "$(fn_status check-tag v0.1.0-rc.1 "$cargo_file") $(fn_status check-tag v0.1.00 "$cargo_file")"
+    printf '[package]\nname = "lessons"\nversion.workspace = true\n' >"$test_root/workspace-Cargo.toml"
+    first_status="$(fn_status check-tag v "$test_root/workspace-Cargo.toml")"
+    check_equal "check-tag: a [package] with no version of its own refuses every tag, also the bare v" "1 1 1" \
+        "$first_status $(fn_output_count 'no [package] version') $(fn_status check-tag v0.1.0 "$test_root/workspace-Cargo.toml")"
+    printf "[package] # the crate\r\n  version = '0.1.0'\r\n" >"$test_root/quoted-Cargo.toml"
+    check_equal "check-tag: single quotes, an indented version, CRLF and a header comment are read" "0" \
+        "$(fn_status check-tag v0.1.0 "$test_root/quoted-Cargo.toml")"
+    first_status="$(fn_status check-tag v0.1.0 "$test_root/missing-Cargo.toml")"
+    check_equal "check-tag: an unreadable Cargo.toml is refused and named" "1 1" \
+        "$first_status $(fn_output_count "cannot read $test_root/missing-Cargo.toml")"
 
     # notes
     check_equal "notes v0.2.0: the version line, then only the commits after v0.1.0, newest first" \
@@ -122,16 +153,27 @@ run_self_test() {
     fn_status notes v0.2.0 >/dev/null
     check_equal "notes run twice give identical text (back-to-back repeat)" "same" \
         "$([[ "$(grep -v '^\[' <<<"$first_message")" == "$(grep -v '^\[' "$test_root/output.txt")" ]] && echo same || echo differs)"
+    first_status="$(fn_status notes v9.9.9)"
+    check_equal "notes for an unknown tag: refused and named, and no header is printed" "1 1 0" \
+        "$first_status $(fn_output_count "no commit named 'v9.9.9'") $(fn_output_count 'lessons v9.9.9')"
+    git -c core.hooksPath=/dev/null clone -q --depth 1 --branch v0.2.0 "file://$repo_dir" "$test_root/shallow" 2>/dev/null
+    first_status="$(fn_status_in "$test_root/shallow" notes v0.2.0)"
+    check_equal "notes in a shallow clone: refused, because the previous tag is not there to find" "1 1" \
+        "$first_status $(fn_output_count 'shallow clone')"
 
     # prerelease
     check_equal "prerelease: 0.1.0 is a pre-release, 1.0.0 is not" "true false" \
         "$(fn_status prerelease 0.1.0 >/dev/null; grep -v '^\[' "$test_root/output.txt") $(fn_status prerelease 1.0.0 >/dev/null; grep -v '^\[' "$test_root/output.txt")"
+    check_equal "prerelease: 0.1.0-rc.1 is a pre-release, 10.0.0 is not" "true false" \
+        "$(fn_status prerelease 0.1.0-rc.1 >/dev/null; grep -v '^\[' "$test_root/output.txt") $(fn_status prerelease 10.0.0 >/dev/null; grep -v '^\[' "$test_root/output.txt")"
+    check_equal "prerelease: 9x, 1 and an empty version are refused, not published as full releases" "1 1 1" \
+        "$(fn_status prerelease 9x) $(fn_status prerelease 1) $(fn_status prerelease '')"
 
     if [[ "$failures" -eq 0 ]]; then
         printf 'release-meta self-test: all checks passed\n'
     else
         printf 'release-meta self-test: %s check(s) failed\n' "$failures"
-        exit "$EXIT_FAILURE"
+        return "$EXIT_FAILURE" # return, not exit, so the RETURN trap removes the temp dir
     fi
 }
 

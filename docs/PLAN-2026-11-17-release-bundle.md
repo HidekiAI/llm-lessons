@@ -63,18 +63,19 @@ Premises, each labelled:
 - MEASURED: `REPO_ROOT` is the parent of `scripts/` (`scripts/setup.sh:25`), so in the unpacked zip it is the zip root,
   and `SKILL_SOURCE` / `PLUGIN_SOURCE` (`setup.sh:32,36`) resolve to the zip's `skills/` and `integrations/`.
 - MEASURED: the toolchain here is `rustc 1.95.0` (`rustc --version`) and `Cargo.toml:6` has `rust-version = "1.89"`, so the
-  build image is pinned `rust:1.95-bookworm`. UNVERIFIED: that this tag exists on Docker Hub (no network call made); R4's
-  first run proves it, else step down to the newest existing `1.NN` at or above 1.89.
-- UNVERIFIED (checked by the smoke job, R5): glibc 2.36 in `rust:1.95-bookworm`, and so that the binary runs on Debian 12
-  and 13. Command to measure: `docker run --rm rust:1.95-bookworm ldd --version`, then run the binary in `debian:bookworm-slim`
-  and `debian:trixie-slim`.
+  build image is pinned `rust:1.95-bookworm`. MEASURED 2026-11-19: the tag exists (`docker pull rust:1.95-bookworm`), its
+  `CARGO_HOME` is `/usr/local/cargo` (the workflow's cache path), and it has `git` and `unzip` but no `zip` or `zstd`.
+- MEASURED 2026-11-19: glibc 2.36 in `rust:1.95-bookworm` (`docker run --rm rust:1.95-bookworm ldd --version`).
+  UNVERIFIED (checked by the smoke job, R5): that the binary runs on Debian 12 and 13 (`debian:bookworm-slim`,
+  `debian:trixie-slim`).
 - MEASURED: nothing else uses `curl` (`grep -rn curl scripts src` is empty), so only the rustup fetch needs it.
 - UNVERIFIED: a fresh `debian:bookworm-slim` has empty apt lists, so `apt-get install` fails without `apt-get update` first.
-- UNVERIFIED: `debian:bookworm-slim` lacks `git`, `cc` and Rust (R5 asserts it before installing: `command -v git` fails).
+- MEASURED 2026-11-19: `debian:bookworm-slim` lacks `git`, `cc`, `cargo` and `curl` (a real `bash install.sh` there listed
+  all four as missing); R5 still asserts it before installing.
 - UNVERIFIED: rustup `--profile minimal` is enough for `cargo install --locked --path` (no rustfmt or clippy are needed,
   and `bundled` needs only `cc`); the source smoke run proves it.
-- UNVERIFIED: `zip` and `unzip` exist in `rust:1.NN-bookworm` and `debian:bookworm-slim`; R4 and R5 run `apt-get install -y zip unzip`
-  first, so it does not matter.
+- MEASURED 2026-11-19: `rust:1.95-bookworm` has no `zip` (R4 installs it); UNVERIFIED for `debian:bookworm-slim`, where
+  R5 installs `unzip` first, so it does not matter.
 - UNVERIFIED: GitHub's automatic "Source code (zip)" keeps `install.sh`'s exec bit; the README says `bash install.sh`, which does not need it.
 
 ### Why T3 cannot hold word for word
@@ -157,11 +158,18 @@ install run with `--install-depends`:
 | `check-tag v0.1.0` against version `0.1.0` passes; `v0.1.1` against `0.1.0` and `0.1.0` (no `v`) fail | T1, D3 | always exit 0; or skip the `v` strip |
 | `check-tag vX` and `check-tag v` against `0.1.0` fail with the tag named (malformed tag) | T1 | compare only a prefix of the version; or accept an empty version after the strip |
 | `check-tag` reads the `[package]` version even when another table with its own `version =` line comes first | T1 | read the first `version =` line in the file, any table |
+| `check-tag v0.1.0-rc.1` and `v0.1.00` against `0.1.0` fail: only an exact match passes | T1 | accept any tag that starts with `v<version>` |
+| a `[package]` with no version of its own (`version.workspace = true`) refuses every tag, the bare `v` too | T1 | drop the empty-version guard |
+| single quotes, an indented `version`, CRLF and a comment after `[package]` are read | T1 | read only `version = "..."` at the start of a line |
+| an unreadable `Cargo.toml` is refused and named | T1 | drop the readable-file check |
 | repeat after refusal: `check-tag v0.1.1` against `0.1.0` run twice exits non-zero both times with the same message | T1, D3 | the first refusal rewrites the `Cargo.toml` copy or caches the verdict |
 | `notes v0.2.0` lists only the subjects after `v0.1.0`, one `- <subject>` per commit, and the version line | T4 | range `HEAD` instead of `<previous>..<tag>` |
 | `notes v0.1.0` with no earlier tag lists every commit, exit 0 | T4 | drop the no-previous-tag branch (the lookup fails under `set -e`) |
 | `prerelease 0.1.0` prints `true`; `1.0.0` prints `false` | D3 | invert; or always `true` |
+| `prerelease 0.1.0-rc.1` prints `true`, `10.0.0` `false`; `9x`, `1` and an empty version are refused | D3 | test only the leading digit |
 | running `notes` twice gives identical output (back-to-back repeat) | T4 | stamp the output with `date` |
+| `notes` for an unknown tag is refused and named, with no header printed | T4 | drop the commit lookup |
+| `notes` in a shallow clone is refused (the previous tag would be missing and the notes too short) | T4 | drop the shallow-clone check |
 
 Workflow-only parts (`docker`, `gh release create`, the zip step) are checked by the `workflow_dispatch` run, not a unit test
 (R4, R5, R6 "Done when").
