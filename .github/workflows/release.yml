@@ -63,7 +63,7 @@ jobs:
         run: |
           bash scripts/release-meta.sh notes "$NOTES_REF"
           echo "prerelease: $(bash scripts/release-meta.sh prerelease "$VERSION")"
-      - name: Test, in the release profile so the build below reuses the compiled code
+      - name: Test, in the release profile
         run: cargo test --release --locked
       - name: Build
         run: cargo build --release --locked

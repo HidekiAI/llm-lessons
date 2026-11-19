@@ -88,7 +88,7 @@ cannot run against it. Mapping each assertion:
 |---|---|
 | runs on Debian (`os-release`) | smoke job prints `PRETTY_NAME` of `debian:bookworm-slim` and asserts `ID=debian` (R5) |
 | `git --version` works | the smoke job asserts `git --version` after `install.sh` installed it (R5) |
-| `cargo test -q` passes | CI runs `cargo test --release --locked` (@me 2026-11-19: one compile for test and build) in the Debian build image BEFORE packaging (R4); the binary tested is the one built |
+| `cargo test -q` passes | CI runs `cargo test --release --locked` (@me 2026-11-19; MEASURED: the release build after it still recompiles rusqlite and lessons) in the Debian build image BEFORE packaging (R4); the binary tested is the one built |
 | `git ls-files` tests | stay in `cargo test` in CI (a git checkout there); not reachable from a zip |
 | (new) the bundle itself installs | smoke job: `install.sh`, then `lessons --version`, then plain `scripts/setup.sh --test` with no `LESSONS_BIN`, so its fallback to the zip's `bin/lessons` is what runs (R5) |
 
