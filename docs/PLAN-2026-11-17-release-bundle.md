@@ -7,7 +7,7 @@ given `--install-depends`, then hands off to
 the existing `scripts/setup.sh`. The release logic (tag check, notes range, pre-release flag) lives in
 `scripts/release-meta.sh` so it has `--test` checks with mutations. Detail below.
 
-Current step: plan gate passed (iteration 3, 91/100); next R1 `scripts/setup.sh`
+Current step: R1 `scripts/setup.sh` coded and walked through, not committed. TODO, in order: commit R1; R2 `install.sh`; R3-R6 release scripts and workflow; R7 README update (@me 2026-11-19: "make sure to add a todo in the list to update README")
 
 ## Requirements
 
@@ -103,7 +103,7 @@ The ticket's wording is reworded by @me; this plan keeps its intent: every `test
 | R4 | `.github/workflows/release.yml` build job: pinned `rust:1.95-bookworm`, `apt-get update && apt-get install -y zip` (UNVERIFIED zip is preinstalled), `release-meta.sh check-tag`, `cargo test --locked`, `cargo build --release --locked`, zip `lessons-v<ver>-linux-x86_64.zip` with top-level directory `lessons-v<ver>-linux-x86_64/` holding `install.sh`, `bin/lessons`, `scripts/setup.sh`, `skills/`, `integrations/opencode/lessons-hook.js`, `README.md`, `LICENSE`. A `concurrency` group keyed on the tag, `cancel-in-progress: false`: it only serialises a RE-PUSH of the same tag (distinct tags build independently and never touch each other's release); it serves T1 only through that re-push and is the one guard not taken from a ticket line | T1, T3, T5, D8 | `actionlint` if installed, else manual review; the zip listing in the `workflow_dispatch` run shows all seven entries |
 | R5 | Smoke job (`needs` build): unzip in `debian:bookworm-slim`, assert `git` absent, `bash install.sh --install-depends --domains shared --no-sync`, then `lessons --version` and `scripts/setup.sh --test` (T3 map above). A second smoke job tests the source path on the SAME tree a release would hold: before a release exists the source tree is `git archive --prefix=llm-lessons-<ver>/ HEAD` of the CI checkout (GitHub's own archive has the same top-level directory), unzipped and run the same way | T2, T3, D6 | green on a `workflow_dispatch` run of the branch; no test tag is pushed |
 | R6 | Release job, tags only, with `permissions: contents: write` (the default token cannot create a release): `release-meta.sh notes` into the notes file, `release-meta.sh prerelease` picks `--prerelease`, `gh release create`, binary zip attached | T1, T4, D3 | the `workflow_dispatch` run prints the notes and the flag and skips the release |
-| R7 | README "Install" (line 14): the two zips, "unzip, `cd` into the one directory, `bash install.sh`", that `--install-depends` lets it install missing system apps (D9), the Debian-only binary, the `~/.local/bin` note, and the note to restart agents after an upgrade (a running MCP keeps the old binary, see this plan's "Race and non-determinism" paragraph) | T5, D2, D6, D9 | grep finds the section |
+| R7 | README "Install" (line 14): the two zips, "unzip, `cd` into the one directory, `bash install.sh`", that `--install-depends` lets it install missing system apps (D9), the Debian-only binary, the `~/.local/bin` note with the `export PATH="$HOME/.local/bin:$PATH"` line setup prints when it is missing, and the note to restart agents after an upgrade (a running MCP keeps the old binary, see this plan's "Race and non-determinism" paragraph) | T5, D2, D6, D9 | grep finds the section |
 
 ## Tests
 
