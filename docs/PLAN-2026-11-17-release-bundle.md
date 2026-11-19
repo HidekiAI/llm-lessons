@@ -156,6 +156,7 @@ install run with `--install-depends`:
 |---|---|---|
 | `check-tag v0.1.0` against version `0.1.0` passes; `v0.1.1` against `0.1.0` and `0.1.0` (no `v`) fail | T1, D3 | always exit 0; or skip the `v` strip |
 | `check-tag vX` and `check-tag v` against `0.1.0` fail with the tag named (malformed tag) | T1 | compare only a prefix of the version; or accept an empty version after the strip |
+| `check-tag` reads the `[package]` version even when another table with its own `version =` line comes first | T1 | read the first `version =` line in the file, any table |
 | repeat after refusal: `check-tag v0.1.1` against `0.1.0` run twice exits non-zero both times with the same message | T1, D3 | the first refusal rewrites the `Cargo.toml` copy or caches the verdict |
 | `notes v0.2.0` lists only the subjects after `v0.1.0`, one `- <subject>` per commit, and the version line | T4 | range `HEAD` instead of `<previous>..<tag>` |
 | `notes v0.1.0` with no earlier tag lists every commit, exit 0 | T4 | drop the no-previous-tag branch (the lookup fails under `set -e`) |
