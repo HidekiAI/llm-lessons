@@ -140,6 +140,13 @@ install run with `--install-depends`:
 | repeat after refusal: the unknown-OS refusal and the macOS-no-cc refusal each run twice; both runs exit 1 with the same message and install nothing | T5, D5 | the first refusal writes a marker file that makes the second run proceed |
 | all present: no installs, `setup.sh` gets the same arguments | D1 | drop `"$@"` from the exec |
 | second run installs nothing (back-to-back repeat) | D1 | reinstall when present |
+| the rerun command quotes an argument with a space and names this install.sh | D9 | print the arguments unquoted |
+| macOS, a `git` found on PATH that does not run (the stub without the command line tools) counts as missing | D5 | find git on PATH instead of running it |
+| macOS, a `cc` on PATH but no command line tools (`xcode-select -p` fails): refuses | D5 | find `cc` on PATH on macOS |
+| no `apt-get` (Linux) or no Homebrew (macOS), only `cargo` missing: rustup alone, no package-manager refusal | D5 | require the package manager even with no packages |
+| source, no `cargo` and no `curl`: apt installs `curl ca-certificates`, rustup runs, and `setup.sh` finds the new `cargo` on PATH | D5 | drop `ca-certificates`; drop the `~/.cargo/bin` PATH export |
+| a failing install command is journaled with the command and its exit status; `setup.sh` never runs | D5 | run the command without logging its failure |
+| Debian, a user with no `sudo`: refuses, calls no `apt-get` | D5 | drop the `sudo` check |
 
 `release-meta.sh --test` (a temp git repo with tagged commits; a temp `Cargo.toml`):
 

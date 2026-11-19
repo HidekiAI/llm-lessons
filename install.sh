@@ -40,7 +40,7 @@ has_compiler() {
 # prebuilt bin/lessons also needs a C compiler and cargo to build, and curl only to fetch rustup when cargo is missing.
 missing_tools() {
     local os_name="$1"
-    has_tool git || echo git
+    git --version >/dev/null 2>&1 || echo git # run it, not just find it: macOS has a /usr/bin/git stub without the tools
     if [[ ! -f "$INSTALL_ROOT/bin/lessons" || ! -x "$INSTALL_ROOT/bin/lessons" ]]; then
         has_compiler "$os_name" || echo cc
         has_tool cargo || { echo cargo; has_tool curl || echo curl; }
@@ -62,17 +62,25 @@ package_names() {
     done
 }
 
-run_as_root() {
-    log_step "run: $*"
-    case "$(id -u)" in
-        0) "$@" ;;
-        *) sudo "$@" ;;
-    esac
-}
-
-fn_refuse() { # the message, then exit: nothing has been installed at this point
+fn_refuse() { # logs the message as an error, then exits
     log_step "ERROR: $*"
     exit "$EXIT_FAILURE"
+}
+
+# Runs one install command, logged; a failure is journaled with the command and its exit status before exiting.
+run_install_step() {
+    log_step "run: $*"
+    "$@" || fn_refuse "failed (exit $?): $*"
+}
+
+run_as_root() {
+    case "$(id -u)" in
+        0) run_install_step "$@" ;;
+        *)
+            has_tool sudo || fn_refuse "not root and no sudo; run install.sh as root, or install these yourself: $*"
+            run_install_step sudo "$@"
+            ;;
+    esac
 }
 
 install_missing() {
@@ -88,26 +96,25 @@ install_missing() {
             fn_refuse "no C compiler; run xcode-select --install, then rerun install.sh" ;;
     esac
     while IFS= read -r package_name; do packages+=("$package_name"); done < <(package_names "$os_name" "$@")
-    case "$os_name" in
-        Linux)
-            has_tool apt-get || fn_refuse "no apt-get on this Linux; install these yourself, then rerun: $*"
-            if [[ ${#packages[@]} -gt 0 ]]; then
+    # A package manager is needed only for packages: a missing cargo alone is fetched by rustup.
+    if [[ ${#packages[@]} -gt 0 ]]; then
+        case "$os_name" in
+            Linux)
+                has_tool apt-get || fn_refuse "no apt-get on this Linux; install these yourself, then rerun: ${packages[*]}"
                 run_as_root apt-get update # a fresh image has empty package lists
                 run_as_root apt-get install -y "${packages[@]}"
-            fi
-            ;;
-        Darwin)
-            has_tool brew || fn_refuse "no Homebrew (https://brew.sh); install these yourself, then rerun: $*"
-            if [[ ${#packages[@]} -gt 0 ]]; then
-                log_step "run: brew install ${packages[*]}"
-                brew install "${packages[@]}"
-            fi
-            ;;
-    esac
+                ;;
+            Darwin)
+                has_tool brew || fn_refuse "no Homebrew (https://brew.sh); install these yourself, then rerun: ${packages[*]}"
+                run_install_step brew install "${packages[@]}"
+                ;;
+        esac
+    fi
     case " $* " in
         *" cargo "*)
             log_step "run: rustup from https://sh.rustup.rs (-y --profile minimal)"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal ||
+                fn_refuse "rustup failed (exit $?)" # pipefail: a failed download is not masked by sh
             export PATH="$HOME/.cargo/bin:$PATH" # rustup's default install dir, for the cargo install in setup.sh
             ;;
     esac
@@ -130,7 +137,8 @@ main() {
             true) install_missing "$os_name" "${missing[@]}" ;;
             false)
                 log_step "missing: ${missing[*]}; nothing was installed. To install them, rerun:"
-                log_step "  bash install.sh $INSTALL_DEPENDS_FLAG ${setup_args[*]:-}"
+                # %q quotes each word, so an argument with a space survives being retyped
+                log_step "  $(printf '%q ' bash "$INSTALL_ROOT/install.sh" "$INSTALL_DEPENDS_FLAG" ${setup_args[@]+"${setup_args[@]}"})"
                 exit "$EXIT_FAILURE"
                 ;;
         esac
@@ -144,25 +152,30 @@ main() {
 # the case, not by this machine.
 run_self_test() {
     local test_root core_bin case_bin tool_name tool_path kind_name failures=0
-    local case_os="" case_uid="" case_tools="" case_xcode_status=0 first_status second_status first_output
+    local case_os="" case_uid="" case_tools="" case_failing="" case_xcode_status=0 first_status second_status first_output
     test_root="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/lessons-install-test.XXXXXX")" && pwd)" # pwd drops the // a TMPDIR ending in / gives
     # shellcheck disable=SC2064 # expand test_root now: it is local and gone when the trap runs
     trap "rm -rf '$test_root'" RETURN
     core_bin="$test_root/core-bin"
     case_bin="$test_root/case-bin"
     mkdir -p "$core_bin" "$test_root/home"
-    for tool_name in bash sh dirname cat mkdir date tee grep rm chmod tr; do # only what this script and the fakes run
+    for tool_name in bash sh dirname cat cp mkdir date tee grep rm chmod tr; do # only what this script and the fakes run
         tool_path="$(command -v "$tool_name")"
         ln -s "$tool_path" "$core_bin/$tool_name"
     done
     for kind_name in binary source; do # binary: the release zip with bin/lessons; source: a tree without it
         mkdir -p "$test_root/$kind_name/scripts"
         cp "${BASH_SOURCE[0]}" "$test_root/$kind_name/install.sh"
-        printf '#!/bin/sh\necho "setup $*" >>"$CALLS_LOG"\n' >"$test_root/$kind_name/scripts/setup.sh"
+        # also logs which cargo setup.sh would find, so the PATH install.sh hands over is checked
+        printf '#!/bin/sh\necho "setup $*" >>"$CALLS_LOG"\necho "setup-cargo $(command -v cargo || echo none)" >>"$CALLS_LOG"\n' \
+            >"$test_root/$kind_name/scripts/setup.sh"
     done
     mkdir -p "$test_root/binary/bin"
     printf '#!/bin/sh\n' >"$test_root/binary/bin/lessons"
     chmod +x "$test_root/binary/bin/lessons"
+    # What the fake curl serves as rustup's installer: it logs its arguments and leaves a cargo where rustup puts it.
+    printf '%s\n' 'echo "rustup-script $*" >>"$CALLS_LOG"' 'mkdir -p "$HOME/.cargo/bin"' \
+        'printf "#!/bin/sh\n" >"$HOME/.cargo/bin/cargo"' 'chmod +x "$HOME/.cargo/bin/cargo"' >"$test_root/rustup-installer.sh"
 
     check_equal() {
         local check_name="$1" expected_text="$2" actual_text="$3"
@@ -177,24 +190,34 @@ run_self_test() {
         printf '#!/bin/sh\necho "%s $*" >>"$CALLS_LOG"\n%s\n' "$1" "${2:-}" >"$case_bin/$1"
         chmod +x "$case_bin/$1"
     }
-    fn_run_case() { # zip kind (binary|source), then install.sh's arguments; case_os, case_uid, case_tools, case_xcode_status come from the caller
+    # zip kind (binary|source), then install.sh's arguments; case_os, case_uid, case_tools, case_failing and
+    # case_xcode_status come from the caller. HOME is kept between runs (a refusal must leave nothing that changes the
+    # next run), except the cargo a fake rustup left there.
+    fn_run_case() {
         local kind_name="$1"
         shift
-        rm -rf "$case_bin" "$test_root/calls.log"
+        rm -rf "$case_bin" "$test_root/calls.log" "$test_root/home/.cargo"
         mkdir -p "$case_bin"
         printf '#!/bin/sh\necho "$FAKE_UNAME"\n' >"$case_bin/uname"
         printf '#!/bin/sh\necho "$FAKE_UID"\n' >"$case_bin/id"
         printf '#!/bin/sh\nexit "$FAKE_XCODE_STATUS"\n' >"$case_bin/xcode-select"
         chmod +x "$case_bin/uname" "$case_bin/id" "$case_bin/xcode-select"
-        fn_write_fake sudo 'exec "$@"'
         for tool_name in $case_tools; do
-            case "$tool_name" in
-                curl) fn_write_fake curl "echo 'echo \"rustup-script \$*\" >>\"\$CALLS_LOG\"'" ;; # prints the "installer" sh runs
+            case "$tool_name:$case_failing" in
+                sudo:*) fn_write_fake sudo 'exec "$@"' ;;
+                curl:*) fn_write_fake curl 'cat "$FAKE_RUSTUP_INSTALLER"' ;;
+                *:*" $tool_name "*) fn_write_fake "$tool_name" 'exit 1' ;; # present but failing, like a macOS git stub
+                apt-get-with-curl:*) # an apt-get whose install leaves a curl behind, as the real one does
+                    fn_write_fake apt-get 'cp "$case_bin_dir/curl.pending" "$case_bin_dir/curl"'
+                    fn_write_fake curl 'cat "$FAKE_RUSTUP_INSTALLER"'
+                    mv "$case_bin/curl" "$case_bin/curl.pending"
+                    ;;
                 *) fn_write_fake "$tool_name" ;;
             esac
         done
         env -i HOME="$test_root/home" XDG_STATE_HOME="$test_root/state" PATH="$case_bin:$core_bin" \
             CALLS_LOG="$test_root/calls.log" FAKE_UNAME="$case_os" FAKE_UID="$case_uid" FAKE_XCODE_STATUS="$case_xcode_status" \
+            FAKE_RUSTUP_INSTALLER="$test_root/rustup-installer.sh" case_bin_dir="$case_bin" \
             bash "$test_root/$kind_name/install.sh" "$@" >"$test_root/output.txt" 2>&1 && echo 0 || echo $?
     }
     fn_calls() { # the logged calls whose first word matches the pattern, joined by ';'
@@ -207,69 +230,105 @@ run_self_test() {
         tr -d '[:digit:]' <"$test_root/output.txt"
     }
 
-    # Without --install-depends nothing is installed.
-    case_os=Linux case_uid=1000 case_tools="apt-get"
-    first_status="$(fn_run_case binary --domains shared)"
-    check_equal "Debian, git missing, no flag: refuses, names git and the rerun command, calls no apt-get or sudo" "1 1 1 " \
-        "$first_status $(fn_output_count 'missing: git; nothing was installed') $(fn_output_count "bash install.sh $INSTALL_DEPENDS_FLAG --domains shared") $(fn_calls 'apt-get|sudo')"
-    second_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "repeat after refusal: the same run with the flag installs git and hands off" "0 sudo apt-get install -y git;apt-get install -y git; setup --domains shared;" \
-        "$second_status $(fn_calls 'sudo|apt-get' | sed 's/sudo apt-get update;apt-get update;//') $(fn_calls setup)"
-    case_os=Darwin case_tools="brew"
-    first_status="$(fn_run_case binary --domains shared)"
-    check_equal "macOS, git missing, no flag: refuses with the rerun command, calls no brew" "1 1 " \
-        "$first_status $(fn_output_count "bash install.sh $INSTALL_DEPENDS_FLAG --domains shared") $(fn_calls brew)"
-    case_os=Linux case_tools="apt-get git cc curl"
-    first_status="$(fn_run_case source --domains shared)"
-    check_equal "source, no cargo, no flag: refuses, names cargo, never fetches rustup" "1 1 " \
-        "$first_status $(fn_output_count 'missing: cargo; nothing was installed') $(fn_calls 'curl|rustup-script')"
-    case_tools="apt-get git"
-    first_status="$(fn_run_case binary --domains shared)"
-    check_equal "all present, no flag: no refusal, setup.sh runs with the same arguments" "0 setup --domains shared;" \
-        "$first_status $(fn_calls setup)"
-    first_status="$(fn_run_case binary --domains shared --no-sync)"
-    second_status="$(fn_run_case binary --domains shared --no-sync)"
-    check_equal "all present, run twice (back-to-back): both hand off and neither installs anything" "0 0 " \
-        "$first_status $second_status $(fn_calls 'apt-get|sudo|brew|curl|rustup-script')"
-    fn_run_case binary --domains shared "$INSTALL_DEPENDS_FLAG" --no-sync >/dev/null
-    check_equal "the flag is removed wherever it sits; the other arguments reach setup.sh in order" "setup --domains shared --no-sync;" \
-        "$(fn_calls setup)"
+    fn_check_without_flag() {
+        local rerun_prefix="bash $test_root/binary/install.sh $INSTALL_DEPENDS_FLAG"
+        case_os=Linux case_uid=1000 case_tools="apt-get sudo" case_failing=""
+        first_status="$(fn_run_case binary --domains shared)"
+        check_equal "Debian, git missing, no flag: refuses, names git and the rerun command, calls no apt-get or sudo" "1 1 1 " \
+            "$first_status $(fn_output_count 'missing: git; nothing was installed') $(fn_output_count "$rerun_prefix --domains shared") $(fn_calls 'apt-get|sudo')"
+        second_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "repeat after refusal: the same run with the flag installs git and hands off" "0 sudo apt-get install -y git;apt-get install -y git; setup --domains shared;" \
+            "$second_status $(fn_calls 'sudo|apt-get' | sed 's/sudo apt-get update;apt-get update;//') $(fn_calls setup)"
+        fn_run_case binary --domains shared --label 'two words' >/dev/null
+        check_equal "the rerun command quotes an argument with a space, so it can be retyped" "1" \
+            "$(fn_output_count "$rerun_prefix --domains shared --label two\\ words")"
+        case_os=Darwin case_tools="brew"
+        first_status="$(fn_run_case binary --domains shared)"
+        check_equal "macOS, git missing, no flag: refuses with the rerun command, calls no brew" "1 1 " \
+            "$first_status $(fn_output_count "$rerun_prefix --domains shared") $(fn_calls brew)"
+        case_os=Linux case_tools="apt-get git cc curl"
+        first_status="$(fn_run_case source --domains shared)"
+        check_equal "source, no cargo, no flag: refuses, names cargo, never fetches rustup" "1 1 " \
+            "$first_status $(fn_output_count 'missing: cargo; nothing was installed') $(fn_calls 'curl|rustup-script')"
+        case_tools="apt-get git"
+        first_status="$(fn_run_case binary --domains shared)"
+        check_equal "all present, no flag: no refusal, setup.sh runs with the same arguments" "0 setup --domains shared;" \
+            "$first_status $(fn_calls setup)"
+        first_status="$(fn_run_case binary --domains shared --no-sync)"
+        second_status="$(fn_run_case binary --domains shared --no-sync)"
+        check_equal "all present, run twice (back-to-back): both hand off and neither installs anything" "0 0 " \
+            "$first_status $second_status $(fn_calls 'apt-get|sudo|brew|curl|rustup-script')"
+        fn_run_case binary --domains shared "$INSTALL_DEPENDS_FLAG" --no-sync >/dev/null
+        check_equal "the flag is removed wherever it sits; the other arguments reach setup.sh in order" "setup --domains shared --no-sync;" \
+            "$(fn_calls setup)"
+    }
 
-    # With --install-depends, Debian.
-    case_tools="apt-get" case_uid=1000
-    first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "Debian, binary zip, git missing, as a user: sudo apt-get installs git only (no curl, no build tools, no rustup)" \
-        "0 sudo apt-get update;sudo apt-get install -y git; " \
-        "$first_status $(fn_calls sudo) $(fn_calls 'curl|rustup-script')"
-    case_tools="apt-get cargo" case_uid=0
-    first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "Debian, source with cargo, git and cc missing, as root: one update, then one install of both; no sudo, no curl, no rustup" \
-        "0 apt-get update;apt-get install -y git build-essential; " \
-        "$first_status $(fn_calls 'apt-get|sudo') $(fn_calls 'curl|rustup-script')"
-    case_tools="apt-get git cc curl"
-    first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "source, no cargo: rustup is fetched once and run with -y --profile minimal" \
-        "0 curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs;rustup-script -y --profile minimal;" \
-        "$first_status $(fn_calls 'curl|rustup-script')"
+    fn_check_debian() {
+        case_os=Linux case_tools="apt-get sudo" case_uid=1000 case_failing=""
+        first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "Debian, binary zip, git missing, as a user: sudo apt-get installs git only (no curl, no build tools, no rustup)" \
+            "0 sudo apt-get update;sudo apt-get install -y git; " \
+            "$first_status $(fn_calls sudo) $(fn_calls 'curl|rustup-script')"
+        case_tools="apt-get"
+        first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "Debian, as a user with no sudo: refuses, calls no apt-get" "1 1 " \
+            "$first_status $(fn_output_count 'not root and no sudo') $(fn_calls apt-get)"
+        case_tools="apt-get cargo" case_uid=0
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "Debian, source with cargo, git and cc missing, as root: one update, then one install of both; no sudo, no curl, no rustup" \
+            "0 apt-get update;apt-get install -y git build-essential; " \
+            "$first_status $(fn_calls 'apt-get|sudo') $(fn_calls 'curl|rustup-script')"
+        case_tools="apt-get git cc curl"
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "source, no cargo: rustup is fetched once with -y --profile minimal, and setup.sh finds its cargo" \
+            "0 curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs;rustup-script -y --profile minimal; setup-cargo $test_root/home/.cargo/bin/cargo;" \
+            "$first_status $(fn_calls 'curl|rustup-script') $(fn_calls setup-cargo)"
+        case_tools="apt-get-with-curl git cc"
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "source, no cargo and no curl: apt installs curl with ca-certificates, then rustup runs" \
+            "0 apt-get install -y curl ca-certificates;" \
+            "$first_status $(fn_calls apt-get | sed 's/apt-get update;//')"
+        case_tools="git cc curl"
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "Linux without apt-get, only cargo missing: rustup alone, no apt refusal" "0 1 0" \
+            "$first_status $(fn_calls rustup-script | tr ';' '\n' | grep -c rustup-script) $(fn_output_count 'no apt-get')"
+        case_tools="apt-get" case_failing=" apt-get "
+        first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "a failing apt-get is journaled with the command and its exit status, and setup.sh never runs" "1 1 " \
+            "$first_status $(fn_output_count 'failed (exit 1): apt-get update') $(fn_calls setup)"
+    }
 
-    # With --install-depends, macOS and other systems.
-    case_os=Darwin case_uid=501 case_tools="brew"
-    first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "macOS, git missing: brew install git, never sudo" "0 brew install git;" \
-        "$first_status $(fn_calls 'brew|sudo')"
-    case_tools="brew git cargo" case_xcode_status=2
-    first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    first_output="$(fn_messages)"
-    second_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "macOS, source, no command line tools: points at xcode-select --install, exits 1, no setup; the same twice" \
-        "1 1 1 same" \
-        "$first_status $second_status $(fn_output_count 'xcode-select --install')$(fn_calls setup) $([[ "$first_output" == "$(fn_messages)" ]] && echo same || echo differs)"
-    case_os=FreeBSD case_tools="" case_xcode_status=0
-    first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    first_output="$(fn_messages)"
-    second_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
-    check_equal "unknown OS, git missing: exits 1 naming git, installs nothing; the same twice" "1 1 1  same" \
-        "$first_status $second_status $(fn_output_count 'install these yourself, then rerun: git') $(fn_calls 'apt-get|brew|sudo|curl|setup') $([[ "$first_output" == "$(fn_messages)" ]] && echo same || echo differs)"
+    fn_check_other_systems() {
+        case_os=Darwin case_uid=501 case_tools="brew" case_failing=""
+        first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "macOS, git missing: brew install git, never sudo" "0 brew install git;" \
+            "$first_status $(fn_calls 'brew|sudo')"
+        case_tools="brew git" case_failing=" git "
+        first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "macOS, a git that is found but does not run (the stub without the tools) counts as missing" "0 brew install git;" \
+            "$first_status $(fn_calls brew)"
+        case_tools="git curl" case_failing=""
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "macOS without Homebrew, only cargo missing: rustup alone, no Homebrew refusal" "0 1 0" \
+            "$first_status $(fn_calls rustup-script | tr ';' '\n' | grep -c rustup-script) $(fn_output_count 'no Homebrew')"
+        case_tools="brew git cargo cc" case_xcode_status=2 # cc is on PATH, as the macOS stub is; only xcode-select can tell
+        first_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        first_output="$(fn_messages)"
+        second_status="$(fn_run_case source "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "macOS, source, no command line tools: points at xcode-select --install, exits 1, no setup; the same twice" \
+            "1 1 1 same" \
+            "$first_status $second_status $(fn_output_count 'xcode-select --install')$(fn_calls setup) $([[ "$first_output" == "$(fn_messages)" ]] && echo same || echo differs)"
+        case_os=FreeBSD case_tools="" case_xcode_status=0
+        first_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        first_output="$(fn_messages)"
+        second_status="$(fn_run_case binary "$INSTALL_DEPENDS_FLAG" --domains shared)"
+        check_equal "unknown OS, git missing: exits 1 naming git, installs nothing; the same twice" "1 1 1  same" \
+            "$first_status $second_status $(fn_output_count 'install these yourself, then rerun: git') $(fn_calls 'apt-get|brew|sudo|curl|setup') $([[ "$first_output" == "$(fn_messages)" ]] && echo same || echo differs)"
+    }
+
+    fn_check_without_flag
+    fn_check_debian
+    fn_check_other_systems
 
     if [[ "$failures" -eq 0 ]]; then
         printf 'install self-test: all checks passed\n'
