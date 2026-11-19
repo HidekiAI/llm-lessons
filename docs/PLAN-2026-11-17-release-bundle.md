@@ -48,6 +48,11 @@ Decided with @me, 2026-11-17 (folded into #10; @me rewords the ticket):
   only a missing `git` (and the build tools for the source zip).
 - D8 The zip ships `LICENSE` (MIT, MEASURED: `LICENSE:1`). @me 2026-11-17: "add license = "MIT" to Cargo.toml too";
   done in this branch (`Cargo.toml:5`).
+- D9 (@me 2026-11-19) "have install.sh have `--install-depends` or something, which can then install its dependant apps
+  that ISN'T `lessons` specific"; then "go with --install-depends". So `install.sh` installs system apps only when given
+  `--install-depends`; without it, a missing app is listed with the rerun command and nothing is installed (no `sudo`
+  without consent). This narrows D6: "unzip, run `install.sh`" installs the apps only on the flagged run. Lessons-specific
+  steps stay in `setup.sh` (D1).
 
 Premises, each labelled:
 
@@ -92,12 +97,12 @@ The ticket's wording is reworded by @me; this plan keeps its intent: every `test
 | Step | Change | Serves | Done when |
 |---|---|---|---|
 | R1 | `scripts/setup.sh` `run_setup` (cargo check at line 757, `cargo install` at 765): when `$REPO_ROOT/bin/lessons` is executable, `install -m 755` it to `~/.local/bin/lessons`, set `lessons_binary` to `~/.local/bin/lessons` (today it is derived from `CARGO_INSTALL_ROOT`/`CARGO_HOME`/`~/.cargo`, lines 766-767), warn when `~/.local/bin` is not on `PATH`, and skip the cargo check; else `cargo install` as today. `run_sync_self_test` (line 959; its `lessons_binary` default is line 960) defaults `LESSONS_BIN` to `bin/lessons` when that exists | T2, D1, D2 | `setup.sh --test` green; new checks red under their mutations |
-| R2 | `install.sh` (repo root): checks `git`; when `bin/lessons` is absent also `cc`, and `curl` only when `cargo` is also absent (rustup fetch). Missing ones: `apt-get update` then `apt-get install -y` of the missing ones among `git curl ca-certificates build-essential` (with `sudo` unless root) on Debian, `brew install` of the missing ones on macOS; no `cc` on macOS prints `xcode-select --install` and exits 1; other OS lists what is missing and exits 1. No `cargo` and no `bin/lessons`: rustup with `-y --profile minimal`, then `. ~/.cargo/env`. Then `exec scripts/setup.sh "$@"`. `--test` uses fake tools on `PATH` (the shell test layer for D5's install rules) | T2, T5, D1, D5, D6, D7 | `bash install.sh --test` green; each check red under its mutation |
+| R2 | `install.sh` (repo root): checks `git`; when `bin/lessons` is absent also `cc`, and `curl` only when `cargo` is also absent (rustup fetch). Missing ones without `--install-depends`: list them, print the same command with the flag added, exit 1, install nothing. Missing ones with it: `apt-get update` then `apt-get install -y` of the missing ones among `git curl ca-certificates build-essential` (with `sudo` unless root) on Debian, `brew install` of the missing ones on macOS; no `cc` on macOS prints `xcode-select --install` and exits 1; other OS lists what is missing and exits 1. No `cargo` and no `bin/lessons`: rustup with `-y --profile minimal`, then `. ~/.cargo/env`. Then `exec scripts/setup.sh` with every argument except `--install-depends`, which `setup.sh` would refuse as unknown. `--test` uses fake tools on `PATH` (the shell test layer for D5's install rules) | T2, T5, D1, D5, D6, D7, D9 | `bash install.sh --test` green; each check red under its mutation |
 | R3 | `scripts/release-meta.sh` with subcommands `check-tag <tag> <Cargo.toml>`, `notes <tag>`, `prerelease <version>`; checks behind `--test` (repo convention, as `scripts/setup.sh --test`) | T1, T4, D3 | `bash scripts/release-meta.sh --test` green; each check red under its mutation |
 | R4 | `.github/workflows/release.yml` build job: pinned `rust:1.95-bookworm`, `apt-get update && apt-get install -y zip` (UNVERIFIED zip is preinstalled), `release-meta.sh check-tag`, `cargo test --locked`, `cargo build --release --locked`, zip `lessons-v<ver>-linux-x86_64.zip` with top-level directory `lessons-v<ver>-linux-x86_64/` holding `install.sh`, `bin/lessons`, `scripts/setup.sh`, `skills/`, `integrations/opencode/lessons-hook.js`, `README.md`, `LICENSE`. A `concurrency` group keyed on the tag, `cancel-in-progress: false`: it only serialises a RE-PUSH of the same tag (distinct tags build independently and never touch each other's release); it serves T1 only through that re-push and is the one guard not taken from a ticket line | T1, T3, T5, D8 | `actionlint` if installed, else manual review; the zip listing in the `workflow_dispatch` run shows all seven entries |
-| R5 | Smoke job (`needs` build): unzip in `debian:bookworm-slim`, assert `git` absent, `bash install.sh --domains shared --no-sync`, then `lessons --version` and `scripts/setup.sh --test` (T3 map above). A second smoke job tests the source path on the SAME tree a release would hold: before a release exists the source tree is `git archive --prefix=llm-lessons-<ver>/ HEAD` of the CI checkout (GitHub's own archive has the same top-level directory), unzipped and run the same way | T2, T3, D6 | green on a `workflow_dispatch` run of the branch; no test tag is pushed |
+| R5 | Smoke job (`needs` build): unzip in `debian:bookworm-slim`, assert `git` absent, `bash install.sh --install-depends --domains shared --no-sync`, then `lessons --version` and `scripts/setup.sh --test` (T3 map above). A second smoke job tests the source path on the SAME tree a release would hold: before a release exists the source tree is `git archive --prefix=llm-lessons-<ver>/ HEAD` of the CI checkout (GitHub's own archive has the same top-level directory), unzipped and run the same way | T2, T3, D6 | green on a `workflow_dispatch` run of the branch; no test tag is pushed |
 | R6 | Release job, tags only, with `permissions: contents: write` (the default token cannot create a release): `release-meta.sh notes` into the notes file, `release-meta.sh prerelease` picks `--prerelease`, `gh release create`, binary zip attached | T1, T4, D3 | the `workflow_dispatch` run prints the notes and the flag and skips the release |
-| R7 | README "Install" (line 14): the two zips, "unzip, `cd` into the one directory, `bash install.sh`", the Debian-only binary, the `~/.local/bin` note, and the note to restart agents after an upgrade (a running MCP keeps the old binary, see this plan's "Race and non-determinism" paragraph) | T5, D2, D6 | grep finds the section |
+| R7 | README "Install" (line 14): the two zips, "unzip, `cd` into the one directory, `bash install.sh`", that `--install-depends` lets it install missing system apps (D9), the Debian-only binary, the `~/.local/bin` note, and the note to restart agents after an upgrade (a running MCP keeps the old binary, see this plan's "Race and non-determinism" paragraph) | T5, D2, D6, D9 | grep finds the section |
 
 ## Tests
 
@@ -107,14 +112,18 @@ The ticket's wording is reworded by @me; this plan keeps its intent: every `test
 |---|---|---|
 | with a fake `bin/lessons`, setup installs it to `~/.local/bin` and never calls `cargo` | T2, D2 | delete the `bin/lessons` branch |
 | the MCP registration and `init` use `~/.local/bin/lessons`, not the cargo path | T2, D2 | leave `lessons_binary` on the cargo path |
-| back-to-back: run setup twice with a fake `bin/lessons`; both exit 0 and `~/.local/bin/lessons` is executable (mode 755) and has the fake's content both times | T2, D2 | `cp -n` (second run skips, a newer binary never lands: use a changed fake on run two); or `install` without `-m 755` |
+| back-to-back: run setup twice with a fake `bin/lessons`; both exit 0 and `~/.local/bin/lessons` is executable (mode 755) and has the fake's content both times | T2, D2 | `cp -n` (second run skips, a newer binary never lands: use a changed fake on run two); or plain `cp` (keeps the fake's mode 700; MEASURED: `install` without `-m` already gives 755, so that mutation cannot go red) |
 | without `bin/lessons`, setup still calls `cargo install` | T5 | invert the detection test |
 | `~/.local/bin` missing from `PATH` logs the warning; present, none | D2 | delete the warning |
 
-`install.sh --test` (fake `uname`, `apt-get`, `sudo`, `brew`, `curl` on `PATH`, each logging its arguments):
+`install.sh --test` (fake `uname`, `apt-get`, `sudo`, `brew`, `curl` on `PATH`, each logging its arguments). Rows that
+install run with `--install-depends`:
 
 | Check | Serves | Mutation that must turn it red |
 |---|---|---|
+| Debian, `git` missing, no flag: exit 1, names `git` and the rerun command with `--install-depends`, no `apt-get` or `sudo` call | D9 | ignore the flag (always install) |
+| repeat after refusal: the no-flag refusal, then the same run with `--install-depends`, installs `git` and hands off to `setup.sh` | D9 | the flag check reads a stale variable so the second run still refuses |
+| `--install-depends` is not passed to `setup.sh`; every other argument is, in order | D9, D1 | pass `"$@"` unfiltered |
 | Debian, binary zip, `git` missing: installs `git` only, no rustup | D5, D7 | check build tools even with `bin/lessons` |
 | Debian, source, `git` and `cc` missing: one `apt-get update`, then one `apt-get install` naming both, in that order (the fake logs the sequence) | D5 | always install every package; drop the `update` |
 | Debian, binary zip: `curl` never installed; source with `cargo` present: `curl` never installed | D5 | install `curl` unconditionally |
