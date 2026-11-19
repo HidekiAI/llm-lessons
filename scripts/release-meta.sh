@@ -136,8 +136,9 @@ run_self_test() {
     check_equal "check-tag: a [package] with no version of its own refuses every tag, also the bare v" "1 1 1" \
         "$first_status $(fn_output_count 'no [package] version') $(fn_status check-tag v0.1.0 "$test_root/workspace-Cargo.toml")"
     printf "[package] # the crate\r\n  version = '0.1.0'\r\n" >"$test_root/quoted-Cargo.toml"
-    check_equal "check-tag: single quotes, an indented version, CRLF and a header comment are read" "0" \
-        "$(fn_status check-tag v0.1.0 "$test_root/quoted-Cargo.toml")"
+    printf '[package]\r\nversion = "0.1.0"\r\n' >"$test_root/crlf-Cargo.toml" # a bare header: only the CR strip matches it
+    check_equal "check-tag: single quotes, an indented version, CRLF and a header comment are read" "0 0" \
+        "$(fn_status check-tag v0.1.0 "$test_root/quoted-Cargo.toml") $(fn_status check-tag v0.1.0 "$test_root/crlf-Cargo.toml")"
     first_status="$(fn_status check-tag v0.1.0 "$test_root/missing-Cargo.toml")"
     check_equal "check-tag: an unreadable Cargo.toml is refused and named" "1 1" \
         "$first_status $(fn_output_count "cannot read $test_root/missing-Cargo.toml")"
@@ -166,8 +167,8 @@ run_self_test() {
         "$(fn_status prerelease 0.1.0 >/dev/null; grep -v '^\[' "$test_root/output.txt") $(fn_status prerelease 1.0.0 >/dev/null; grep -v '^\[' "$test_root/output.txt")"
     check_equal "prerelease: 0.1.0-rc.1 is a pre-release, 10.0.0 is not" "true false" \
         "$(fn_status prerelease 0.1.0-rc.1 >/dev/null; grep -v '^\[' "$test_root/output.txt") $(fn_status prerelease 10.0.0 >/dev/null; grep -v '^\[' "$test_root/output.txt")"
-    check_equal "prerelease: 9x, 1 and an empty version are refused, not published as full releases" "1 1 1" \
-        "$(fn_status prerelease 9x) $(fn_status prerelease 1) $(fn_status prerelease '')"
+    check_equal "prerelease: 9x, 1, x1.0.0 and an empty version are refused, not published as full releases" "1 1 1 1" \
+        "$(fn_status prerelease 9x) $(fn_status prerelease 1) $(fn_status prerelease x1.0.0) $(fn_status prerelease '')"
 
     if [[ "$failures" -eq 0 ]]; then
         printf 'release-meta self-test: all checks passed\n'
