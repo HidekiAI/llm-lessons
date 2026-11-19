@@ -6,6 +6,9 @@ name: release
 on:
   push:
     tags: ['v*']
+    # Temporary: a manual run needs this file on the default branch, so a push to this branch runs it instead (the
+    # release job only runs on tags). Remove before merging to trunk.
+    branches: [ci/release-bundle]
   workflow_dispatch:
 
 # Only a re-push of the same tag shares a group, and it waits rather than cancelling a release half made.
@@ -18,7 +21,7 @@ permissions:
 
 defaults:
   run:
-    shell: bash # the steps use bash arrays and [[ ]]
+    shell: bash # the steps use bash arrays and [[ ]]; a container job's default shell is sh
 
 jobs:
   build:
@@ -39,16 +42,15 @@ jobs:
             /usr/local/cargo/registry
             /usr/local/cargo/git
             target
-          key: cargo-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-release-
+          key: cargo-release-${{ hashFiles('Cargo.lock') }} # no restore-keys: a release never starts from another lock's build
       - name: Install zip
         run: apt-get update && apt-get install -y zip
       - name: Read the version
         id: version
         run: |
-          package_id="$(cargo pkgid)"
-          echo "version=${package_id##*@}" >>"$GITHUB_OUTPUT"
-          echo "version ${package_id##*@} from $package_id"
+          package_id="$(cargo pkgid)" # ...#lessons@0.1.0, or ...#0.1.0 when the package and directory names match
+          echo "version=${package_id##*[@#]}" >>"$GITHUB_OUTPUT"
+          echo "version ${package_id##*[@#]} from $package_id"
       - name: The tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -61,8 +63,8 @@ jobs:
         run: |
           bash scripts/release-meta.sh notes "$NOTES_REF"
           echo "prerelease: $(bash scripts/release-meta.sh prerelease "$VERSION")"
-      - name: Test
-        run: cargo test --locked
+      - name: Test, in the release profile so the build below reuses the compiled code
+        run: cargo test --release --locked
       - name: Build
         run: cargo build --release --locked
       - name: Package the binary zip and the source zip
@@ -78,7 +80,7 @@ jobs:
           cp integrations/opencode/lessons-hook.js "$bundle_dir/integrations/opencode/"
           zip -r "$bundle_dir.zip" "$bundle_dir"
           unzip -l "$bundle_dir.zip"
-          # The same tree GitHub attaches as "Source code (zip)", so the source path is tested before a release exists.
+          # The tree GitHub's "Source code (zip)" is expected to match, so the source path is tested before a release exists.
           git archive --format=zip --prefix="llm-lessons-$VERSION/" -o "llm-lessons-$VERSION.zip" HEAD
       - uses: actions/upload-artifact@v4
         with:
@@ -101,7 +103,7 @@ jobs:
           grep -E '^(ID|PRETTY_NAME)=' /etc/os-release
           grep -qx 'ID=debian' /etc/os-release
           apt-get update && apt-get install -y unzip
-          ! command -v git
+          ! command -v git # keep last: bash -e does not stop on a failed negated command, only the last status counts
       - name: Unzip and run install.sh
         run: |
           unzip -q "lessons-v$VERSION-linux-x86_64.zip"
@@ -125,7 +127,7 @@ jobs:
       - name: Install unzip only; git, cc and cargo must still be missing
         run: |
           apt-get update && apt-get install -y unzip
-          ! command -v git && ! command -v cc && ! command -v cargo
+          ! command -v git && ! command -v cc && ! command -v cargo # keep last, as above
       - name: Unzip and run install.sh, which builds from source
         run: |
           unzip -q "llm-lessons-$VERSION.zip"
