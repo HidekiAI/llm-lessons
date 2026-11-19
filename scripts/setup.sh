@@ -754,17 +754,28 @@ run_setup() {
     fi
 
     log_step "setup: repo $REPO_ROOT, domains ${domain_names[*]}, agents ${agent_names[*]:-none}, log $LOG_FILE"
-    if ! command -v cargo >/dev/null 2>&1; then
-        # A dry run only shows the steps, so it goes on without cargo.
-        if [[ "$dry_run" != true ]]; then
-            log_step "ERROR: cargo not found; install Rust from https://rustup.rs"
-            exit "$EXIT_FAILURE"
+    local lessons_binary bundled_binary="$REPO_ROOT/bin/lessons" user_bin_dir="$HOME/.local/bin"
+    if [[ -x "$bundled_binary" ]]; then
+        # A release zip carries a prebuilt binary, so no cargo is needed. install (not cp) sets mode 755 and replaces
+        # the file, so a running MCP server keeps its old copy instead of failing with "Text file busy".
+        lessons_binary="$user_bin_dir/lessons"
+        run_step mkdir -p "$user_bin_dir"
+        run_step install -m 755 "$bundled_binary" "$lessons_binary"
+        [[ ":$PATH:" == *":$user_bin_dir:"* ]] ||
+            log_step "WARNING: $user_bin_dir is not on PATH; to run lessons by name, add this line to your shell config: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    else
+        if ! command -v cargo >/dev/null 2>&1; then
+            # A dry run only shows the steps, so it goes on without cargo.
+            if [[ "$dry_run" != true ]]; then
+                log_step "ERROR: cargo not found; install Rust from https://rustup.rs"
+                exit "$EXIT_FAILURE"
+            fi
+            log_step "note: cargo not found; a real run needs it (https://rustup.rs)"
         fi
-        log_step "note: cargo not found; a real run needs it (https://rustup.rs)"
+        run_step cargo install --locked --path "$REPO_ROOT"
+        # Where `cargo install` puts the binary: CARGO_INSTALL_ROOT, else CARGO_HOME, else ~/.cargo.
+        lessons_binary="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/lessons"
     fi
-    run_step cargo install --locked --path "$REPO_ROOT"
-    # Where `cargo install` puts the binary: CARGO_INSTALL_ROOT, else CARGO_HOME, else ~/.cargo.
-    local lessons_binary="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/lessons"
     for domain_name in "${domain_names[@]}"; do
         run_step "$lessons_binary" init --domain "$domain_name"
     done
@@ -954,10 +965,63 @@ run_skill_self_test() {
         "$(sed -n "${USAGE_FIRST_LINE},${USAGE_LAST_LINE}p" "${BASH_SOURCE[0]}" | grep -c -e '--no-skills')"
 }
 
+# The release-zip checks, run by --test: a copy of this script in a temp tree shaped like the unpacked binary zip, run
+# with a temp HOME and fake cargo, claude and lessons that log their calls. Called from run_self_test, whose check_equal
+# and failure count it uses.
+run_bundle_self_test() {
+    local test_root bundle_root fake_bin home_dir installed_binary first_status second_status tool_name
+    test_root="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/lessons-setup-bundle.XXXXXX")" && pwd)" # pwd drops the // a TMPDIR ending in / gives, as REPO_ROOT does
+    # shellcheck disable=SC2064 # expand test_root now: it is local and gone when the trap runs
+    trap "rm -rf '$test_root'" RETURN
+    bundle_root="$test_root/bundle"
+    fake_bin="$test_root/fake-bin"
+    home_dir="$test_root/home"
+    installed_binary="$home_dir/.local/bin/lessons"
+    mkdir -p "$bundle_root/scripts" "$fake_bin" "$home_dir"
+    cp "$REPO_ROOT/scripts/setup.sh" "$bundle_root/scripts/setup.sh"
+    for tool_name in cargo claude; do
+        printf '#!/bin/sh\necho "%s $*" >>"%s/calls.log"\n' "$tool_name" "$test_root" >"$fake_bin/$tool_name"
+        chmod +x "$fake_bin/$tool_name"
+    done
+    fn_write_fake_lessons() { # the zip's prebuilt binary; the build label tells two zips apart, mode 700 so a plain cp shows
+        mkdir -p "$bundle_root/bin"
+        printf '#!/bin/sh\n# build %s\necho "$0 $*" >>"%s/calls.log"\n' "$1" "$test_root" >"$bundle_root/bin/lessons"
+        chmod 700 "$bundle_root/bin/lessons"
+    }
+    fn_run_bundle_setup() { # the PATH for the run; setup's output goes to setup-output.txt, its exit status is printed
+        HOME="$home_dir" XDG_STATE_HOME="$test_root/state" LESSONS_HOME="$test_root/lessons-home" PATH="$1" \
+            bash "$bundle_root/scripts/setup.sh" --domains shared --agents claude --no-sync --no-skills \
+            >"$test_root/setup-output.txt" 2>&1 && echo 0 || echo $?
+    }
+
+    fn_write_fake_lessons one
+    first_status="$(fn_run_bundle_setup "$fake_bin:$PATH")"
+    check_equal "release zip: bin/lessons is installed to ~/.local/bin and cargo is never called" "0 build-one 0" \
+        "$first_status $(grep -o 'build one' "$installed_binary" 2>/dev/null | tr ' ' -) $(grep -c '^cargo ' "$test_root/calls.log" 2>/dev/null)"
+    check_equal "release zip: init and the MCP registration use ~/.local/bin/lessons" "1 1" \
+        "$(grep -cxF "$installed_binary init --domain shared" "$test_root/calls.log" 2>/dev/null) $(grep -cxF "claude mcp add --scope user lessons -- $installed_binary mcp" "$test_root/calls.log" 2>/dev/null)"
+    check_equal "release zip: ~/.local/bin missing from PATH is warned about, with the line to add" "1 1" \
+        "$(grep -c '\.local/bin is not on PATH' "$test_root/setup-output.txt") $(grep -cF 'export PATH="$HOME/.local/bin:$PATH"' "$test_root/setup-output.txt")"
+
+    fn_write_fake_lessons two
+    second_status="$(fn_run_bundle_setup "$home_dir/.local/bin:$fake_bin:$PATH")"
+    check_equal "release zip: a second run installs the newer binary, mode 755" "0 build-two -rwxr-xr-x" \
+        "$second_status $(grep -o 'build two' "$installed_binary" 2>/dev/null | tr ' ' -) $(ls -l "$installed_binary" 2>/dev/null | cut -c1-10)"
+    check_equal "release zip: ~/.local/bin on PATH gives no warning" "0" \
+        "$(grep -c '\.local/bin is not on PATH' "$test_root/setup-output.txt")"
+
+    rm -rf "${bundle_root:?}/bin" "${test_root:?}/calls.log"
+    fn_run_bundle_setup "$fake_bin:$PATH" >/dev/null # fails after cargo, at init: the fake cargo builds nothing
+    check_equal "no bin/lessons: setup still calls cargo install" "1" \
+        "$(grep -cxF "cargo install --locked --path $bundle_root" "$test_root/calls.log" 2>/dev/null)"
+}
+
 # The sync-configuration checks, run by --test with piped answers in throwaway LESSONS_HOME dirs.
 # Called from run_self_test, whose check_equal and failure count it uses.
 run_sync_self_test() {
-    local test_root lessons_binary="${LESSONS_BIN:-$REPO_ROOT/target/debug/lessons}" config_text prompt_text quiet_text loud_text invalid_dir
+    local test_root lessons_binary="${LESSONS_BIN:-$REPO_ROOT/target/debug/lessons}" config_text
+    [[ -n "${LESSONS_BIN:-}" || ! -x "$REPO_ROOT/bin/lessons" ]] || lessons_binary="$REPO_ROOT/bin/lessons" # a release zip has no target/, only its prebuilt bin/lessons
+    local prompt_text quiet_text loud_text invalid_dir
     test_root="$(mktemp -d "${TMPDIR:-/tmp}/lessons-setup-test.XXXXXX")"
     # shellcheck disable=SC2064 # expand test_root now: it is local and gone when the trap runs
     trap "rm -rf '$test_root'" RETURN
@@ -1195,6 +1259,7 @@ run_self_test() {
     check_equal "platform: a WSL2 LESSONS_HOME on the Windows drive is warned about, also the drive root itself" "1 1 0" \
         "$(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c/Users/u/.lessons 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /mnt/c 2>&1 | grep -c 'Windows drive') $(check_platform Linux 5.15-microsoft-standard-WSL2 Debian /home/u/.lessons 2>&1 | grep -c 'Windows drive')"
     run_skill_self_test
+    run_bundle_self_test
     run_sync_self_test
     if [[ "$failures" -eq 0 ]]; then
         printf 'setup self-test: all checks passed\n'
