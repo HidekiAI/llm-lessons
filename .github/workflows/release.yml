@@ -1,0 +1,159 @@
+# A tag v<Cargo version> builds the Debian x86_64 binary zip, smoke-tests both zips in a clean Debian, then publishes a
+# GitHub release. A manual run (workflow_dispatch) does everything except the release, so a branch can be checked
+# without pushing a tag.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Only a re-push of the same tag shares a group, and it waits rather than cancelling a release half made.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # the steps use bash arrays and [[ ]]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: rust:1.95-bookworm
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the notes need the previous tag and the history since it
+      - name: Trust the checkout (the container runs as a different user than the runner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Cache the cargo registry and the build
+        uses: actions/cache@v4
+        with:
+          path: | # the image's CARGO_HOME is /usr/local/cargo
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-release-
+      - name: Install zip
+        run: apt-get update && apt-get install -y zip
+      - name: Read the version
+        id: version
+        run: |
+          package_id="$(cargo pkgid)"
+          echo "version=${package_id##*@}" >>"$GITHUB_OUTPUT"
+          echo "version ${package_id##*@} from $package_id"
+      - name: The tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: bash scripts/release-meta.sh check-tag "$TAG_NAME" Cargo.toml
+      - name: Show the release notes and the pre-release flag
+        env:
+          NOTES_REF: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'HEAD' }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash scripts/release-meta.sh notes "$NOTES_REF"
+          echo "prerelease: $(bash scripts/release-meta.sh prerelease "$VERSION")"
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package the binary zip and the source zip
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bundle_dir="lessons-v$VERSION-linux-x86_64"
+          mkdir -p "$bundle_dir/bin" "$bundle_dir/scripts" "$bundle_dir/integrations/opencode"
+          cp install.sh README.md LICENSE "$bundle_dir/"
+          cp target/release/lessons "$bundle_dir/bin/"
+          cp scripts/setup.sh "$bundle_dir/scripts/"
+          cp -R skills "$bundle_dir/"
+          cp integrations/opencode/lessons-hook.js "$bundle_dir/integrations/opencode/"
+          zip -r "$bundle_dir.zip" "$bundle_dir"
+          unzip -l "$bundle_dir.zip"
+          # The same tree GitHub attaches as "Source code (zip)", so the source path is tested before a release exists.
+          git archive --format=zip --prefix="llm-lessons-$VERSION/" -o "llm-lessons-$VERSION.zip" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zips
+          path: '*.zip'
+          if-no-files-found: error
+
+  smoke-binary:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: debian:bookworm-slim
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zips
+      - name: Install unzip only; git must still be missing
+        run: |
+          grep -E '^(ID|PRETTY_NAME)=' /etc/os-release
+          grep -qx 'ID=debian' /etc/os-release
+          apt-get update && apt-get install -y unzip
+          ! command -v git
+      - name: Unzip and run install.sh
+        run: |
+          unzip -q "lessons-v$VERSION-linux-x86_64.zip"
+          cd "lessons-v$VERSION-linux-x86_64"
+          bash install.sh --install-depends --domains shared --no-sync
+          git --version
+          "$HOME/.local/bin/lessons" --version
+      - name: setup.sh checks, using the zip's bin/lessons
+        run: bash "lessons-v$VERSION-linux-x86_64/scripts/setup.sh" --test
+
+  smoke-source:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: debian:bookworm-slim
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zips
+      - name: Install unzip only; git, cc and cargo must still be missing
+        run: |
+          apt-get update && apt-get install -y unzip
+          ! command -v git && ! command -v cc && ! command -v cargo
+      - name: Unzip and run install.sh, which builds from source
+        run: |
+          unzip -q "llm-lessons-$VERSION.zip"
+          cd "llm-lessons-$VERSION"
+          bash install.sh --install-depends --domains shared --no-sync
+          "$HOME/.cargo/bin/lessons" --version
+
+  release:
+    needs: [build, smoke-binary, smoke-source]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # creating a release needs it; the default token is read-only here
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: zips
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          bash scripts/release-meta.sh notes "$TAG_NAME" >release-notes.md
+          prerelease_flag=()
+          [[ "$(bash scripts/release-meta.sh prerelease "$VERSION")" != true ]] || prerelease_flag=(--prerelease)
+          gh release create "$TAG_NAME" "lessons-v$VERSION-linux-x86_64.zip" --title "lessons $TAG_NAME" \
+            --notes-file release-notes.md "${prerelease_flag[@]}"
