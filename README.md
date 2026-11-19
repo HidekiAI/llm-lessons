@@ -220,6 +220,12 @@ So lessons merges each lesson field by field, against the version both machines 
 
 Everything else is git: lessons only fetches, commits on top of the remote tip, and pushes. It never runs `git merge` or `git pull`.
 
+### Does `lessons sync` pull the latest JSONL files automatically?
+
+Yes in effect, but not with a literal `git pull`. Each sync cycle runs `git fetch origin` (no throttle on the explicit command), reads the remote `<domain>.jsonl` at the fetched tip, three-way merges it into your local database field by field, then resets its clone to the remote tip, commits and pushes a fast-forward. So running `lessons sync` is all you need: there is no reason to `cd ~/.lessons/sync/<slug>/ && git pull` yourself.
+
+`pull_every_minutes` (default 10) does not gate the explicit `lessons sync` command. It belongs to the automatic background sync, which is not built yet; until then, run `lessons sync` by hand.
+
 ### Why are there no extra indexes in the SQLite files?
 
 Every query that runs often already has one:
