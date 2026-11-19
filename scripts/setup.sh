@@ -755,7 +755,7 @@ run_setup() {
 
     log_step "setup: repo $REPO_ROOT, domains ${domain_names[*]}, agents ${agent_names[*]:-none}, log $LOG_FILE"
     local lessons_binary bundled_binary="$REPO_ROOT/bin/lessons" user_bin_dir="$HOME/.local/bin"
-    if [[ -x "$bundled_binary" ]]; then
+    if [[ -f "$bundled_binary" && -x "$bundled_binary" ]]; then # -x alone is also true for a directory
         # A release zip carries a prebuilt binary, so no cargo is needed. install (not cp) sets mode 755 and replaces
         # the file, so a running MCP server keeps its old copy instead of failing with "Text file busy".
         lessons_binary="$user_bin_dir/lessons"
@@ -995,7 +995,7 @@ run_bundle_self_test() {
     }
 
     fn_write_fake_lessons one
-    first_status="$(fn_run_bundle_setup "$fake_bin:$PATH")"
+    first_status="$(fn_run_bundle_setup "$home_dir/.local/bin2:$fake_bin:$PATH")" # a lookalike entry must not count as ~/.local/bin
     check_equal "release zip: bin/lessons is installed to ~/.local/bin and cargo is never called" "0 build-one 0" \
         "$first_status $(grep -o 'build one' "$installed_binary" 2>/dev/null | tr ' ' -) $(grep -c '^cargo ' "$test_root/calls.log" 2>/dev/null)"
     check_equal "release zip: init and the MCP registration use ~/.local/bin/lessons" "1 1" \
@@ -1011,8 +1011,9 @@ run_bundle_self_test() {
         "$(grep -c '\.local/bin is not on PATH' "$test_root/setup-output.txt")"
 
     rm -rf "${bundle_root:?}/bin" "${test_root:?}/calls.log"
+    mkdir -p "$bundle_root/bin/lessons" # a directory passes -x, so only the -f test keeps it off the bundle branch
     fn_run_bundle_setup "$fake_bin:$PATH" >/dev/null # fails after cargo, at init: the fake cargo builds nothing
-    check_equal "no bin/lessons: setup still calls cargo install" "1" \
+    check_equal "no bin/lessons file (a directory there): setup still calls cargo install" "1" \
         "$(grep -cxF "cargo install --locked --path $bundle_root" "$test_root/calls.log" 2>/dev/null)"
 }
 
