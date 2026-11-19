@@ -15,7 +15,8 @@ Lessons learned from each|every sessions based on trials, errors, failures, and 
 
 ### From a release
 
-Each release has two zips. Either way: unzip, `cd` into the one directory it holds, run `install.sh`.
+Each release on the [Releases page](https://github.com/HidekiAI/llm-lessons/releases) has two zips. Either way: unzip,
+`cd` into the one directory it holds, run `install.sh`. Each zip carries this README, so the steps travel with it.
 
 - `lessons-v<version>-linux-x86_64.zip`: a prebuilt binary, for **Debian x86_64 (64-bit) only**.
 - "Source code (zip)": every other platform; it builds `lessons` with cargo.

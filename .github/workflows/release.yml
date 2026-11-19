@@ -77,6 +77,9 @@ jobs:
           cp integrations/opencode/lessons-hook.js "$bundle_dir/integrations/opencode/"
           zip -r "$bundle_dir.zip" "$bundle_dir"
           unzip -l "$bundle_dir.zip"
+          # The zip's README is its install guide: fail the build if it ever loses the release steps.
+          zipped_readme="$(unzip -p "$bundle_dir.zip" "$bundle_dir/README.md")" # not a pipe: grep -q under pipefail can kill unzip
+          grep -q '^### From a release$' <<<"$zipped_readme"
           # The tree GitHub's "Source code (zip)" is expected to match, so the source path is tested before a release exists.
           git archive --format=zip --prefix="llm-lessons-$VERSION/" -o "llm-lessons-$VERSION.zip" HEAD
       - uses: actions/upload-artifact@v4
