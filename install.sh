@@ -58,7 +58,6 @@ package_names() {
             Linux:curl) printf '%s\n' curl ca-certificates ;;
             Darwin:curl) echo curl ;;
             *:cargo | Darwin:cc) ;; # rustup below; on macOS the compiler comes from xcode-select --install
-            *) log_step "ERROR: no package known for $tool_name on $os_name" && return "$EXIT_FAILURE" ;;
         esac
     done
 }
