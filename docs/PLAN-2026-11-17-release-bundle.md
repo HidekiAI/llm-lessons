@@ -89,7 +89,7 @@ cannot run against it. Mapping each assertion:
 | `git --version` works | the smoke job asserts `git --version` after `install.sh` installed it (R5) |
 | `cargo test -q` passes | CI runs `cargo test --locked` in the Debian build image BEFORE packaging (R4); the binary tested is the one built |
 | `git ls-files` tests | stay in `cargo test` in CI (a git checkout there); not reachable from a zip |
-| (new) the bundle itself installs | smoke job: `install.sh`, then `lessons --version`, then `scripts/setup.sh --test` with `LESSONS_BIN=bin/lessons` (R5) |
+| (new) the bundle itself installs | smoke job: `install.sh`, then `lessons --version`, then plain `scripts/setup.sh --test` with no `LESSONS_BIN`, so its fallback to the zip's `bin/lessons` is what runs (R5) |
 
 The ticket's wording is reworded by @me; this plan keeps its intent: every `test-debian.sh` assertion has a home.
 
@@ -155,7 +155,7 @@ install run with `--install-depends`:
 Workflow-only parts (`docker`, `gh release create`, the zip step) are checked by the `workflow_dispatch` run, not a unit test
 (R4, R5, R6 "Done when").
 
-Race and non-determinism: not reachable in the scripts. Each runs once, by one user, on one machine; no shared row, no timer.
+Race and non-determinism: not reachable in the scripts. Interactive `sudo` (from `--install-depends`, non-root, no passwordless sudo) prompts for a password: fine in a terminal, and the CI smoke jobs run as root so never prompt; no extra refusal is planned. Each runs once, by one user, on one machine; no shared row, no timer.
 One caveat for the new setup branch: `install` replaces `~/.local/bin/lessons` by unlink and create, so an MCP server already
 running keeps its old inode and keeps running the old binary until restarted (UNVERIFIED for this `install` build; `cp` would
 instead write into the running file and fail with "Text file busy"). The upgrade note in R7 says to restart agents. The only
