@@ -7,7 +7,7 @@ given `--install-depends`, then hands off to
 the existing `scripts/setup.sh`. The release logic (tag check, notes range, pre-release flag) lives in
 `scripts/release-meta.sh` so it has `--test` checks with mutations. Detail below.
 
-Current step: R1-R3 committed, reviewed and pushed; R4-R6 workflow committed and reviewed, first run pending. TODO, in order: R4-R6 workflow run green on the temporary branch trigger, then REMOVE that `branches:` trigger before merging; R7 README update (@me 2026-11-19: "make sure to add a todo in the list to update README")
+Current step: R1-R7 done; workflow run 44623131071 green on the temporary branch trigger (now removed). Next: merge to trunk; @me rewords #10 and closes #9.
 
 ## Requirements
 

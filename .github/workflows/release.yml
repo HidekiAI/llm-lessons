@@ -6,9 +6,6 @@ name: release
 on:
   push:
     tags: ['v*']
-    # Temporary: a manual run needs this file on the default branch, so a push to this branch runs it instead (the
-    # release job only runs on tags). Remove before merging to trunk.
-    branches: [ci/release-bundle]
   workflow_dispatch:
 
 # Only a re-push of the same tag shares a group, and it waits rather than cancelling a release half made.
