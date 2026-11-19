@@ -17,7 +17,7 @@ Lessons learned from each|every sessions based on trials, errors, failures, and 
 
 Each release has two zips. Either way: unzip, `cd` into the one directory it holds, run `install.sh`.
 
-- `lessons-v<version>-linux-x86_64.zip`: a prebuilt binary, for **Debian 64-bit only**.
+- `lessons-v<version>-linux-x86_64.zip`: a prebuilt binary, for **Debian x86_64 (64-bit) only**.
 - "Source code (zip)": every other platform; it builds `lessons` with cargo.
 
 ```sh
@@ -26,7 +26,7 @@ cd lessons-v0.1.0-linux-x86_64
 bash install.sh --domains work,shared --agents opencode,claude
 ```
 
-`install.sh` first checks the apps lessons needs: `git`, and for the source zip also a C compiler, `cargo` and `curl`. If one is missing it lists them and installs nothing; rerun with `--install-depends` to let it install them with `apt-get` (through `sudo` unless you are root) or Homebrew, and Rust with rustup. On macOS the C compiler comes from `xcode-select --install`, which you run yourself. It then passes every other argument to `scripts/setup.sh`, described below.
+`install.sh` first checks the apps lessons needs: `git`, and for the source zip also a C compiler and `cargo` (with `curl` to fetch Rust when `cargo` is missing). If one is missing it lists them and installs nothing; rerun with `--install-depends` to let it install them with `apt-get` (through `sudo` unless you are root) or Homebrew, and Rust with rustup. On macOS the C compiler comes from `xcode-select --install`, which you run yourself. It then passes every other argument to `scripts/setup.sh`, described below.
 
 The binary zip installs `lessons` to `~/.local/bin/lessons`. If `~/.local/bin` is not on your PATH, setup prints the line to add to your shell config: `export PATH="$HOME/.local/bin:$PATH"`. To upgrade, run `install.sh` from the newer zip, then restart your agents: an MCP server that is already running keeps the old binary until it restarts. The upgrading note below (DB migration) applies to a release too.
 
