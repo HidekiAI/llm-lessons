@@ -246,6 +246,31 @@ Yes in effect, but not with a literal `git pull`. Each sync cycle runs `git fetc
 
 `pull_every_minutes` (default 10) does not gate the explicit `lessons sync` command. It belongs to the automatic background sync, which is not built yet; until then, run `lessons sync` by hand.
 
+### How do I import my existing SQLite lessons into another machine whose old sync repos no longer exist?
+
+Copy the `.db` file, point the config at a new repo, then run `lessons sync`. There is no `import` command, and none is needed: the `.db` is the data, and the repo only carries a text copy of it.
+
+1. **Copy the files** of the domains that machine should hold (`work.db`, `personal.db`, `shared.db`) into its `~/.lessons/`, e.g. `scp ~/.lessons/personal.db ~/.lessons/shared.db newhost:~/.lessons/`. Run no `lessons` command on either side while you copy. SQLite runs these files in WAL mode, so also copy any `<name>.db-wal` and `<name>.db-shm` beside each file, or the newest lessons are left behind.
+2. **Point the config at a repo that exists.** In `~/.lessons/config.toml` on the new machine, replace the dead `remote` of each `[sync.<domain>]` with a new private repo (an empty one is fine) and check `ssh_key`. Keep a work repo private.
+3. **Run `lessons sync`.** A new remote gets a new `<slug>` clone under `~/.lessons/sync/`, so there is no earlier synced version to compare against, and the first sync is a union: every local lesson is written to the repo as `<domain>.jsonl` and pushed. Nothing is dropped.
+4. **Check the count:** `lessons list --limit 1000 | wc -l` before and after the sync, on both machines.
+
+Then delete the old `~/.lessons/sync/<slug>/` clones of the dead remotes. Nothing reads them once the config no longer names them.
+
+**The new machine already has lessons of its own? Two `.db` files are never merged directly**: there is no command for it, and copying one over the other replaces it. The only merge is `lessons sync` through a repo, so put both sets of lessons through the same repo:
+
+1. On the new machine, sync its own `.db` to the new repo as in step 3 above.
+2. Give the old `.db` a temporary home of its own, with a config naming the SAME repo and key: `mkdir /tmp/old-lessons`, copy the old `shared.db` (plus its `-wal` and `-shm`) and a `config.toml` with only `[sync.shared]` into it.
+3. Run `LESSONS_HOME=/tmp/old-lessons lessons sync --domain shared`. This pushes the old lessons into the same `shared.jsonl`, merged with what step 1 pushed.
+4. Run `lessons sync` on the new machine. It pulls the old lessons into its `shared.db`.
+5. Check the counts with `lessons list --limit 1000 | wc -l`, then delete `/tmp/old-lessons`.
+
+Every lesson has its own ULID, so two databases that grew apart share no ids and the merge is a plain union. The same id on both sides with different text in one field cannot be told apart without a base: sync keeps one value and queues the other, and `lessons resolve` asks you per field. Do not replay the old lessons with `lessons add --json -`: `add` always makes a new id, so any lesson both sides already hold is duplicated.
+
+**Will the same problem, recorded on both machines, collide?** Not as a conflict: the two lessons have different ids, sync compares ids and never the title or text (checked in the source, not by running a merged pair), so both survive and `lessons search` returns both. After the merge, search the recurring topics (`lessons search "<error text>"`) and run `lessons retire <old-id> --by <kept-id>` on each pair: it hides the duplicate from search and deletes nothing. There is no automatic duplicate finder yet; a `lessons dedupe` that finds near-duplicate pairs and merges them is requested in [#35](https://github.com/HidekiAI/llm-lessons/issues/35).
+
+**Why not `INSERT` the rows with `sqlite3`?** A hand-made database skips the FTS5 search index, the triggers and the schema version that `lessons` creates, so the schema check refuses it or search finds nothing (see the CSV row in [Why does git store JSON lines](#why-does-git-store-json-lines-and-never-the-db-itself)).
+
 ### Why are there no extra indexes in the SQLite files?
 
 Every query that runs often already has one:
@@ -278,3 +303,4 @@ Only the hook adds text to the prompt on its own, and a prompt that matches noth
 ## Phase 2 (not built yet)
 
 - Semantic search with sqlite-vec embeddings.
+- `lessons dedupe`: find near-duplicate lessons and merge each confirmed pair into one row ([#35](https://github.com/HidekiAI/llm-lessons/issues/35)).
