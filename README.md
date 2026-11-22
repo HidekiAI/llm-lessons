@@ -7,7 +7,7 @@ Your coding assistant fixed a similar pattern of bugs last week. Today it walks 
 
 It is only as good as what you feed it: record what each session learned, and every post-mortem, in the same session, every time. An empty or stale database teaches nothing.
 
-Lessons learned from each|every sessions based on trials, errors, failures, and building postmortem style database, so that LLMs can query the lessons db to make sure mistakes|err are not repeated
+Correct approaches change; mistakes do not. A fix that was right ten years ago may be superseded tomorrow, but an anti-pattern is still an anti-pattern. `lessons` is a record of failures, not a catalogue of best practices: it keeps each mistake beside what fixed it, and a new way of doing something right never makes an old mistake correct.
 
 `lessons` is a small CLI that records each problem: what went wrong, why, what fixed it, and what was tried that did NOT work. A human or an LLM can then search it before debugging the same thing again. The failed attempts are kept on purpose: they are what saves a repeat of the same dead end.
 
@@ -245,6 +245,12 @@ Everything else is git: lessons only fetches, commits on top of the remote tip, 
 Yes in effect, but not with a literal `git pull`. Each sync cycle runs `git fetch origin` (no throttle on the explicit command), reads the remote `<domain>.jsonl` at the fetched tip, three-way merges it into your local database field by field, then resets its clone to the remote tip, commits and pushes a fast-forward. So running `lessons sync` is all you need: there is no reason to `cd ~/.lessons/sync/<slug>/ && git pull` yourself.
 
 `pull_every_minutes` (default 10) does not gate the explicit `lessons sync` command. It belongs to the automatic background sync, which is not built yet; until then, run `lessons sync` by hand.
+
+### What happens when I change a sync remote? (planned)
+
+A changed `remote` in `[sync.<domain>]` gets a new clone slug under `~/.lessons/sync/`. Today that new slug starts from an empty BASE, so deletions stop propagating. The planned recovery (not yet shipped) makes the next `lessons sync` adopt the previous clone's last synced commit when that commit exists in the new remote, so the three-way merge still propagates deletions and keeps one-sided edits out of the conflict queue. When the commit is not in the new remote, sync uses the empty-BASE union; no lesson is lost. `--verbose` logs which commit was adopted and from which slug, and reports when it falls back to the empty-BASE union.
+
+The old clone is left in place. To clean up, run `lessons --verbose search`; its `config: [sync.<domain>] -> clone of ...` lines name the remotes still in use. Keep the clone for each listed remote (its slug is that remote encoded as described above); back up and remove every other `<slug>/` directory and `<slug>.*` file under `~/.lessons/sync/`.
 
 ### How do I import my existing SQLite lessons into another machine whose old sync repos no longer exist?
 
