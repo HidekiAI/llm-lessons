@@ -140,6 +140,24 @@ Use the absolute path to `lessons` if it is not on the PATH the hook sees.
 
 </details>
 
+### Sample interaction with LLM (Opencode)
+
+While I was working, there are times where I will see thinking|thoughts (usually, Deepseek but even on OpenCode/Big-Pickle, but I've seen something similar appear at work on Claude-CLI):
+
+```text
+
+     I have the two relevant lessons in hand — especially the wrapped-
+     comment one (id 01M790F2SJ62FH48NNXRN4ZXSF), which is exactly
+     your worry. Let me first confirm them in the DB, then inspect the
+     diff and check for bare prose lines.
+
+     − 1 command, 1 thought, 1 tool
+
+     ✓ execute
+     › lessons.search_lessons [query=...s like code scaffold, limit=5]
+
+```
+
 ## Troubleshooting
 
 - **opencode shows the lessons plugin as failed** (`Plugin must export a default definition...`, or it keeps failing after you fixed the file): the opencode background service keeps the plugin it loaded when it started and does not re-read a changed file. Run `opencode service restart`, then open a new session and check `/plugins` and `/mcp`. The log entry named by the error reference is in `~/.local/share/opencode/log/opencode.log`.
